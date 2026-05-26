@@ -344,7 +344,13 @@ class FlowMatchingTransformer(nn.Module):
 
         return xt
 
-    def forward(self, x, x_mask, cond_code, is_prompt=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_mask: torch.Tensor,
+        cond_code: torch.Tensor,
+        is_prompt: torch.Tensor | None = None,
+    ):
         """
         Args:
             x: (B, T, mel_dim)

@@ -76,7 +76,7 @@ def load_config(config_path: str | Path) -> DictConfig:
 # ---------------- utils for data processing ----------------
 
 
-def load_wav(wav_path: str, sample_rate: int):
+def load_wav(wav_path: str, sample_rate: int) -> torch.Tensor:
     """Load wav file and resample to target sample rate.
 
     Args:
