@@ -1,6 +1,5 @@
 """Lazy-loaded SoulX preprocess model tree."""
 
-
 import tempfile
 from pathlib import Path
 from typing import ClassVar, cast
@@ -16,10 +15,10 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from .asr import LyricModel
 from .bs_roformer.separator import MelBandRoformerSeparator
 from .pe.mel_grid_f0 import extract_f0_file
-from .utils import resample_mono
 from .pe.rmvpe.inference import RMVPE
 from .rosvot.inference import RosvotModel
 from .segmentation import VocalSegmenter
+from .utils import resample_mono
 
 logger = init_logger(__name__)
 

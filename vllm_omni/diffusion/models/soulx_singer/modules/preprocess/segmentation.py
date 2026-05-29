@@ -1,6 +1,5 @@
 import time
 from dataclasses import dataclass
-from typing import List
 
 import numpy as np
 import torch.nn as nn
@@ -33,25 +32,24 @@ def _moving_average(x: np.ndarray, win: int) -> np.ndarray:
 
 
 def _merge_short_segments(
-    segments_ms: List[List[int]],
+    segments_ms: list[list[int]],
     *,
     min_len_ms: int,
     max_len_ms: int,
     short_seg_merge_gap_ms: int,
     small_gap_ms: int,
-) -> List[List[int]]:
+) -> list[list[int]]:
     if not segments_ms:
         return []
 
-    merged: List[List[int]] = []
+    merged: list[list[int]] = []
     cur_start, cur_end = segments_ms[0]
     for next_start, next_end in segments_ms[1:]:
         cur_len = cur_end - cur_start
         gap_ms = next_start - cur_end
         merged_len = next_end - cur_start
-        should_merge = (
-            (cur_len < min_len_ms and gap_ms < short_seg_merge_gap_ms)
-            or (gap_ms < small_gap_ms and merged_len < max_len_ms)
+        should_merge = (cur_len < min_len_ms and gap_ms < short_seg_merge_gap_ms) or (
+            gap_ms < small_gap_ms and merged_len < max_len_ms
         )
         if should_merge:
             cur_end = next_end
@@ -79,11 +77,11 @@ def _voiced_to_segments(
     prepad_ms: int,
     postpad_ms: int,
     max_len_ms: int,
-) -> List[List[int]]:
+) -> list[list[int]]:
     smooth_frames = max(1, int(round(smooth_ms / hop_ms)))
     active = _moving_average(voiced.astype(np.float32), smooth_frames) >= 0.5
 
-    segments: List[List[int]] = []
+    segments: list[list[int]] = []
     start_idx = None
     start_frames = max(1, int(round(start_ms / hop_ms)))
     end_frames = max(1, int(round(end_ms / hop_ms)))
@@ -119,7 +117,7 @@ def _voiced_to_segments(
         if end_ms_val > start_ms_val:
             segments.append([int(start_ms_val), int(end_ms_val)])
 
-    def _split_segment(seg: List[int]) -> List[List[int]]:
+    def _split_segment(seg: list[int]) -> list[list[int]]:
         start_ms_val, end_ms_val = seg
         start_frame = int(start_ms_val // hop_ms)
         end_frame = int((end_ms_val - 1) // hop_ms)
@@ -190,7 +188,7 @@ class VocalSegmenter(nn.Module):
         base_name: str = "vocal",
         origin_wav_fn: str = "",
         verbose: bool | None = None,
-    ) -> List[dict]:
+    ) -> list[dict]:
         verbose = self.verbose if verbose is None else verbose
         if verbose:
             logger.info("[vocal detection] segmenting %s", base_name)
@@ -218,7 +216,7 @@ class VocalSegmenter(nn.Module):
             small_gap_ms=cfg.small_gap_ms,
         )
 
-        adjusted_segments: List[List[int]] = []
+        adjusted_segments: list[list[int]] = []
         prev_end = 0
         for start_ms, end_ms in segments_ms:
             start_ms = max(0, start_ms - cfg.lookback_ms)
@@ -255,4 +253,3 @@ class VocalSegmenter(nn.Module):
                 time.time() - t0,
             )
         return segment_infos
-

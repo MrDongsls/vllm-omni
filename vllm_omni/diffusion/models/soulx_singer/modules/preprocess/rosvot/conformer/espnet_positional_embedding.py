@@ -1,4 +1,5 @@
 import math
+
 import torch
 
 
@@ -13,7 +14,7 @@ class PositionalEncoding(torch.nn.Module):
 
     def __init__(self, d_model, dropout_rate, max_len=5000, reverse=False):
         """Construct an PositionalEncoding object."""
-        super(PositionalEncoding, self).__init__()
+        super().__init__()
         self.d_model = d_model
         self.reverse = reverse
         self.xscale = math.sqrt(self.d_model)
@@ -30,14 +31,11 @@ class PositionalEncoding(torch.nn.Module):
                 return
         pe = torch.zeros(x.size(1), self.d_model)
         if self.reverse:
-            position = torch.arange(
-                x.size(1) - 1, -1, -1.0, dtype=torch.float32
-            ).unsqueeze(1)
+            position = torch.arange(x.size(1) - 1, -1, -1.0, dtype=torch.float32).unsqueeze(1)
         else:
             position = torch.arange(0, x.size(1), dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
-            torch.arange(0, self.d_model, 2, dtype=torch.float32)
-            * -(math.log(10000.0) / self.d_model)
+            torch.arange(0, self.d_model, 2, dtype=torch.float32) * -(math.log(10000.0) / self.d_model)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)

@@ -27,9 +27,7 @@ class RMVPE(nn.Module):
         self.hop_length = hop_length
         self._model_path = str(model_path)
         self.encoder = E2E0(4, 1, (2, 2))
-        self.mel_extractor = MelSpectrogram(
-            N_MELS, SAMPLE_RATE, WINDOW_LENGTH, hop_length, None, MEL_FMIN, MEL_FMAX
-        )
+        self.mel_extractor = MelSpectrogram(N_MELS, SAMPLE_RATE, WINDOW_LENGTH, hop_length, None, MEL_FMIN, MEL_FMAX)
         self._resamplers = nn.ModuleDict()
         cents_mapping = 20 * np.arange(N_CLASS) + CONST
         self.register_buffer(
@@ -69,7 +67,7 @@ class RMVPE(nn.Module):
         mel = F.pad(mel, (0, 32 * ((n_frames - 1) // 32 + 1) - n_frames), mode="constant")
         return self.encoder(mel)[:, :n_frames]
 
-    def decode_hidden(self, hidden: torch.Tensor, *, thred: float = 0.03) -> np.ndarray:
+    def decode_hidden(self, hidden: torch.Tensor, *, thread: float = 0.03) -> np.ndarray:
         """Match upstream ``RMVPE.decode`` / ``to_local_average_cents`` in f0_extraction.py."""
         salience = hidden.detach().float().cpu().numpy()
         if salience.ndim == 3:
@@ -94,7 +92,7 @@ class RMVPE(nn.Module):
         cents = product_sum / np.maximum(weight_sum, 1e-8)
 
         maxx = np.max(salience, axis=1)
-        cents[maxx <= thred] = 0.0
+        cents[maxx <= thread] = 0.0
         f0 = 10 * (2 ** (cents / 1200))
         f0[f0 == 10] = 0
         return f0.astype(np.float32)
@@ -121,7 +119,7 @@ class RMVPE(nn.Module):
         audio: torch.Tensor | np.ndarray,
         *,
         sample_rate: int = SAMPLE_RATE,
-        thred: float = 0.03,
+        thread: float = 0.03,
     ) -> torch.Tensor:
         if not isinstance(audio, torch.Tensor):
             audio = torch.from_numpy(np.asarray(audio, dtype=np.float32))
@@ -129,7 +127,7 @@ class RMVPE(nn.Module):
             audio = audio.unsqueeze(0)
         audio = audio.float().to(next(self.parameters()).device)
         mel = self.mel_extractor(self._resample_audio(audio, sample_rate), center=True)
-        f0 = self.decode_hidden(self.mel2hidden(mel), thred=thred)
+        f0 = self.decode_hidden(self.mel2hidden(mel), thread=thread)
         return torch.from_numpy(f0).squeeze(0)
 
     @torch.no_grad()

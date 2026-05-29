@@ -26,10 +26,10 @@ from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import (
     attach_preprocess_for_diffusion_request,
 )
 from vllm_omni.diffusion.models.soulx_singer.utils import (
+    _patch_torchaudio_load,
     f0_to_coarse,
     load_config,
     resolve_pitch_shift,
-    _patch_torchaudio_load,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 

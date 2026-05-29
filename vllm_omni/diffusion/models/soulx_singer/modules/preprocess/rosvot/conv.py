@@ -1,5 +1,6 @@
 """ROSVOT conv/norm building blocks (inference-only; weights from checkpoint)."""
 
+# ruff: noqa: N803
 
 import torch
 import torch.nn as nn

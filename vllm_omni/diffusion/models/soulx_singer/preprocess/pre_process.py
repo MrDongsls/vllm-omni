@@ -1,6 +1,5 @@
 """Shared ``pre_process_func`` helpers for SoulX-Singer pipelines."""
 
-
 from pathlib import Path
 from typing import Any
 
@@ -144,8 +143,7 @@ def attach_preprocess_for_diffusion_request(
                 dummy_prompt = payload["prompt_meta"]
                 processed = metadata_processor.process(dict(payload["target_meta_list"][0]))
                 payload["prompt_meta"] = {
-                    key: value.clone() if isinstance(value, torch.Tensor) else value
-                    for key, value in processed.items()
+                    key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in processed.items()
                 }
                 if isinstance(dummy_prompt.get("wav"), torch.Tensor):
                     payload["prompt_meta"]["wav"] = dummy_prompt["wav"].clone()

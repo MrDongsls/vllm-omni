@@ -1,8 +1,6 @@
 """SoulX preprocess module."""
 
-
 import json
-import os
 import tempfile
 from pathlib import Path
 from typing import Any, ClassVar
@@ -16,8 +14,8 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportsComponentDiscovery
-from vllm_omni.diffusion.models.soulx_singer.modules.preprocess.utils import load_mono_audio, resample_mono
 from vllm_omni.diffusion.models.soulx_singer.modules.preprocess.stack import SoulXPreprocessStack
+from vllm_omni.diffusion.models.soulx_singer.modules.preprocess.utils import load_mono_audio, resample_mono
 from vllm_omni.diffusion.models.soulx_singer.preprocess.metadata_utils import (
     SegmentMetadata,
     convert_metadata,
@@ -227,14 +225,10 @@ class SoulXPreprocessModule(nn.Module, SupportAudioInput, SupportsComponentDisco
         p_sep = prompt_vocal_sep if prompt_vocal_sep is not None else vocal_sep
         t_sep = target_vocal_sep if target_vocal_sep is not None else vocal_sep
         p_merge = (
-            prompt_max_merge_duration_ms
-            if prompt_max_merge_duration_ms is not None
-            else self.max_merge_duration_ms
+            prompt_max_merge_duration_ms if prompt_max_merge_duration_ms is not None else self.max_merge_duration_ms
         )
         t_merge = (
-            target_max_merge_duration_ms
-            if target_max_merge_duration_ms is not None
-            else self.max_merge_duration_ms
+            target_max_merge_duration_ms if target_max_merge_duration_ms is not None else self.max_merge_duration_ms
         )
         prompt_list = self.run_svs_metadata(
             prompt_audio,
@@ -265,9 +259,7 @@ class SoulXPreprocessModule(nn.Module, SupportAudioInput, SupportsComponentDisco
                 )
             max_samples = prompt_meta["mel2note"].shape[1] * metadata_processor.hop_size
             segment_wav = np.asarray(prompt_vocal[:max_samples], dtype=np.float32)
-            prompt_meta["wav"] = (
-                torch.from_numpy(segment_wav).unsqueeze(0).float().to(metadata_processor.device)
-            )
+            prompt_meta["wav"] = torch.from_numpy(segment_wav).unsqueeze(0).float().to(metadata_processor.device)
 
         return {
             "kind": SOULX_SVS_KIND,

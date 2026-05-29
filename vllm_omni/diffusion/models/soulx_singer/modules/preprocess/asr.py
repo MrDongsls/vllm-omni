@@ -1,6 +1,5 @@
 """Lyric transcription (Paraformer + Parakeet) for SoulX preprocess."""
 
-
 import os
 import re
 import tempfile
@@ -12,7 +11,6 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 from omegaconf import open_dict
-
 from vllm.logger import init_logger
 
 from .utils import get_audio_duration

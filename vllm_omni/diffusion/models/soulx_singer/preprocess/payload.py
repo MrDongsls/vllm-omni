@@ -1,7 +1,6 @@
 """SoulX-Singer preprocess payload contract and stage handoff helpers."""
 
-
-import pickle
+import io
 from typing import Any
 
 import numpy as np
@@ -72,8 +71,9 @@ def build_dummy_payload(kind: str, device: torch.device) -> dict[str, Any]:
 
 
 def encode_ipc(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
-    blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
-    arr = np.frombuffer(blob, dtype=np.uint8)
+    buffer = io.BytesIO()
+    torch.save(payload, buffer)
+    arr = np.frombuffer(buffer.getvalue(), dtype=np.uint8)
     return {SOULX_PREPROCESSED_BLOB_KEY: torch.from_numpy(arr.copy())}
 
 
@@ -85,7 +85,8 @@ def decode_ipc(data: dict[str, Any] | None) -> dict[str, Any] | None:
         return payload
     blob = data.get(SOULX_PREPROCESSED_BLOB_KEY)
     if isinstance(blob, torch.Tensor):
-        return pickle.loads(blob.detach().cpu().numpy().tobytes())
+        buffer = io.BytesIO(blob.detach().cpu().numpy().tobytes())
+        return torch.load(buffer, weights_only=False)
     return None
 
 
@@ -100,9 +101,7 @@ def consume_payload(
         raise ValueError(f"SoulX-Singer {expected_kind} request has no prompts.")
     prompt = prompts[0]
     if isinstance(prompt, str):
-        raise ValueError(
-            f"SoulX-Singer {expected_kind} forward requires pre_process_func output on the prompt."
-        )
+        raise ValueError(f"SoulX-Singer {expected_kind} forward requires pre_process_func output on the prompt.")
     payload = get_soulx_preprocessed_payload(prompt)
     if payload is None or payload.get("kind") != expected_kind:
         raise ValueError(
@@ -144,9 +143,7 @@ def attach_to_diffusion_prompt(
     expected_kind: str,
 ) -> dict[str, Any]:
     if payload.get("kind") != expected_kind:
-        raise ValueError(
-            f"Expected preprocess payload kind {expected_kind!r}, got {payload.get('kind')!r}."
-        )
+        raise ValueError(f"Expected preprocess payload kind {expected_kind!r}, got {payload.get('kind')!r}.")
     diffusion_prompt = (
         dict(original_prompt)
         if isinstance(original_prompt, dict)

@@ -10,18 +10,12 @@ Usage:
     python benchmark.py ... --enable-diffusion-pipeline-profiler
 """
 
-
 import argparse
 import statistics
 import time
 from pathlib import Path
 
 import soundfile as sf
-
-from vllm_omni.diffusion.models.soulx_singer.preprocess.prompt import prepare_multistage_prompt
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-from vllm_omni.entrypoints.omni import Omni
-
 from end2end import (
     SVC_DEPLOY_CONFIG,
     SVS_DEPLOY_CONFIG,
@@ -31,6 +25,10 @@ from end2end import (
     finalize_mode_args,
     resolve_preprocess_weights_dir,
 )
+
+from vllm_omni.diffusion.models.soulx_singer.preprocess.prompt import prepare_multistage_prompt
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+from vllm_omni.entrypoints.omni import Omni
 
 
 def _audio_duration_sec(outputs) -> float:

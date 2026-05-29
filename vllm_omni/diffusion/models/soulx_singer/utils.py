@@ -171,9 +171,7 @@ def resolve_pitch_shift(
         target_voiced = target_f0[target_f0 > 0]
         prompt_voiced = prompt_f0[prompt_f0 > 0]
         if target_voiced.numel() > 0 and prompt_voiced.numel() > 0:
-            shift = torch.round(
-                torch.log2(prompt_voiced.median() / target_voiced.median()) * 1200 / 100
-            )
+            shift = torch.round(torch.log2(prompt_voiced.median() / target_voiced.median()) * 1200 / 100)
             if torch.isfinite(shift):
                 return int(shift.item())
 

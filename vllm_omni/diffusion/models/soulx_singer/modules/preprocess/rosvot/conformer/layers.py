@@ -1,5 +1,5 @@
-from torch import nn
 import torch
+from torch import nn
 
 from ..conv import LayerNorm
 
@@ -8,13 +8,13 @@ class ConvolutionModule(nn.Module):
     """ConvolutionModule in Conformer model.
     Args:
         channels (int): The number of channels of conv layers.
-        kernel_size (int): Kernerl size of conv layers.
+        kernel_size (int): Kernel size of conv layers.
     """
 
     def __init__(self, channels, kernel_size, activation=nn.ReLU(), bias=True):
         """Construct an ConvolutionModule object."""
-        super(ConvolutionModule, self).__init__()
-        # kernerl_size should be a odd number for 'SAME' padding
+        super().__init__()
+        # kernel_size should be a odd number for 'SAME' padding
         assert (kernel_size - 1) % 2 == 0
 
         self.pointwise_conv1 = nn.Conv1d(
@@ -70,7 +70,7 @@ class ConvolutionModule(nn.Module):
 
 class MultiLayeredConv1d(torch.nn.Module):
     """Multi-layered conv1d for Transformer block.
-    This is a module of multi-leyered conv1d designed
+    This is a module of multi-layered conv1d designed
     to replace positionwise feed-forward network
     in Transforner block, which is introduced in
     `FastSpeech: Fast, Robust and Controllable Text to Speech`_.
@@ -86,7 +86,7 @@ class MultiLayeredConv1d(torch.nn.Module):
             kernel_size (int): Kernel size of conv1d.
             dropout_rate (float): Dropout rate.
         """
-        super(MultiLayeredConv1d, self).__init__()
+        super().__init__()
         self.w_1 = torch.nn.Conv1d(
             in_chans,
             hidden_chans,
@@ -118,7 +118,7 @@ class Swish(torch.nn.Module):
     """Construct an Swish object."""
 
     def forward(self, x):
-        """Return Swich activation function."""
+        """Return Swish activation function."""
         return x * torch.sigmoid(x)
 
 
@@ -146,18 +146,18 @@ class EncoderLayer(nn.Module):
     """
 
     def __init__(
-            self,
-            size,
-            self_attn,
-            feed_forward,
-            feed_forward_macaron,
-            conv_module,
-            dropout_rate,
-            normalize_before=True,
-            concat_after=False,
+        self,
+        size,
+        self_attn,
+        feed_forward,
+        feed_forward_macaron,
+        conv_module,
+        dropout_rate,
+        normalize_before=True,
+        concat_after=False,
     ):
         """Construct an EncoderLayer object."""
-        super(EncoderLayer, self).__init__()
+        super().__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
         self.feed_forward_macaron = feed_forward_macaron

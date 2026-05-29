@@ -1,6 +1,5 @@
 """Frozen Whisper encoder wrapper (wav -> encoder embeddings)."""
 
-
 import torch
 import torchaudio
 from transformers import WhisperFeatureExtractor, WhisperModel

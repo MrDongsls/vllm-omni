@@ -1,4 +1,3 @@
-
 import math
 from pathlib import Path
 from typing import Any
@@ -35,7 +34,7 @@ class RosvotModel(nn.Module):
         *,
         config_path: str | Path = "",
         pe: nn.Module | None = None,
-        thr: float = 0.85,
+        the: float = 0.85,
         verbose: bool = False,
     ):
         super().__init__()
@@ -43,7 +42,7 @@ class RosvotModel(nn.Module):
         resolved_config = Path(config_path) if config_path else ckpt.with_name("config.yaml")
         self.hparams = load_rosvot_config(
             resolved_config,
-            hparams_str=f"note_bd_threshold={thr}",
+            hparams_str=f"note_bd_threshold={the}",
         )
         if verbose:
             logger.info("ROSVOT config: %s", resolved_config)
@@ -245,11 +244,7 @@ class RosvotModel(nn.Module):
             }
 
         note2words_raw = rosvot_out.get("note2words") or []
-        align_words = [
-            item["words"][idx - 1]
-            for idx in note2words_raw
-            if 0 < idx <= len(item["words"])
-        ]
+        align_words = [item["words"][idx - 1] for idx in note2words_raw if 0 < idx <= len(item["words"])]
         ep_types = self._build_ep_types(self._normalize_note2words(note2words_raw), align_words) if align_words else []
         seg = segment_info or item
 
@@ -265,4 +260,3 @@ class RosvotModel(nn.Module):
             "note_type": ep_types,
             "note_pitch": rosvot_out.get("pitches", []),
         }
-

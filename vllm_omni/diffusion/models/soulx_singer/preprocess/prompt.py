@@ -1,6 +1,5 @@
 """Build stage-0 preprocess prompts for multistage SoulX-Singer serving."""
 
-
 from collections.abc import Sequence
 from typing import Any
 

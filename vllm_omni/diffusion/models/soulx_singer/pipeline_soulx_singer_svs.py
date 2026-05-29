@@ -24,9 +24,9 @@ from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import (
     build_metadata_processor,
 )
 from vllm_omni.diffusion.models.soulx_singer.utils import (
+    _patch_torchaudio_load,
     f0_to_coarse,
     resolve_pitch_shift,
-    _patch_torchaudio_load,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -128,9 +128,7 @@ class PipelineSoulXSingerSVS(FlowMatchingAudioPipeline):
         f0_coarse: torch.Tensor,
     ) -> torch.Tensor:
         features = (
-            self.note_pitch_encoder(note_pitch)
-            + self.note_type_encoder(note_type)
-            + self.note_text_encoder(note_text)
+            self.note_pitch_encoder(note_pitch) + self.note_type_encoder(note_type) + self.note_text_encoder(note_text)
         )
         features = self.preflow(features)
         features = _expand_states(features, mel2note)

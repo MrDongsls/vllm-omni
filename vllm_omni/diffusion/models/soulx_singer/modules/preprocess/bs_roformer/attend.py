@@ -1,9 +1,9 @@
 from collections import namedtuple
 
 import torch
+import torch.nn.functional as F
 from packaging import version
 from torch import einsum, nn
-import torch.nn.functional as F
 
 FlashAttentionConfig = namedtuple("FlashAttentionConfig", ["enable_flash", "enable_math", "enable_mem_efficient"])
 
@@ -23,9 +23,9 @@ class Attend(nn.Module):
         super().__init__()
         self.scale = scale
         self.flash = flash
-        assert not (
-            flash and version.parse(torch.__version__) < version.parse("2.0.0")
-        ), "flash attention requires pytorch 2.0+"
+        assert not (flash and version.parse(torch.__version__) < version.parse("2.0.0")), (
+            "flash attention requires pytorch 2.0+"
+        )
 
         self.cpu_config = FlashAttentionConfig(True, True, True)
         self.cuda_config = None

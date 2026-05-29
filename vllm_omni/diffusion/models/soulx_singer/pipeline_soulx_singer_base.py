@@ -9,8 +9,6 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-logger = init_logger(__name__)
-
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin, _unwrap, _wrap
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -23,6 +21,8 @@ from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import build
 from vllm_omni.diffusion.models.soulx_singer.utils import _patch_torchaudio_load, load_config
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
 
 PROJECT_ROOT = Path(__file__).parents[4]
 _SOULX_EXAMPLE_AUDIO_DIR = PROJECT_ROOT / "tests" / "assets" / "soulxsinger"

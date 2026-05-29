@@ -18,7 +18,6 @@ Usage:
         -o output_svc.wav
 """
 
-
 import argparse
 import os
 from pathlib import Path
@@ -50,18 +49,14 @@ _SAMPLE_RATE = 24000
 def _require_paths(paths: dict[str, str | None]) -> None:
     missing = [name for name, p in paths.items() if not p or not os.path.isfile(p)]
     if missing:
-        raise FileNotFoundError(
-            "Missing file(s): " + ", ".join(f"{k}={paths[k]!r}" for k in missing)
-        )
+        raise FileNotFoundError("Missing file(s): " + ", ".join(f"{k}={paths[k]!r}" for k in missing))
 
 
 def resolve_preprocess_weights_dir(explicit: str | None) -> str:
     if explicit:
         path = Path(explicit).expanduser().resolve()
         if not (path / "rmvpe" / "rmvpe.pt").is_file():
-            raise FileNotFoundError(
-                f"--preprocess-weights-dir must contain rmvpe/rmvpe.pt: {path}"
-            )
+            raise FileNotFoundError(f"--preprocess-weights-dir must contain rmvpe/rmvpe.pt: {path}")
         return str(path)
     env = os.environ.get("SOULX_PREPROCESS_WEIGHTS_DIR")
     if env:
@@ -97,9 +92,7 @@ def build_multistage_sampling(
         if args.target_metadata_path:
             stage1_extra["target_metadata_path"] = os.path.abspath(args.target_metadata_path)
         if args.prompt_metadata_path or args.target_metadata_path:
-            stage1_extra["audio_path"] = os.path.abspath(
-                args.prompt_wav_path or args.prompt_audio
-            )
+            stage1_extra["audio_path"] = os.path.abspath(args.prompt_wav_path or args.prompt_audio)
 
     return [
         SamplingParams(max_tokens=1),
@@ -127,8 +120,7 @@ def extract_audio(outputs) -> tuple[np.ndarray, int]:
     audio_val = mm["audio"]
     if isinstance(audio_val, list):
         chunks = [
-            np.asarray(chunk.detach().cpu().float().numpy() if hasattr(chunk, "detach") else chunk)
-            .reshape(-1)
+            np.asarray(chunk.detach().cpu().float().numpy() if hasattr(chunk, "detach") else chunk).reshape(-1)
             for chunk in audio_val
             if chunk is not None
         ]
@@ -190,8 +182,7 @@ def add_inference_args(parser: argparse.ArgumentParser) -> None:
         "--prompt-wav-path",
         type=str,
         default=None,
-        help="SVS: prompt vocal wav for metadata processor when using --prompt-metadata-path "
-        "(default: --prompt-audio)",
+        help="SVS: prompt vocal wav for metadata processor when using --prompt-metadata-path (default: --prompt-audio)",
     )
     parser.add_argument(
         "--preprocess-weights-dir",

@@ -1,6 +1,5 @@
 """E2E offline multistage tests for SoulX-Singer (preprocess → SVS/SVC)."""
 
-
 import functools
 import importlib
 import json
@@ -105,9 +104,7 @@ def _model_view(base: Path, name: str, architecture: str) -> str:
         dst = view / "phoneme" / "phone_set.json"
         if not dst.exists():
             dst.symlink_to(phoneset.resolve())
-    (view / "config.json").write_text(
-        json.dumps({"model_type": "soulxsinger", "architectures": [architecture]}) + "\n"
-    )
+    (view / "config.json").write_text(json.dumps({"model_type": "soulxsinger", "architectures": [architecture]}) + "\n")
     return str(view.resolve())
 
 

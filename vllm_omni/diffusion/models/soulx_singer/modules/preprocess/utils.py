@@ -1,6 +1,5 @@
 """Shared helpers for SoulX preprocess (I/O, config, checkpoints, pitch)."""
 
-
 from pathlib import Path
 from typing import Any
 

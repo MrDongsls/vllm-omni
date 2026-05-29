@@ -1,6 +1,5 @@
 """SoulX-Singer preprocess stage wrapped for ``LLM_GENERATION`` runtime."""
 
-
 from collections.abc import Iterable
 from typing import Any
 
@@ -98,10 +97,7 @@ class SoulXSingerPreprocessForGeneration(nn.Module):
         if runtime_info is None:
             runtime_info = kwargs.get("runtime_additional_information", [])
 
-        is_dummy = (
-            isinstance(runtime_info, dict)
-            and runtime_info.get("_is_dummy")
-        ) or (
+        is_dummy = (isinstance(runtime_info, dict) and runtime_info.get("_is_dummy")) or (
             isinstance(runtime_info, list)
             and bool(runtime_info)
             and isinstance(runtime_info[0], dict)

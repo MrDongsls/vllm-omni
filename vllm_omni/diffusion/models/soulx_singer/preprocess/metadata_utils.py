@@ -1,6 +1,5 @@
 """Metadata merge helpers for SoulX-Singer preprocess."""
 
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -160,12 +159,8 @@ def merge_short_segments(
     for seg in segments:
         start_time = int(_get_attr(seg, "start_time_ms", 0))
         end_time = int(_get_attr(seg, "end_time_ms", 0))
-        if (
-            current_group
-            and (
-                start_time - prev_end > max_gap_ms
-                or current_len + end_time - start_time > max_duration_ms
-            )
+        if current_group and (
+            start_time - prev_end > max_gap_ms or current_len + end_time - start_time > max_duration_ms
         ):
             merged_segments.append(
                 _merge_group(

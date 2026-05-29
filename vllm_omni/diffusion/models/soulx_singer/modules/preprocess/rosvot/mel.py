@@ -1,3 +1,4 @@
+# ruff: noqa: N803
 import math
 
 import numpy as np

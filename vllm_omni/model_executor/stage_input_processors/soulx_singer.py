@@ -1,6 +1,5 @@
 """Stage-0 preprocess → stage-1 SoulX DiT diffusion handoff."""
 
-
 from typing import Any
 
 from vllm.logger import init_logger

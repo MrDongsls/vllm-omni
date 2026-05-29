@@ -1,6 +1,5 @@
 """Resample RMVPE F0 (16 kHz hop) onto the SoulX mel frame grid."""
 
-
 import math
 import time
 from typing import TYPE_CHECKING
@@ -64,7 +63,7 @@ def extract_f0_file(
     target_sr: int,
     hop_size: int,
     f0_path: str | None = None,
-    thred: float = 0.03,
+    thread: float = 0.03,
     max_duration: float = 300.0,
     verbose: bool = False,
 ) -> np.ndarray:
@@ -74,7 +73,7 @@ def extract_f0_file(
         t0 = time.perf_counter()
 
     audio, _ = load_mono_audio(wav_path, target_sr=SAMPLE_RATE)
-    f0_16k = rmvpe.forward(audio, sample_rate=SAMPLE_RATE, thred=thred).detach().cpu().numpy()
+    f0_16k = rmvpe.forward(audio, sample_rate=SAMPLE_RATE, thread=thread).detach().cpu().numpy()
     f0 = interpolate_f0_to_mel_grid(
         f0_16k,
         original_length=audio.shape[-1],

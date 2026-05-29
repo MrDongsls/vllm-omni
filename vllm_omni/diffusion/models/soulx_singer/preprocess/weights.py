@@ -1,6 +1,5 @@
 """Resolve SoulX preprocess checkpoint locations via vLLM-Omni model loading helpers."""
 
-
 import os
 from pathlib import Path
 
@@ -62,10 +61,7 @@ def preprocess_weight_paths(weights_root: Path) -> dict[str, str]:
         "rmvpe": str(root / "rmvpe/rmvpe.pt"),
         "sep_ckpt": str(root / "mel-band-roformer-karaoke/mel_band_roformer_karaoke_becruily.ckpt"),
         "sep_config": str(root / "mel-band-roformer-karaoke/config_karaoke_becruily.yaml"),
-        "asr_zh": str(
-            root
-            / "speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
-        ),
+        "asr_zh": str(root / "speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"),
         "asr_en": str(root / "parakeet-tdt-0.6b-v2/parakeet-tdt-0.6b-v2.nemo"),
         "rosvot": str(root / "rosvot/rosvot/model.pt"),
     }

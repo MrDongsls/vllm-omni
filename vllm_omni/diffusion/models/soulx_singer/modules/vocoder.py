@@ -797,7 +797,7 @@ class VocosBackbone(Backbone):
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
-        if isinstance(m, (nn.Conv1d, nn.Linear)):
+        if isinstance(m, nn.Conv1d | nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
             nn.init.constant_(m.bias, 0)
 

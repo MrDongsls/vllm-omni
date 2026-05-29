@@ -4,7 +4,7 @@ import torch
 from .constants import CONST, N_CLASS
 
 
-def to_local_average_f0(hidden: torch.Tensor, thred: float = 0.03) -> np.ndarray:
+def to_local_average_f0(hidden: torch.Tensor, thread: float = 0.03) -> np.ndarray:
     hidden = hidden.detach().float().cpu()
     idx = torch.arange(N_CLASS)[None, None, :]
     idx_cents = idx * 20 + CONST
@@ -17,5 +17,5 @@ def to_local_average_f0(hidden: torch.Tensor, thred: float = 0.03) -> np.ndarray
     weight_sum = torch.sum(weights, dim=2)
     cents = product_sum / (weight_sum + (weight_sum == 0))
     f0 = 10 * 2 ** (cents / 1200)
-    uv = hidden.max(dim=2)[0] < thred
+    uv = hidden.max(dim=2)[0] < thread
     return (f0 * ~uv).numpy()

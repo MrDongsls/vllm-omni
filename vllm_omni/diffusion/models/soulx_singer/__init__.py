@@ -1,6 +1,5 @@
 """SoulX-Singer SVS / SVC flow-matching singing models for vLLM-Omni."""
 
-
 __all__ = [
     "FlowMatchingAudioPipeline",
     "PipelineSoulXSingerSVS",

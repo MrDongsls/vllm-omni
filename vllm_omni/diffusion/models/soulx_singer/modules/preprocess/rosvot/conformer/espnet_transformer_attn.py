@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # Copyright 2019 Shigeki Karita
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
 """Multi-Head Attention layer definition."""
 
-from packaging import version
 import math
 
 import numpy
 import torch
+from packaging import version
 from torch import nn
 
 
@@ -24,7 +23,7 @@ class MultiHeadedAttention(nn.Module):
 
     def __init__(self, n_head, n_feat, dropout_rate, flash=False):
         """Construct an MultiHeadedAttention object."""
-        super(MultiHeadedAttention, self).__init__()
+        super().__init__()
         assert n_feat % n_head == 0
         # We assume d_v always equals d_k
         self.d_k = n_feat // n_head
@@ -72,21 +71,15 @@ class MultiHeadedAttention(nn.Module):
         n_batch = value.size(0)
         if mask is not None:
             mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
-            min_value = float(
-                numpy.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min
-            )
+            min_value = float(numpy.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min)
             scores = scores.masked_fill(mask, min_value)
-            self.attn = torch.softmax(scores, dim=-1).masked_fill(
-                mask, 0.0
-            )  # (batch, head, time1, time2)
+            self.attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)  # (batch, head, time1, time2)
         else:
             self.attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
 
         p_attn = self.dropout(self.attn)
         x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
-        x = (
-            x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)
-        )  # (batch, time1, d_model)
+        x = x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
 
         return self.linear_out(x)  # (batch, time1, d_model)
 
@@ -105,10 +98,9 @@ class MultiHeadedAttention(nn.Module):
         if version.parse(torch.__version__) >= version.parse("2.0") and self.flash:
             n_batch = value.size(0)
             x = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask.unsqueeze(1) if mask is not None else None, dropout_p=self.dropout_rate)
-            x = (
-                x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)
-            )  # (batch, time1, d_model)
+                q, k, v, attn_mask=mask.unsqueeze(1) if mask is not None else None, dropout_p=self.dropout_rate
+            )
+            x = x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
             return self.linear_out(x)
         else:
             scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
@@ -127,7 +119,7 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
     def __init__(self, n_head, n_feat, dropout_rate):
         """Construct an RelPositionMultiHeadedAttention object."""
         super().__init__(n_head, n_feat, dropout_rate)
-        # linear transformation for positional ecoding
+        # linear transformation for positional encoding
         self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
         # these two learnable bias are used in matrix c and matrix d
         # as described in https://arxiv.org/abs/1901.02860 Section 3.3
@@ -191,8 +183,6 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
         matrix_bd = self.rel_shift(matrix_bd)
 
-        scores = (matrix_ac + matrix_bd) / math.sqrt(
-            self.d_k
-        )  # (batch, head, time1, time2)
+        scores = (matrix_ac + matrix_bd) / math.sqrt(self.d_k)  # (batch, head, time1, time2)
 
         return self.forward_attention(v, scores, mask)

@@ -1,3 +1,4 @@
+# ruff: noqa: N803
 import numpy as np
 import torch
 import torch.nn as nn
