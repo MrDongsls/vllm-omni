@@ -467,23 +467,27 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 
 ## SoulX-Singer
 
-Single-stage flow-matching DiT for **singing voice synthesis (SVS)** and **singing voice conversion (SVC)** @ 24 kHz. Heavy preprocessing (vocal extract, lyrics, notes, optional MIDI edit) runs in the upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) repo — vLLM-Omni only consumes **already produced** json/wav paths.
+Flow-matching DiT for **singing voice synthesis (SVS)** and **singing voice conversion (SVC)** @ 24 kHz.
+`end2end.py` runs integrated preprocess (stage 0) → DiT (stage 1). Deploy: `vllm_omni/deploy/soulxsinger_svs.yaml` / `soulxsinger_svc.yaml`.
 
-One HuggingFace download contains **two checkpoints** in the same folder: `model.pt` (SVS) and `model-svc.pt` (SVC). vLLM-Omni picks the pipeline from each weight directory’s `config.json` `architectures[0]` (or from `--model-class-name` / `end2end.py --svs`, same as other diffusion models).
+HF repo has `model.pt` (SVS) and `model-svc.pt` (SVC); use separate view dirs + `config.json` `architectures` (below). **`phoneme/phone_set.json` is not on HF** — copy from upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) into `$BASE/phoneme/`.
 
 ### Prerequisites
 
 ```bash
-# 1. Download weights once
+# 1. DiT weights
 BASE=path/to/SoulX-Singer
+PREPROCESS=path/to/SoulX-Singer-Preprocess
+SVC_DIR=path/to/SoulX-Singer-svc
 
 huggingface-cli download Soul-AILab/SoulX-Singer --local-dir "$BASE"
 
-# 2. Routing: two view directories
-# Same pattern as using separate `--model` paths for SVS vs SVC— no need to edit `config.json`
-# when switching modes. Symlink the shared files; only `config.json` differs:
-SVC_DIR=path/to/SoulX-Singer-svc
+# 2. Preprocess weights (required)
+huggingface-cli download Soul-AILab/SoulX-Singer-Preprocess --local-dir "$PREPROCESS"
+export SOULX_PREPROCESS_WEIGHTS_DIR="$PREPROCESS"
 
+# 3. SVS / SVC view directories
+SVC_DIR=path/to/SoulX-Singer-svc
 mkdir -p "$SVC_DIR"
 cp $BASE/{config.yaml,README.md,assets} $SVC_DIR
 mv $BASE/model-svc.pt $SVC_DIR/model-svc.pt
@@ -505,61 +509,52 @@ cat > "$SVC_DIR/config.json" <<'EOF'
 EOF
 ```
 
-| Directory | Pipeline | Checkpoint loaded |
-|-----------|----------|-------------------|
-| `$BASE` | `SoulXSingerPipeline` | `model.pt` |
-| `$SVC_DIR` | `SoulXSingerSVCPipeline` | `model-svc.pt` |
+`config.yaml` hyper-parameters live under `$BASE`; `config.json` only routes SVS vs SVC.
 
-Runtime hyper-parameters still come from `config.yaml` in `$BASE` (symlinked into both dirs). Do not confuse it with vLLM-Omni’s `config.json` routing file.
+**Mandarin SVS (integrated preprocess):** `pip install funasr==1.3.0 g2pM g2p_en`. English: NeMo / NLTK in Notes (legacy preprocess).
 
-
-### Preprocess (upstream, required for SVS)
-
-Omni does not run preprocess in `vllm serve` or `end2end.py`. Clone [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer), follow [`preprocess/README.md`](https://github.com/Soul-AILab/SoulX-Singer/tree/main/preprocess), edit `example/preprocess.sh`, and run `bash example/preprocess.sh` from that repo. Outputs `metadata.json` under each configured `save_dir`; pass absolute paths to `end2end.py` below.
-
-### Quick start (SVS)
+### Quick start
 
 ```bash
+# SVS — defaults: zh_prompt.mp3 + music.mp3 (vendored under tests/assets/soulxsinger/)
 python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
-    --model "$SVS_DIR" \
-    --svs \
-    --prompt-metadata-path tests/assets/soulxsinger/zh_prompt.json \
-    --target-metadata-path tests/assets/soulxsinger/zh_target.json \
-    --audio-path tests/assets/soulxsinger/zh_prompt.mp3 \
+    --model "$BASE" \
+    --preprocess-weights-dir "$PREPROCESS" \
     --control score \
-    --num-inference-steps 16 \
-    --guidance-scale 3.0 \
-    --output output.wav
+    --num-inference-steps 32 \
+    -o output.wav
+
+# SVC — $SVC_DIR needs model-svc.pt only
+python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
+    --model "$SVC_DIR" --svc \
+    --preprocess-weights-dir "$PREPROCESS" \
+    -o output_svc.wav
 ```
 
-With the two-directory layout, `--svs` is optional if `$SVS_DIR/config.json` already lists `SoulXSingerPipeline`. One `generate` call merges all target segments inside the pipeline. Fixtures under `tests/assets/soulxsinger/` still need a real `--audio-path`.
+`SOULX_PREPROCESS_WEIGHTS_DIR` makes `--preprocess-weights-dir` optional. Long SVS targets are merged in one request.
 
-### Singing voice conversion (SVC)
-
+**SVS precomputed metadata (optional):** pass **both** `--prompt-metadata-path` and `--target-metadata-path` to skip online ASR/ROSVOT:
 
 ```bash
 python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
-    --model "$SVC_DIR" \
-    --prompt-wav-path tests/assets/soulxsinger/zh_prompt.mp3 \
-    --target-wav-path tests/assets/soulxsinger/music.mp3 \
-    --prompt-f0-path tests/assets/soulxsinger/zh_prompt_f0.npy \
-    --target-f0-path tests/assets/soulxsinger/music_f0.npy \
-    --num-inference-steps 16 \
-    --guidance-scale 3.0 \
-    --output output_svc.wav
+    --model "$BASE" \
+    --prompt-metadata-path path/to/prompt/metadata.json \
+    --target-metadata-path path/to/target/metadata.json \
+    --prompt-wav-path path/to/prompt/vocal.wav \
+    -o output.wav
 ```
 
 ### Notes
 
-- Output: 24 kHz mono WAV (full utterance per request; **no PCM streaming**).
-- SVS `--control`: `score` (note pitches from metadata) or `melody` (F0). Tuning: `--num-inference-steps`, `--guidance-scale`, `--auto-shift` / `--pitch-shift` (`end2end.py --help`).
-- Preprocess + MIDI correction: upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) only; poor lyrics/note labels hurt SVS quality.
-- Preprocess (upstream repo, `uv` env): `uv venv && source .venv/bin/activate && uv pip install -r preprocess/requirements.txt`; extra deps below often surface only at runtime.
-    - Install `ffmpeg` on `PATH` (system package, e.g. `apt install ffmpeg`) — `funasr` checks it on import; not in `requirements.txt`.
-    - `uv pip install "nemo_toolkit[asr]==2.6.1"` — English lyrics via Parakeet; pulls `lightning` and related ASR deps.
-    - `uv pip install lhotse==1.32.2` — pin after NeMo install to avoid `DynamicCutSampler` / PyTorch `Sampler` mismatch.
-    - `python -c "import nltk; nltk.download('cmudict'); nltk.download('averaged_perceptron_tagger_eng')"` — NLTK data for English G2P.
-    - Set `language=English` in `example/preprocess.sh` for English audio; default `Mandarin` uses Paraformer + Chinese G2P.
-    - Parakeet on PyTorch 2.10: use upstream `lyric_transcription.py` with CUDA graphs disabled if decode fails on `cuda-bindings` API mismatch.
+- Output: 24 kHz mono WAV; no PCM streaming.
+- Defaults: `--guidance-scale 3.0`, `--seed 42`, `--auto-shift` **off** (upstream). Use `--auto-shift` when aligning pitch to the prompt.
+- SVS `--control`: `score` or `melody`. See `end2end.py --help` for `--pitch-shift`, `--vocal-sep`.
+- MIDI / lyric QC: upstream `midi_editor` only.
+- **External / legacy preprocess** (optional): if you prefer the upstream CLI instead of integrated stage-0, clone [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) and use its `preprocess/` env, then pass the resulting JSON paths via `--prompt-metadata-path` / `--target-metadata-path` as above:
+    - Install `ffmpeg` on `PATH` (e.g. `apt install ffmpeg`) — checked by `funasr` on import.
+    - `uv pip install "nemo_toolkit[asr]==2.6.1"` — English lyrics via Parakeet.
+    - `uv pip install lhotse==1.32.2` — pin after NeMo to avoid sampler mismatches.
+    - `python -c "import nltk; nltk.download('cmudict'); nltk.download('averaged_perceptron_tagger_eng')"` — English G2P.
+    - Set `language=English` in upstream `example/preprocess.sh` for English audio; default `Mandarin` uses Paraformer + Chinese G2P.
 
 ---

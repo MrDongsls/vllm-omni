@@ -6,7 +6,10 @@ from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import set_default_torch_dtype
+
+logger = init_logger(__name__)
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin, _unwrap, _wrap
@@ -16,7 +19,8 @@ from vllm_omni.diffusion.models.interface import (
     SupportAudioOutput,
     SupportsComponentDiscovery,
 )
-from vllm_omni.diffusion.models.soulx_singer.utils import MetadataProcessor, _patch_torchaudio_load, load_config
+from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import build_metadata_processor
+from vllm_omni.diffusion.models.soulx_singer.utils import _patch_torchaudio_load, load_config
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.platforms import current_omni_platform
 
@@ -116,24 +120,13 @@ class FlowMatchingAudioPipeline(
         self.pitch_dim = self.encoder_config.pitch_dim
         self.type_dim = self.encoder_config.type_dim
 
-        self.hidden_size = self.flow_matching_config.hidden_size
-        self.num_layers = self.flow_matching_config.num_layers
-        self.num_heads = self.flow_matching_config.num_heads
-        self.cfg_drop_prob = self.flow_matching_config.cfg_drop_prob
-        self.use_embedding = self.flow_matching_config.use_embedding
-        self.cond_codebook_size = self.flow_matching_config.cond_codebook_size
-        self.cond_scale_factor = self.flow_matching_config.cond_scale_factor
-        self.sigma = self.flow_matching_config.sigma
-        self.time_scheduler = self.flow_matching_config.time_scheduler
-
-        self.metadata_processor = MetadataProcessor(
-            hop_size=self.audio_config.hop_size,
-            sample_rate=self.audio_config.sample_rate,
-            phoneset_path=_resolve_phoneset_path(model_dir),
-            device=self.device,
-        )
+        self.metadata_processor = build_metadata_processor(od_config)
 
         _patch_torchaudio_load()
+
+    def _mel_to_audio(self, generated_mel: torch.Tensor, *, squeeze: bool = False) -> torch.Tensor:
+        audio = self.vocoder(generated_mel.transpose(1, 2)[0:1, ...].float()).float()
+        return audio.squeeze() if squeeze else audio
 
     def _setup_soulx_profiler(self, *, extra_targets: list[str] | None = None) -> None:
         """Enable stage timing when ``od_config.enable_diffusion_pipeline_profiler`` is set."""
@@ -178,7 +171,7 @@ class FlowMatchingAudioPipeline(
         return mel, vocoder
 
     def _finalize_loaded_dtypes(self) -> None:
-        """Mirror upstream ``model.half(); model.mel.float()`` after checkpoint load."""
+        """Keep mel/vocoder in FP32; cast DiT trunk to ``od_config.dtype`` after load."""
         self.mel.float()
         self.vocoder.float()
         trunk_dtype = self.od_config.dtype
@@ -215,11 +208,23 @@ class FlowMatchingAudioPipeline(
         trunk_dtype = self.diffusion_trunk_dtype
         return tuple(t if t.dtype == trunk_dtype else t.to(dtype=trunk_dtype) for t in tensors)
 
+    def _resolve_diffusion_generator(self, sampling_params: Any) -> torch.Generator | None:
+        """Build a device-local RNG for CFM noise from ``generator`` or ``seed``."""
+        generator = getattr(sampling_params, "generator", None)
+        if generator is not None:
+            return generator
+        seed = getattr(sampling_params, "seed", None)
+        if seed is None:
+            return None
+        return torch.Generator(device=self.device).manual_seed(int(seed))
+
     def _prepare_cfm_loop_state(
         self,
         prompt: torch.Tensor,
         cond: torch.Tensor,
         n_timesteps: int,
+        *,
+        generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """Cast FP32 islands to trunk dtype and build CFM loop tensors/masks."""
         trunk_dtype = self.diffusion_trunk_dtype
@@ -243,6 +248,7 @@ class FlowMatchingAudioPipeline(
             self.mel_dim,
             dtype=trunk_dtype,
             device=device,
+            generator=generator,
         )
         return cond_emb, prompt, xt, x_mask, xt_mask, h_tensor, prompt_len
 
@@ -291,10 +297,12 @@ class FlowMatchingAudioPipeline(
         cond: torch.Tensor,
         n_timesteps: int,
         cfg: float,
+        *,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Euler flow-matching loop aligned with ``FlowMatchingTransformer.reverse_diffusion``."""
         cond_emb, prompt, xt, x_mask, xt_mask, h_tensor, prompt_len = self._prepare_cfm_loop_state(
-            prompt, cond, n_timesteps
+            prompt, cond, n_timesteps, generator=generator
         )
         trunk_dtype = self.diffusion_trunk_dtype
         step_scale = 1.0 / n_timesteps
@@ -321,6 +329,7 @@ class FlowMatchingAudioPipeline(
                 negative_kwargs={
                     "x": xt,
                     "diffusion_step": diffusion_step,
+                    # CFG null cond: zero out target frames only (prompt cond stays in pos branch).
                     "cond": torch.zeros_like(cond_emb)[:, : xt.shape[1], :],
                     "x_mask": x_mask,
                 },

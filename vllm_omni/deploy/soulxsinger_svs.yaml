@@ -1,0 +1,43 @@
+# SoulX-Singer SVS: stage-0 preprocess (LLM_GENERATION) → stage-1 DiT (DIFFUSION).
+# Use: vllm serve <SoulX-Singer> --omni --deploy-config vllm_omni/deploy/soulxsinger_svs.yaml
+#
+# Stage 0 runs ASR / ROSVOT / F0 / vocal_sep; stage 1 runs PipelineSoulXSingerSVS.
+# Pass prompt audio via multi_modal_data['audio'] and target via extra_args['target_audio'].
+# For multistage offline/API use, call prepare_multistage_prompt() before generate() so
+# stage-1 extra_args are merged into the stage-0 prompt (see preprocess/prompt.py).
+pipeline: soulxsinger_svs
+async_chunk: false
+dtype: float16
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.35
+    enforce_eager: true
+    enable_prefix_caching: false
+    skip_tokenizer_init: true
+    devices: "0"
+    default_sampling_params:
+      max_tokens: 1
+    hf_overrides:
+      model_type: soulxsinger
+      architectures: ["SoulXSingerModel"]
+      soulx_mode: svs
+    skip_mm_profiling: true
+    disable_hybrid_kv_cache_manager: true
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.45
+    enforce_eager: false
+    enable_prefix_caching: false
+    devices: "0"
+    default_sampling_params:
+      num_inference_steps: 32
+      guidance_scale: 3.0
+      seed: 42
+    engine_extras:
+      model_class_name: SoulXSingerPipeline
+    skip_mm_profiling: true
+    disable_hybrid_kv_cache_manager: true

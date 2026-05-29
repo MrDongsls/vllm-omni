@@ -1,6 +1,5 @@
 """Frozen Whisper encoder wrapper (wav -> encoder embeddings)."""
 
-from __future__ import annotations
 
 import torch
 import torchaudio
@@ -31,6 +30,10 @@ class WhisperEncoder:
     @property
     def dtype(self) -> torch.dtype:
         return torch.float32
+
+    def float(self) -> "WhisperEncoder":
+        self.model = self.model.float()
+        return self
 
     def encode(
         self,

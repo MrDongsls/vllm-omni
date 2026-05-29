@@ -1,6 +1,5 @@
 import os
 from collections.abc import Iterable
-from pathlib import Path
 from typing import ClassVar
 
 import numpy as np
@@ -11,68 +10,49 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.soulx_singer.modules import (
     CFMDecoder,
     WhisperEncoder,
 )
-from vllm_omni.diffusion.models.soulx_singer.pipeline_soulx_singer_base import FlowMatchingAudioPipeline
-from vllm_omni.diffusion.models.soulx_singer.utils import _patch_torchaudio_load, f0_to_coarse, load_wav
+from vllm_omni.diffusion.models.soulx_singer.pipeline_soulx_singer_base import (
+    FlowMatchingAudioPipeline,
+)
+from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
+    SOULX_SVC_KIND,
+    consume_payload,
+)
+from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import (
+    attach_preprocess_for_diffusion_request,
+)
+from vllm_omni.diffusion.models.soulx_singer.utils import (
+    f0_to_coarse,
+    load_config,
+    resolve_pitch_shift,
+    _patch_torchaudio_load,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
 
-PROJECT_ROOT = Path(__file__).parents[4]
-_SOULX_EXAMPLE_AUDIO_DIR = PROJECT_ROOT / "tests" / "assets" / "soulxsinger"
-_SOULX_REQUIRED_EXTRA_KEYS = ("prompt_wav_path", "target_wav_path", "prompt_f0_path", "target_f0_path")
 _DEFAULT_NUM_INFERENCE_STEPS = 32
 _DEFAULT_GUIDANCE_SCALE = 3.0
 _LONG_AUDIO_SEGMENT_THRESHOLD_SEC = 30.0
 
 
-def _is_warmup_request(request: OmniDiffusionRequest) -> bool:
-    request_ids = getattr(request, "request_ids", None) or ()
-    return len(request_ids) == 1 and request_ids[0] == "dummy_req_id"
-
-
 def get_soulxsinger_svc_pre_process_func(od_config: OmniDiffusionConfig):
-    """Inject SoulX-Singer metadata paths for DiffusionEngine dummy warmup."""
-    del od_config  # reserved for future model-path overrides
-
-    example_dir = _SOULX_EXAMPLE_AUDIO_DIR
-    prompt_wav_path = example_dir / "zh_prompt.mp3"
-    target_wav_path = example_dir / "music.mp3"
-    prompt_f0_path = example_dir / "zh_prompt_f0.npy"
-    target_f0_path = example_dir / "music_f0.npy"
+    """Validate/load SVC preprocess payload for single-stage or stage-1 DiT."""
+    hf_config = load_config(os.path.join(od_config.model, "config.yaml"))
+    sample_rate = hf_config.audio.sample_rate
+    device = get_local_device()
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        extra_args = dict(getattr(request.sampling_params, "extra_args", None) or {})
-
-        if _is_warmup_request(request):
-            if (
-                not prompt_wav_path.is_file()
-                or not target_wav_path.is_file()
-                or not prompt_f0_path.is_file()
-                or not target_f0_path.is_file()
-            ):
-                raise FileNotFoundError(
-                    "SoulX-Singer bundled example audio files are missing under "
-                    f"{example_dir}. Cannot run DiffusionEngine dummy warmup."
-                )
-            request.sampling_params.num_inference_steps = 1
-            extra_args["prompt_wav_path"] = str(prompt_wav_path)
-            extra_args["target_wav_path"] = str(target_wav_path)
-            extra_args["prompt_f0_path"] = str(prompt_f0_path)
-            extra_args["target_f0_path"] = str(target_f0_path)
-            request.sampling_params.extra_args = extra_args
-            return request
-
-        missing = [key for key in _SOULX_REQUIRED_EXTRA_KEYS if not extra_args.get(key)]
-        if missing:
-            raise ValueError(
-                "SoulX-Singer requires the following sampling_params.extra_args fields: "
-                f"{list(_SOULX_REQUIRED_EXTRA_KEYS)}. Missing: {missing}"
-            )
-        return request
+        return attach_preprocess_for_diffusion_request(
+            request,
+            kind=SOULX_SVC_KIND,
+            sample_rate=sample_rate,
+            device=device,
+        )
 
     return pre_process_func
 
@@ -92,6 +72,11 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
             "target_wav_path",
             "prompt_f0_path",
             "target_f0_path",
+            "prompt_audio",
+            "target_audio",
+            "vocal_sep",
+            "preprocess_weights_dir",
+            "preprocess_verbose",
             "auto_shift",
             "pitch_shift",
         }
@@ -200,67 +185,9 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
 
         return overlap_segments, segments
 
-    def _plan_svc_segments(
-        self,
-        target_f0: torch.Tensor,
-        target_duration_sec: float,
-        *,
-        f0_rate: int,
-        ignore_silent_frames_thresh: int = 10,
-        min_duration_sec_per_segment: float = 15.0,
-        max_duration_sec_per_segment: float = 30.0,
-        ignore_silent_frames: bool = True,
-    ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-        """Plan segments so that short and long targets share one inference loop."""
-        adaptive_min_duration = min(min_duration_sec_per_segment, max(target_duration_sec, 1e-6))
-        overlap_segments, segments = self.build_vocal_segments(
-            target_f0,
-            f0_rate=f0_rate,
-            ignore_silent_frames_thresh=ignore_silent_frames_thresh,
-            min_duration_sec_per_segment=adaptive_min_duration,
-            max_duration_sec_per_segment=max_duration_sec_per_segment,
-            ignore_silent_frames=ignore_silent_frames,
-        )
-        if not segments:
-            overlap_segments = [(0.0, target_duration_sec)]
-            segments = [(0.0, target_duration_sec)]
-        return overlap_segments, segments
-
-    def _encode_condition(self, *args, **kwargs) -> torch.Tensor:
-        feature = kwargs["res"]
-        f0_feat = self.f0_encoder(kwargs["f0_course"])
-        cond = feature + f0_feat
+    def _encode_condition(self, *, whisper_features: torch.Tensor, f0_coarse: torch.Tensor) -> torch.Tensor:
+        cond = whisper_features + self.f0_encoder(f0_coarse)
         return self._to_trunk_dtype(cond)[0]
-
-    def _preprocess_metadata(self, extra: dict) -> tuple:
-        prompt_wav_path = extra["prompt_wav_path"]
-        prompt_f0_path = extra["prompt_f0_path"]
-        target_wav_path = extra["target_wav_path"]
-        target_f0_path = extra["target_f0_path"]
-
-        prompt_wav = load_wav(prompt_wav_path, self.audio_config.sample_rate).to(self.device)
-        target_wav = load_wav(target_wav_path, self.audio_config.sample_rate).to(self.device)
-        prompt_f0 = torch.from_numpy(np.load(prompt_f0_path)).unsqueeze(0).to(self.device)
-        target_f0 = torch.from_numpy(np.load(target_f0_path)).unsqueeze(0).to(self.device)
-
-        return prompt_wav, target_wav, prompt_f0, target_f0
-
-    def _resolve_pitch_shift(
-        self,
-        *,
-        auto_shift: bool,
-        pitch_shift: int,
-        prompt_f0: torch.Tensor,
-        target_f0: torch.Tensor,
-    ) -> int:
-        if auto_shift and pitch_shift == 0:
-            if target_f0 is not None and prompt_f0 is not None:
-                target_f0_median = torch.median(target_f0[target_f0 > 0])
-                prompt_f0_median = torch.median(prompt_f0[prompt_f0 > 0])
-                return int(torch.round(torch.log2(prompt_f0_median / target_f0_median) * 1200 / 100).item())
-            logger.warning("Pitch shift is enabled but note_pitch or f0 is not provided. Setting pitch_shift to 0.")
-            return 0
-        return pitch_shift
 
     def _encode_prompt_whisper_feature(self, prompt_wav: torch.Tensor) -> torch.Tensor:
         trunk_dtype = self.f0_encoder.weight.dtype
@@ -283,18 +210,15 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
         num_inference_steps: int,
         guidance_scale: float,
         prompt_feature: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Single-segment SVC inference aligned with ``SoulXSingerSVC.infer_segment``."""
         len_prompt_mel = prompt_mel.shape[1]
         prompt_f0 = F.pad(prompt_f0, (0, 0, 0, max(0, len_prompt_mel - prompt_f0.shape[1])))[:, :len_prompt_mel]
 
-        f0_course_prompt = f0_to_coarse(prompt_f0)
-        f0_course_target = f0_to_coarse(target_f0, f0_shift=int(pitch_shift * 5))
-        if not isinstance(f0_course_prompt, torch.Tensor):
-            f0_course_prompt = torch.as_tensor(f0_course_prompt, device=prompt_f0.device)
-        if not isinstance(f0_course_target, torch.Tensor):
-            f0_course_target = torch.as_tensor(f0_course_target, device=target_f0.device)
-        f0_course = torch.cat([f0_course_prompt, f0_course_target], dim=1)
+        f0_coarse_prompt = f0_to_coarse(prompt_f0)
+        f0_coarse_target = f0_to_coarse(target_f0, f0_shift=int(pitch_shift * 5))
+        f0_coarse = torch.cat([f0_coarse_prompt, f0_coarse_target], dim=1)
 
         trunk_dtype = self.f0_encoder.weight.dtype
         if prompt_feature is None:
@@ -307,16 +231,16 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
             )
         prompt_feature = F.pad(
             prompt_feature,
-            (0, 0, 0, max(0, f0_course_prompt.shape[1] - prompt_feature.shape[1])),
-        )[:, : f0_course_prompt.shape[1], :]
+            (0, 0, 0, max(0, f0_coarse_prompt.shape[1] - prompt_feature.shape[1])),
+        )[:, : f0_coarse_prompt.shape[1], :]
         target_feature = F.pad(
             target_feature,
-            (0, 0, 0, max(0, f0_course_target.shape[1] - target_feature.shape[1])),
-        )[:, : f0_course_target.shape[1], :]
+            (0, 0, 0, max(0, f0_coarse_target.shape[1] - target_feature.shape[1])),
+        )[:, : f0_coarse_target.shape[1], :]
 
-        feature = torch.cat([prompt_feature, target_feature], dim=1)
+        whisper_features = torch.cat([prompt_feature, target_feature], dim=1)
         with self._stage_timer("cond_encode"):
-            cond = self._encode_condition(res=feature, f0_course=f0_course)
+            cond = self._encode_condition(whisper_features=whisper_features, f0_coarse=f0_coarse)
 
         with self._stage_timer("cfm"):
             generated_mel = self._run_flow_matching_loop(
@@ -324,10 +248,11 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
                 cond=cond,
                 n_timesteps=num_inference_steps,
                 cfg=guidance_scale,
+                generator=generator,
             )
 
         with self._stage_timer("vocoder"):
-            generated_audio = self.vocoder(generated_mel.transpose(1, 2)[0:1, ...].float()).squeeze().float()
+            generated_audio = self._mel_to_audio(generated_mel, squeeze=True)
         target_len = target_wav.shape[-1]
         if generated_audio.shape[-1] > target_len:
             generated_audio = generated_audio[:target_len]
@@ -337,32 +262,32 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
 
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        # 1. extract parameters from request
         sampling_params = req.sampling_params
         extra_args = dict(getattr(sampling_params, "extra_args", None) or {})
 
         num_inference_steps = sampling_params.num_inference_steps or _DEFAULT_NUM_INFERENCE_STEPS
         guidance_scale = sampling_params.guidance_scale or _DEFAULT_GUIDANCE_SCALE
 
-        with self._stage_timer("preprocess"):
-            prompt_wav, target_wav, prompt_f0, target_f0 = self._preprocess_metadata(extra_args)
+        with self._stage_timer("consume_payload"):
+            payload = consume_payload(req, SOULX_SVC_KIND, self.device)
+            prompt_wav = payload["prompt_wav"]
+            target_wav = payload["target_wav"]
+            prompt_f0 = payload["prompt_f0"]
+            target_f0 = payload["target_f0"]
 
-        # 2. calculate auto pitch shift
-        auto_shift = extra_args.get("auto_shift", True)
+        auto_shift = extra_args.get("auto_shift", False)
         pitch_shift = extra_args.get("pitch_shift", 0)
-        pitch_shift = self._resolve_pitch_shift(
+        pitch_shift = resolve_pitch_shift(
             auto_shift=auto_shift,
-            pitch_shift=pitch_shift,
+            manual_shift=int(pitch_shift),
             prompt_f0=prompt_f0,
             target_f0=target_f0,
         )
+        generator = self._resolve_diffusion_generator(sampling_params)
 
-        # Mel spectrogram in FP32; CFM trunk dtype align in ``_run_flow_matching_loop``.
         with self._stage_timer("mel"):
             prompt_mel = self.mel(prompt_wav.float() if prompt_wav.dtype != torch.float32 else prompt_wav)
 
-        len_prompt_mel = prompt_mel.shape[1]
-        prompt_f0 = F.pad(prompt_f0, (0, 0, 0, max(0, len_prompt_mel - prompt_f0.shape[1])))[:, :len_prompt_mel]
         prompt_feature = self._encode_prompt_whisper_feature(prompt_wav)
         f0_rate = self.audio_config.sample_rate // self.audio_config.hop_size
         target_duration_sec = target_wav.shape[-1] / self.audio_config.sample_rate
@@ -378,6 +303,7 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 prompt_feature=prompt_feature,
+                generator=generator,
             )
             if generated_audio.dim() == 1:
                 generated_audio = generated_audio.unsqueeze(0)
@@ -387,15 +313,17 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
                 stage_durations=self._profiler_stage_durations() or {},
             )
 
-        overlap_segments, segments = self._plan_svc_segments(
+        overlap_segments, segments = self.build_vocal_segments(
             target_f0,
-            target_duration_sec,
             f0_rate=f0_rate,
             ignore_silent_frames_thresh=10,
-            min_duration_sec_per_segment=15.0,
+            min_duration_sec_per_segment=min(15.0, max(target_duration_sec, 1e-6)),
             max_duration_sec_per_segment=30.0,
             ignore_silent_frames=True,
         )
+        if not segments:
+            overlap_segments = [(0.0, target_duration_sec)]
+            segments = [(0.0, target_duration_sec)]
 
         generated_audio = torch.zeros_like(target_wav)
         for idx in range(len(segments)):
@@ -425,6 +353,7 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 prompt_feature=prompt_feature,
+                generator=generator,
             )
 
             segment_start = int(round(seg_start_sec * self.audio_config.sample_rate))
@@ -441,19 +370,14 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         _patch_torchaudio_load()
-        # Monolithic model-svc.pt checkpoint; see SVS pipeline load_weights for rationale.
         del weights
         weight_path = os.path.join(self.model_path, "model-svc.pt")
-
-        if os.path.exists(weight_path):
-            state = torch.load(weight_path, map_location=self.device)
-            model_weights = state["state_dict"]
-            self.mel.float()
-
-            self.load_state_dict(model_weights, strict=True)
-            self._finalize_loaded_dtypes()
-            logger.info(f"Loaded model weights from {weight_path}")
-        else:
+        if not os.path.isfile(weight_path):
             raise FileNotFoundError(
                 f"Model weights not found at {weight_path}. Please check the pretrained model path."
             )
+        state = torch.load(weight_path, map_location=self.device)
+        self.mel.float()
+        self.load_state_dict(state["state_dict"], strict=True)
+        self._finalize_loaded_dtypes()
+        logger.info("Loaded model weights from %s", weight_path)

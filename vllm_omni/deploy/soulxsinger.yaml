@@ -1,4 +1,5 @@
 # SoulX-Singer deploy: single-stage flow-matching DiT (SVS or SVC).
+# For embedded preprocess, use soulxsinger_svs.yaml / soulxsinger_svc.yaml instead.
 # Pick the pipeline via --model-class-name SoulXSingerPipeline | SoulXSingerSVCPipeline
 # and point MODEL at the SVS or SVC view directory (see examples hub).
 

@@ -501,8 +501,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
-    "SoulXSingerPipeline": "get_soulxsinger_svs_post_process_func",
-    "SoulXSingerSVCPipeline": "get_soulxsinger_svc_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
     "ErnieImagePipeline": "get_ernie_image_post_process_func",

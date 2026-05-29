@@ -86,6 +86,7 @@ def load_wav(wav_path: str, sample_rate: int) -> torch.Tensor:
     Returns:
         torch.Tensor: Waveform tensor with shape (1, T).
     """
+    _patch_torchaudio_load()
     waveform, sr = torchaudio.load(wav_path)
 
     if sr != sample_rate:
@@ -145,6 +146,40 @@ def f0_to_coarse(f0, f0_bin=361, f0_min=32.7031956625, f0_shift=0):
     return f0_coarse
 
 
+def resolve_pitch_shift(
+    *,
+    auto_shift: bool,
+    manual_shift: int,
+    prompt_f0: torch.Tensor | None = None,
+    target_f0: torch.Tensor | None = None,
+    prompt_note_pitch: torch.Tensor | None = None,
+    target_note_pitch: torch.Tensor | None = None,
+) -> int:
+    """Resolve semitone shift for auto_shift; ``f0_to_coarse(..., f0_shift=shift * 5)`` consumes it."""
+    if not auto_shift or manual_shift != 0:
+        return int(manual_shift)
+
+    if prompt_note_pitch is not None and target_note_pitch is not None:
+        target_pitched = target_note_pitch[target_note_pitch >= 1]
+        prompt_pitched = prompt_note_pitch[prompt_note_pitch >= 1]
+        if target_pitched.numel() > 0 and prompt_pitched.numel() > 0:
+            shift = torch.round(prompt_pitched.median() - target_pitched.median())
+            if torch.isfinite(shift):
+                return int(shift.item())
+
+    if prompt_f0 is not None and target_f0 is not None:
+        target_voiced = target_f0[target_f0 > 0]
+        prompt_voiced = prompt_f0[prompt_f0 > 0]
+        if target_voiced.numel() > 0 and prompt_voiced.numel() > 0:
+            shift = torch.round(
+                torch.log2(prompt_voiced.median() / target_voiced.median()) * 1200 / 100
+            )
+            if torch.isfinite(shift):
+                return int(shift.item())
+
+    return 0
+
+
 class MetadataProcessor:
     """Data processor for SoulX-Singer"""
 
@@ -154,7 +189,6 @@ class MetadataProcessor:
         sample_rate: int,
         phoneset_path: str = "soulxsinger/utils/phoneme/phone_set.json",
         device: str = "cuda",
-        prompt_append_duration: float = 0.5,
     ):
         """Initialize data processor.
 
@@ -163,13 +197,10 @@ class MetadataProcessor:
             sample_rate (int): Sample rate in Hz.
             phoneset_path (str): Path to phoneme set JSON file.
             device (str): Device to use for tensor operations.
-            prompt_append_duration (float): Duration to append to prompt in seconds.
         """
         self.hop_size = hop_size
         self.sample_rate = sample_rate
         self.device = device
-        self.prompt_append_duration = prompt_append_duration
-        self.prompt_append_length = int(prompt_append_duration * sample_rate / hop_size)
         self.load_phoneme_id_map(phoneset_path)
 
     def load_phoneme_id_map(self, phoneset_path: str):
@@ -258,7 +289,7 @@ class MetadataProcessor:
             if i >= len(mel2note) or i + j > len(mel2note):
                 break
             if i < len(mel2note) and mel2note[i] > 0:
-                # print(f"warning: overlap of {idx}: {mel2note[i]}")
+                logger.warning(f"warning: overlap of {idx}: {mel2note[i]}")
                 while i < len(mel2note) and mel2note[i] > 0:
                     i += 1
             mel2note[i] = ph_idx
@@ -280,7 +311,7 @@ class MetadataProcessor:
             "mel2note": mel2note.unsqueeze(0),
         }
 
-    def process(self, meta: dict, wav_path: str = None) -> dict[str, torch.Tensor | None]:
+    def process(self, meta: dict, wav_path: str | None = None) -> dict[str, torch.Tensor | None]:
         meta = self.merge_phoneme(meta)
 
         item = self.preprocess(
