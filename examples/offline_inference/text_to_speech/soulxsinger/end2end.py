@@ -1,4 +1,4 @@
-"""Offline SoulX-Singer SVS / SVC: preprocess (stage 0) + DiT (stage 1).
+"""Offline SoulX-Singer SVS / SVC: single-stage DiT (preprocess inline).
 
 Pass raw prompt/target audio; vLLM-Omni runs integrated preprocess then inference.
 
@@ -10,8 +10,8 @@ Usage:
         --preprocess-weights-dir /path/to/SoulX-Singer-Preprocess \\
         -o output.wav
 
-    # SVC
-    python end2end.py --model /path/to/SoulX-Singer-svc --svc \\
+    # SVC (config.json must declare SoulXSingerSVCPipeline; --model points at SVC view)
+    python end2end.py --model /path/to/SoulX-Singer-svc \\
         --prompt-audio path/to/prompt/audio.mp3 \\
         --target-audio path/to/target/audio.mp3 \\
         --preprocess-weights-dir /path/to/SoulX-Singer-Preprocess \\
@@ -24,25 +24,17 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from vllm.sampling_params import SamplingParams
 
-from vllm_omni.diffusion.models.soulx_singer.preprocess.prompt import prepare_multistage_prompt
+from vllm_omni.diffusion.models.soulx_singer.utils import resolve_soulx_kind, validate_soulx_extra_args
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-SOULX_ROOT = REPO_ROOT.parent / "SoulX-Singer"
-# Upstream ``example/infer.sh`` Mandarin demo (zh_prompt + music).
-DEFAULT_PROMPT_AUDIO = SOULX_ROOT / "example/audio/zh_prompt.mp3"
-DEFAULT_TARGET_AUDIO = SOULX_ROOT / "example/audio/music.mp3"
-_FALLBACK_ASSETS = REPO_ROOT / "tests" / "assets" / "soulxsinger"
-if not DEFAULT_PROMPT_AUDIO.is_file():
-    DEFAULT_PROMPT_AUDIO = _FALLBACK_ASSETS / "zh_prompt.mp3"
-if not DEFAULT_TARGET_AUDIO.is_file():
-    DEFAULT_TARGET_AUDIO = _FALLBACK_ASSETS / "music.mp3"
 SVS_DEPLOY_CONFIG = REPO_ROOT / "vllm_omni" / "deploy" / "soulxsinger_svs.yaml"
 SVC_DEPLOY_CONFIG = REPO_ROOT / "vllm_omni" / "deploy" / "soulxsinger_svc.yaml"
+DEFAULT_PROMPT_AUDIO = REPO_ROOT / "tests" / "assets" / "soulxsinger" / "zh_prompt.mp3"
+DEFAULT_TARGET_AUDIO = REPO_ROOT / "tests" / "assets" / "soulxsinger" / "music.mp3"
 _SAMPLE_RATE = 24000
 
 
@@ -70,12 +62,13 @@ def resolve_preprocess_weights_dir(explicit: str | None) -> str:
     )
 
 
-def build_multistage_sampling(
+def build_sampling(
     args: argparse.Namespace,
     *,
     preprocess_weights_dir: str,
-) -> list:
-    stage1_extra: dict = {
+    kind: str,
+) -> OmniDiffusionSamplingParams:
+    extra: dict = {
         "prompt_audio": os.path.abspath(args.prompt_audio),
         "target_audio": os.path.abspath(args.target_audio),
         "preprocess_weights_dir": preprocess_weights_dir,
@@ -83,26 +76,24 @@ def build_multistage_sampling(
         "auto_shift": args.auto_shift,
         "pitch_shift": args.pitch_shift,
     }
-    if args.svs:
-        stage1_extra["language"] = args.language
-        stage1_extra["control"] = args.control
-        # Optional: skip online preprocess (stage-0) when metadata JSON is supplied.
+    if kind == "svs":
+        extra["language"] = args.language
+        extra["control"] = args.control
         if args.prompt_metadata_path:
-            stage1_extra["prompt_metadata_path"] = os.path.abspath(args.prompt_metadata_path)
+            extra["prompt_metadata_path"] = os.path.abspath(args.prompt_metadata_path)
         if args.target_metadata_path:
-            stage1_extra["target_metadata_path"] = os.path.abspath(args.target_metadata_path)
+            extra["target_metadata_path"] = os.path.abspath(args.target_metadata_path)
         if args.prompt_metadata_path or args.target_metadata_path:
-            stage1_extra["audio_path"] = os.path.abspath(args.prompt_wav_path or args.prompt_audio)
+            extra["audio_path"] = os.path.abspath(args.prompt_wav_path or args.prompt_audio)
 
-    return [
-        SamplingParams(max_tokens=1),
-        OmniDiffusionSamplingParams(
-            num_inference_steps=args.num_inference_steps,
-            guidance_scale=args.guidance_scale,
-            seed=args.seed,
-            extra_args=stage1_extra,
-        ),
-    ]
+    extra = validate_soulx_extra_args(kind, extra)
+
+    return OmniDiffusionSamplingParams(
+        num_inference_steps=args.num_inference_steps,
+        guidance_scale=args.guidance_scale,
+        seed=args.seed,
+        extra_args=extra,
+    )
 
 
 def extract_audio(outputs) -> tuple[np.ndarray, int]:
@@ -140,8 +131,11 @@ def extract_audio(outputs) -> tuple[np.ndarray, int]:
 
 def add_inference_args(parser: argparse.ArgumentParser) -> None:
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--svs", action="store_true", help="Singing voice synthesis (default)")
-    mode.add_argument("--svc", action="store_true", help="Singing voice conversion")
+    mode.add_argument(
+        "--svc",
+        action="store_true",
+        help="Assert SVC mode (must match config.json architectures)",
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -222,8 +216,6 @@ def add_inference_args(parser: argparse.ArgumentParser) -> None:
 
 
 def finalize_mode_args(args: argparse.Namespace) -> argparse.Namespace:
-    if not args.svs and not args.svc:
-        args.svs = True
     if args.auto_shift is None:
         # Upstream ``SoulXSinger.infer`` defaults to ``auto_shift=False``.
         args.auto_shift = False
@@ -240,11 +232,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    kind = resolve_soulx_kind(args.model)
+
+    if not (args.svc ^ (kind == "svs")):
+        raise ValueError(f"mode mismatch: {args.model}/config.json (declares {kind!r}), --svc={args.svc}")
+
     required = {
         "prompt_audio": args.prompt_audio,
         "target_audio": args.target_audio,
     }
-    if bool(args.prompt_metadata_path) ^ bool(args.target_metadata_path):
+    if kind == "svs" and bool(args.prompt_metadata_path) ^ bool(args.target_metadata_path):
         raise ValueError(
             "SVS precomputed metadata requires both --prompt-metadata-path and "
             "--target-metadata-path (or neither, for online preprocess)."
@@ -256,20 +253,24 @@ def main() -> None:
         required["prompt_wav_path"] = args.prompt_wav_path
     _require_paths(required)
     preprocess_dir = resolve_preprocess_weights_dir(args.preprocess_weights_dir)
-    deploy_config = args.deploy_config or str(SVS_DEPLOY_CONFIG if args.svs else SVC_DEPLOY_CONFIG)
-    mode = "SVS" if args.svs else "SVC"
+    deploy_config = args.deploy_config or str(SVC_DEPLOY_CONFIG if kind == "svc" else SVS_DEPLOY_CONFIG)
+    mode = kind.upper()
 
     print(f"Loading SoulX-Singer {mode} from {args.model}")
     print(f"  deploy: {deploy_config}")
     print(f"  prompt: {args.prompt_audio}")
     print(f"  target: {args.target_audio}")
 
-    omni = Omni(model=args.model, deploy_config=deploy_config, async_chunk=False)
-    sampling_params_list = build_multistage_sampling(args, preprocess_weights_dir=preprocess_dir)
-    prompt_dict = prepare_multistage_prompt({"prompt_token_ids": [0]}, sampling_params_list)
+    omni = Omni(model=args.model, deploy_config=deploy_config, async_chunk=False)  # SoulX-Singer is batch-only
+    sampling = build_sampling(
+        args,
+        preprocess_weights_dir=preprocess_dir,
+        kind=kind,
+    )
+    prompt = {"prompt_token_ids": [0], "multi_modal_data": {}}
 
-    print("Running generate (preprocess → DiT; long SVS merges segments in one request)...")
-    outputs = list(omni.generate([prompt_dict], sampling_params_list))
+    print("Running generate (inline preprocess + DiT)...")
+    outputs = list(omni.generate([prompt], sampling))
     if not outputs:
         raise RuntimeError("No output from omni.generate")
 

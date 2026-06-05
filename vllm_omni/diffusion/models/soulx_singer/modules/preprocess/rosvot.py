@@ -1,13 +1,23 @@
+"""ROSVOT note transcription adapter.
+
+Heavy core (MidiExtractor, MelNet, ...) loads from external git clone via sys.path.
+SoulX-specific glue (word alignment, note regulation, transcribe) stays here.
+"""
+
+from __future__ import annotations
+
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
-from ..utils import (
+from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.soulx_singer.modules.preprocess.utils import (
+    _load_rosvot_core,
     boundary2Interval,
     denorm_f0,
     f0_to_coarse,
@@ -18,15 +28,90 @@ from ..utils import (
     pad_or_cut_xd,
     resample_mono,
 )
-from .mel import MelNet
-from .rosvot import MidiExtractor
-from .utils import align_word, get_mel_len, regulate_ill_slur, regulate_real_note_itv
 
 logger = init_logger(__name__)
 
 
-class RosvotModel(nn.Module):
-    """ROSVOT: mel + optional shared RMVPE + note boundary/pitch prediction."""
+def regulate_real_note_itv(
+    note_itv: np.ndarray,
+    note_bd: np.ndarray,
+    word_bd: np.ndarray,
+    word_durs: np.ndarray,
+    hop_size: int,
+    audio_sample_rate: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    assert note_itv.shape[0] == np.sum(note_bd) + 1
+    assert np.sum(word_bd) <= np.sum(note_bd)
+    assert word_durs.shape[0] == np.sum(word_bd) + 1, f"{word_durs.shape[0]} {np.sum(word_bd) + 1}"
+    word_bd = np.cumsum(word_bd) * word_bd
+    word_itv = np.zeros((word_durs.shape[0], 2))
+    word_offsets = np.cumsum(word_durs)
+    note2words = np.zeros(note_itv.shape[0], dtype=int)
+    for idx in range(len(word_offsets) - 1):
+        word_itv[idx, 1] = word_itv[idx + 1, 0] = word_offsets[idx]
+    word_itv[-1, 1] = word_offsets[-1]
+    note_itv_secs = note_itv * hop_size / audio_sample_rate
+    for idx, itv in enumerate(note_itv):
+        start_idx, end_idx = itv
+        if word_bd[start_idx] > 0:
+            word_dur_idx = word_bd[start_idx]
+            note_itv_secs[idx, 0] = word_itv[word_dur_idx, 0]
+            note2words[idx] = word_dur_idx
+        if word_bd[end_idx] > 0:
+            word_dur_idx = word_bd[end_idx] - 1
+            note_itv_secs[idx, 1] = word_itv[word_dur_idx, 1]
+            note2words[idx] = word_dur_idx
+    note2words += 1
+    return note_itv_secs, note2words
+
+
+def regulate_ill_slur(
+    notes: np.ndarray, note_itv: np.ndarray, note2words: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    res_note2words: list[int] = []
+    res_note_itv: list[list[float]] = []
+    res_notes: list[int] = []
+    note_idx = 0
+    note_idx_end = 0
+    while note_idx <= len(notes) - 1:
+        while note_idx <= note_idx_end < len(notes) and note2words[note_idx] == note2words[note_idx_end]:
+            note_idx_end += 1
+        res_note2words.append(note2words[note_idx])
+        res_note_itv.append(note_itv[note_idx].tolist())
+        res_notes.append(notes[note_idx])
+        for idx in range(note_idx + 1, note_idx_end):
+            if notes[idx] == notes[idx - 1]:
+                res_note_itv[-1][1] = note_itv[idx][1]
+            else:
+                res_note_itv.append(note_itv[idx].tolist())
+                res_note2words.append(note2words[idx])
+                res_notes.append(notes[idx])
+        note_idx = note_idx_end
+    return (
+        np.array(res_notes, dtype=notes.dtype),
+        np.array(res_note_itv, dtype=note_itv.dtype),
+        np.array(res_note2words, dtype=note2words.dtype),
+    )
+
+
+def _align_word(word_durs: list[float], mel_len: int, hop_size: int, audio_sample_rate: int) -> np.ndarray:
+    mel2word = np.zeros([mel_len], int)
+    start_time = 0.0
+    for i_word, wd in enumerate(word_durs):
+        start_frame = int(start_time * audio_sample_rate / hop_size + 0.5)
+        end_frame = int((start_time + wd) * audio_sample_rate / hop_size + 0.5)
+        mel2word[start_frame:end_frame] = i_word + 1
+        start_time += wd
+    return mel2word
+
+
+class RosvotModel(nn.Module, SupportAudioInput, SupportsComponentDiscovery):
+    support_audio_input: ClassVar[bool] = True
+    _dit_modules: ClassVar[list[str]] = []
+    _encoder_modules: ClassVar[list[str]] = ["."]
+    _vae_modules: ClassVar[list[str]] = []
+    _resident_modules: ClassVar[list[str]] = []
+    _layerwise_offload_blocks_attrs: ClassVar[list[str]] = ["midi.net", "midi.pitch_decoder", "midi.cond_encoder"]
 
     def __init__(
         self,
@@ -36,30 +121,26 @@ class RosvotModel(nn.Module):
         pe: nn.Module | None = None,
         the: float = 0.85,
         verbose: bool = False,
+        rosvot_source_dir: str | Path | None = None,
     ):
         super().__init__()
+        self.verbose = verbose
         ckpt = Path(rosvot_ckpt)
         resolved_config = Path(config_path) if config_path else ckpt.with_name("config.yaml")
-        self.hparams = load_rosvot_config(
-            resolved_config,
-            hparams_str=f"note_bd_threshold={the}",
-        )
+        self.hparams = load_rosvot_config(resolved_config, hparams_str=f"note_bd_threshold={the}")
         if verbose:
             logger.info("ROSVOT config: %s", resolved_config)
 
+        MidiExtractor, MelNet = _load_rosvot_core(rosvot_source_dir)
         self.midi = MidiExtractor(self.hparams)
         self.mel_net = MelNet(self.hparams)
-        if pe is not None and self.hparams.get("use_pitch_embed", False):
-            self.pe = pe
-        else:
-            self.pe = None
+        self.pe = pe if pe is not None and self.hparams.get("use_pitch_embed", False) else None
         self._checkpoint_path = str(ckpt)
         self.load_checkpoint(str(ckpt), verbose=verbose)
         self.eval()
 
     def load_checkpoint(self, checkpoint_path: str | None = None, *, verbose: bool = False) -> None:
-        path = checkpoint_path or self._checkpoint_path
-        load_model_ckpt(self.midi, path, verbose=verbose)
+        load_model_ckpt(self.midi, checkpoint_path or self._checkpoint_path, verbose=verbose)
 
     @torch.no_grad()
     def forward(self, wav: torch.Tensor, word_durs: list[float]) -> dict[str, Any]:
@@ -67,7 +148,7 @@ class RosvotModel(nn.Module):
         if wav.ndim == 1:
             wav = wav.unsqueeze(0)
 
-        mel_len = get_mel_len(wav.shape[-1], hparams["hop_size"])
+        mel_len = (wav.shape[-1] + hparams["hop_size"] - 1) // hparams["hop_size"]
         min_word_dur = hparams.get("min_word_dur", 20) / 1000
         wd_raw = list(word_durs)
         word_durs_filtered: list[float] = []
@@ -80,23 +161,15 @@ class RosvotModel(nn.Module):
             else:
                 word_durs_filtered.append(wd)
 
-        mel2word, _ = align_word(
-            word_durs_filtered,
-            mel_len,
-            hparams["hop_size"],
-            hparams["audio_sample_rate"],
-        )
-        mel2word = np.asarray(mel2word)
+        mel2word = _align_word(word_durs_filtered, mel_len, hparams["hop_size"], hparams["audio_sample_rate"])
         if mel2word.size > 0 and mel2word[0] == 0:
             mel2word = mel2word + 1
 
         real_len = min(mel_len, int(np.sum(mel2word > 0)))
         T = math.ceil(min(real_len, hparams["max_frames"]) / hparams["frames_multiple"]) * hparams["frames_multiple"]
         device = wav.device
-        target_samples = T * hparams["hop_size"]
-        wav_t = wav.float()
-        if wav_t.shape[-1] < target_samples:
-            wav_t = pad_or_cut_xd(wav_t, target_samples, 1)
+        self.mel_net.to(device)
+        wav_t = pad_or_cut_xd(wav.float(), T * hparams["hop_size"], 1)
 
         pitch_coarse = uv_t = None
         if self.pe is not None:
@@ -138,12 +211,7 @@ class RosvotModel(nn.Module):
         return outputs
 
     @staticmethod
-    def _load_wav(
-        wav_src: str | np.ndarray,
-        sample_rate: int,
-        *,
-        src_sample_rate: int | None = None,
-    ) -> np.ndarray:
+    def _load_wav(wav_src: str | np.ndarray, sample_rate: int, *, src_sample_rate: int | None = None) -> np.ndarray:
         if isinstance(wav_src, str):
             wav, _ = load_mono_audio(wav_src, target_sr=sample_rate)
             return wav
@@ -156,20 +224,17 @@ class RosvotModel(nn.Module):
     def _normalize_note2words(note2words: list[int]) -> list[int]:
         if not note2words:
             return []
-        normalized = [note2words[0]]
+        out = [note2words[0]]
         for idx in range(1, len(note2words)):
-            normalized.append(max(note2words[idx], normalized[-1]))
-        return normalized
+            out.append(max(note2words[idx], out[-1]))
+        return out
 
     @staticmethod
     def _build_ep_types(note2words: list[int], align_words: list[str]) -> list[int]:
         ep_types: list[int] = []
         prev = -1
         for i, w in zip(note2words, align_words):
-            if w == "<SP>":
-                ep_types.append(1)
-            else:
-                ep_types.append(2 if i != prev else 3)
+            ep_types.append(1 if w == "<SP>" else (2 if i != prev else 3))
             prev = i
         return ep_types
 
@@ -184,9 +249,8 @@ class RosvotModel(nn.Module):
         if "word_durs" not in item:
             raise ValueError('item must contain "word_durs" from lyric transcription')
 
-        wav_fn = item.get("wav_fn")
-        if wav_fn:
-            wav = self._load_wav(wav_fn, self.hparams["audio_sample_rate"])
+        if item.get("wav_fn"):
+            wav = self._load_wav(item["wav_fn"], self.hparams["audio_sample_rate"])
         elif item.get("wav") is not None:
             wav = self._load_wav(
                 item["wav"],
@@ -212,7 +276,8 @@ class RosvotModel(nn.Module):
         else:
             note_itv_pred = boundary2Interval(note_bd_pred)
             word_bd_for_reg = word_bd[0].detach().cpu().numpy()[:real_len]
-            word_durs_for_reg = np.array(word_durs_filtered)
+            hop = self.hparams["hop_size"]
+            sr = self.hparams["audio_sample_rate"]
 
             if self.hparams.get("infer_regulate_real_note_itv", True):
                 try:
@@ -220,9 +285,9 @@ class RosvotModel(nn.Module):
                         note_itv_pred,
                         note_bd_pred,
                         word_bd_for_reg,
-                        word_durs_for_reg,
-                        self.hparams["hop_size"],
-                        self.hparams["audio_sample_rate"],
+                        np.array(word_durs_filtered),
+                        hop,
+                        sr,
                     )
                     note_pred, note_itv_pred_secs, note2words = regulate_ill_slur(
                         note_pred, note_itv_pred_secs, note2words
@@ -230,10 +295,10 @@ class RosvotModel(nn.Module):
                 except Exception:
                     if verbose:
                         logger.exception("ROSVOT postprocess failed")
-                    note_itv_pred_secs = note_itv_pred * self.hparams["hop_size"] / self.hparams["audio_sample_rate"]
+                    note_itv_pred_secs = note_itv_pred * hop / sr
                     note2words = None
             else:
-                note_itv_pred_secs = note_itv_pred * self.hparams["hop_size"] / self.hparams["audio_sample_rate"]
+                note_itv_pred_secs = note_itv_pred * hop / sr
                 note2words = None
 
             rosvot_out = {

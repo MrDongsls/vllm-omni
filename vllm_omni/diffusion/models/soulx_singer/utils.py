@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -9,7 +10,25 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# ---------------- utils for model loading ----------------
+_PROJECT_ROOT = Path(__file__).parents[4]
+_SOULX_EXAMPLE_AUDIO_DIR = _PROJECT_ROOT / "tests" / "assets" / "soulxsinger"
+
+
+def resolve_phoneset_path(model_dir: str) -> str:
+    """Resolve phoneme vocabulary; prefer model checkpoint, fall back to bundled fixtures."""
+    candidates = (
+        Path(model_dir) / "phoneme" / "phone_set.json",
+        Path(model_dir) / "phone_set.json",
+        _SOULX_EXAMPLE_AUDIO_DIR / "phoneme" / "phone_set.json",
+    )
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+    raise FileNotFoundError(
+        "SoulX-Singer phoneset not found. Expected one of: "
+        f"{[str(p) for p in candidates]}. "
+        "Copy phoneme/phone_set.json into the model directory or use bundled test assets."
+    )
 
 
 def _patch_torchaudio_load() -> None:
@@ -71,6 +90,89 @@ def load_config(config_path: str | Path) -> DictConfig:
         config = OmegaConf.merge(base_config, config)
 
     return config
+
+
+SoulXKind = Literal["svs", "svc"]
+
+_SVS_ARCHITECTURE = "SoulXSingerPipeline"
+_SVC_ARCHITECTURE = "SoulXSingerSVCPipeline"
+_ARCHITECTURE_TO_KIND: dict[str, SoulXKind] = {
+    _SVS_ARCHITECTURE: "svs",
+    _SVC_ARCHITECTURE: "svc",
+}
+
+
+def load_model_config_json(model_dir: str | Path) -> dict[str, Any]:
+    """Load ``config.json`` from a SoulX-Singer model view directory."""
+    cfg_path = Path(model_dir) / "config.json"
+    if not cfg_path.is_file():
+        raise FileNotFoundError(
+            f"SoulX-Singer config.json not found at {cfg_path}. "
+            "Create one with architectures ['SoulXSingerPipeline'] (SVS) or "
+            "['SoulXSingerSVCPipeline'] (SVC); see examples/offline_inference/text_to_speech/README.md."
+        )
+    with cfg_path.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def resolve_soulx_kind(model_dir: str | Path) -> SoulXKind:
+    """Resolve SVS vs SVC from ``config.json`` ``architectures[0]``."""
+    cfg = load_model_config_json(model_dir)
+    archs = cfg.get("architectures") or []
+    if not archs:
+        raise ValueError(
+            f"SoulX-Singer config.json at {Path(model_dir) / 'config.json'} is missing 'architectures'. "
+            "Set architectures to ['SoulXSingerPipeline'] for SVS or ['SoulXSingerSVCPipeline'] for SVC."
+        )
+    arch = archs[0]
+    kind = _ARCHITECTURE_TO_KIND.get(arch)
+    if kind is None:
+        raise ValueError(
+            f"Unknown SoulX-Singer architecture {arch!r} in config.json. Expected one of {list(_ARCHITECTURE_TO_KIND)}."
+        )
+    return kind
+
+
+def validate_soulx_extra_args(kind: SoulXKind, extra_args: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate request ``extra_args`` against the model mode from config.json."""
+    from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
+        SOULX_PRECOMPUTED_KEYS_BY_KIND,
+        has_precomputed,
+    )
+
+    extra_args = dict(extra_args or {})
+    declared = extra_args.pop("kind", None)
+    if declared is not None and declared != kind:
+        logger.warning(
+            "Ignoring extra_args kind=%r; model config.json declares %r.",
+            declared,
+            kind,
+        )
+
+    other_kind: SoulXKind = "svc" if kind == "svs" else "svs"
+    if has_precomputed(extra_args, other_kind):
+        raise ValueError(
+            f"SoulX-Singer config.json declares {kind!r}, but request supplies "
+            f"{other_kind} precomputed paths {list(SOULX_PRECOMPUTED_KEYS_BY_KIND[other_kind])}."
+        )
+
+    if kind == "svc":
+        for key in ("language", "control"):
+            if extra_args.get(key) is not None:
+                logger.warning(
+                    "Ignoring SVS-only extra_arg %r=%r on an SVC model (config.json).",
+                    key,
+                    extra_args.pop(key),
+                )
+        for key in SOULX_PRECOMPUTED_KEYS_BY_KIND["svs"]:
+            if extra_args.get(key):
+                raise ValueError(f"SoulX-Singer SVC model (config.json) does not accept SVS precomputed key {key!r}.")
+    else:
+        for key in SOULX_PRECOMPUTED_KEYS_BY_KIND["svc"]:
+            if extra_args.get(key):
+                raise ValueError(f"SoulX-Singer SVS model (config.json) does not accept SVC precomputed key {key!r}.")
+
+    return extra_args
 
 
 # ---------------- utils for data processing ----------------
@@ -329,3 +431,90 @@ class MetadataProcessor:
             item["wav"] = waveform.to(self.device)[:, : min_frame * self.hop_size]
 
         return item
+
+
+def build_vocal_segments(
+    f0,
+    *,
+    f0_rate: int = 50,
+    ignore_silent_frames_thresh: int = 5,
+    min_duration_sec_per_segment: float = 5.0,
+    max_duration_sec_per_segment: float = 30.0,
+    num_overlaps: int = 1,
+    ignore_silent_frames: bool = True,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Build vocal segments from an F0 contour for chunked SVC inference."""
+    if isinstance(f0, torch.Tensor):
+        f0_np = f0.detach().float().cpu().numpy()
+    else:
+        f0_np = np.asarray(f0, dtype=np.float32)
+    f0_np = np.squeeze(f0_np)
+
+    total_frames = int(f0_np.shape[0])
+    if total_frames == 0:
+        return [], []
+
+    min_frames = max(1, int(round(min_duration_sec_per_segment * f0_rate)))
+    max_frames = max(1, int(round(max_duration_sec_per_segment * f0_rate)))
+
+    split_points = [0]
+
+    def append_split_point(point: int):
+        point = int(max(0, min(point, total_frames)))
+        while point - split_points[-1] > max_frames:
+            split_points.append(split_points[-1] + max_frames)
+        if point > split_points[-1]:
+            split_points.append(point)
+
+    idx = 0
+    while idx < total_frames:
+        if f0_np[idx] == 0:
+            run_start = idx
+            while idx < total_frames and f0_np[idx] == 0:
+                idx += 1
+            run_end = idx
+            if (run_end - run_start) >= ignore_silent_frames_thresh:
+                split_point = max(run_end - 5, (run_start + run_end) // 2)
+                append_split_point(split_point)
+        else:
+            idx += 1
+    append_split_point(total_frames)
+
+    segments: list[tuple[float, float]] = []
+    overlap_segments: list[tuple[float, float]] = []
+
+    def append_segment(start_idx: int, end_idx: int, overlaps: int = num_overlaps):
+        segments.append((split_points[start_idx] / f0_rate, split_points[end_idx] / f0_rate))
+        overlap_start_idx = start_idx
+        if start_idx > 0 and (split_points[end_idx] - split_points[start_idx - overlaps]) <= max_frames:
+            overlap_start_idx = start_idx - overlaps
+        overlap_segments.append((split_points[overlap_start_idx] / f0_rate, split_points[end_idx] / f0_rate))
+
+    segment_start, segment_end = 0, 1
+    while segment_start < len(split_points) - 1:
+        while (
+            segment_end < len(split_points) and (split_points[segment_end] - split_points[segment_start]) < min_frames
+        ):
+            segment_end += 1
+
+        if segment_end >= len(split_points):
+            append_segment(segment_start, len(split_points) - 1, overlaps=num_overlaps)
+            break
+        append_segment(segment_start, segment_end, overlaps=num_overlaps)
+        segment_start = segment_end
+        segment_end = segment_start + 1
+
+    if ignore_silent_frames:
+        filtered_idx = []
+        for i, seg in enumerate(overlap_segments):
+            start_frame = int(seg[0] * f0_rate)
+            end_frame = int(seg[1] * f0_rate)
+            seg_frames = end_frame - start_frame
+            voice_frames = np.sum(f0_np[start_frame:end_frame] > 0)
+            if voice_frames / seg_frames > 0.05 and voice_frames >= 10:
+                filtered_idx.append(i)
+
+        overlap_segments = [overlap_segments[i] for i in filtered_idx]
+        segments = [segments[i] for i in filtered_idx]
+
+    return overlap_segments, segments

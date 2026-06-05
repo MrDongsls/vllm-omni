@@ -685,6 +685,8 @@ def initialize_model_parallel(
     hsdp_replicate_size: int = 1,
     enable_expert_parallel: bool = False,
     backend: str | None = None,
+    *,
+    reuse_existing_tensor_parallel: bool = False,
 ) -> None:
     if backend is None:
         backend = current_omni_platform.dist_backend
@@ -784,81 +786,134 @@ def initialize_model_parallel(
     )
     sp_group_ranks = rank_generator.get_ranks("sp")
     global _DP
-    assert _DP is None, "data parallel group is already initialized"
-    _DP = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("dp"),
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="data",
-    )
-    vllm_parallel_state._DP = _DP
+    if _DP is None:
+        _DP = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("dp"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="data",
+        )
+        vllm_parallel_state._DP = _DP
+    elif not reuse_existing_tensor_parallel:
+        raise RuntimeError("data parallel group is already initialized")
 
     global _CFG
-    assert _CFG is None, "classifier_free_guidance group is already initialized"
-    _CFG = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("cfg"),
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="classifier_free_guidance",
-    )
+    if _CFG is None:
+        _CFG = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("cfg"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="classifier_free_guidance",
+        )
+    elif not reuse_existing_tensor_parallel:
+        raise RuntimeError("classifier_free_guidance group is already initialized")
+
     global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
-    _PP = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("pp"),
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="pipeline",
-    )
-    vllm_parallel_state._PP = _PP
+    if _PP is None:
+        _PP = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("pp"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="pipeline",
+        )
+        vllm_parallel_state._PP = _PP
+    elif not reuse_existing_tensor_parallel:
+        raise RuntimeError("pipeline model parallel group is already initialized")
 
     global _SP
-    assert _SP is None, "sequence parallel group is already initialized"
-    ulysses_pg, ring_pg = set_seq_parallel_pg(
-        sp_ulysses_degree=ulysses_degree,
-        sp_ring_degree=ring_degree,
-        rank=get_world_group().rank_in_group,
-        world_size=dit_parallel_size,
-        sp_group_ranks=sp_group_ranks,
-    )
-    _SP = init_model_parallel_group(
-        group_ranks=sp_group_ranks,
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="sequence",
-        ulysses_group=ulysses_pg,
-        ring_group=ring_pg,
-    )
+    if _SP is None:
+        ulysses_pg, ring_pg = set_seq_parallel_pg(
+            sp_ulysses_degree=ulysses_degree,
+            sp_ring_degree=ring_degree,
+            rank=get_world_group().rank_in_group,
+            world_size=dit_parallel_size,
+            sp_group_ranks=sp_group_ranks,
+        )
+        _SP = init_model_parallel_group(
+            group_ranks=sp_group_ranks,
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="sequence",
+            ulysses_group=ulysses_pg,
+            ring_group=ring_pg,
+        )
+    elif not reuse_existing_tensor_parallel:
+        raise RuntimeError("sequence parallel group is already initialized")
 
-    assert vllm_parallel_state._TP is None, "Tensor parallel group is already initialized"
-    vllm_parallel_state._TP = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("tp"),
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="tensor",
-    )
+    if vllm_parallel_state._TP is None:
+        vllm_parallel_state._TP = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("tp"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="tensor",
+        )
+    elif reuse_existing_tensor_parallel:
+        if vllm_parallel_state._TP.world_size != tensor_parallel_size:
+            raise RuntimeError(
+                "Existing tensor parallel group world size "
+                f"({vllm_parallel_state._TP.world_size}) does not match "
+                f"requested tensor_parallel_size ({tensor_parallel_size})"
+            )
+    else:
+        raise RuntimeError("Tensor parallel group is already initialized")
 
     global _FS
-    assert _FS is None, "fully shard group is already initialized"
-    _FS = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("fs", independent_ranks=True),
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="fully_shard",
-    )
+    if _FS is None:
+        _FS = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("fs", independent_ranks=True),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="fully_shard",
+        )
+    elif not reuse_existing_tensor_parallel:
+        raise RuntimeError("fully shard group is already initialized")
 
     if enable_expert_parallel:
         od_config: OmniDiffusionConfig | None = get_forward_context().omni_diffusion_config
         if od_config and od_config.is_moe:
-            vllm_parallel_state._EP = init_model_parallel_group(
-                group_ranks=rank_generator.get_ranks("ep"),
-                local_rank=get_world_group().local_rank,
-                backend=backend,
-                parallel_mode="expert",
-            )
+            if vllm_parallel_state._EP is None:
+                vllm_parallel_state._EP = init_model_parallel_group(
+                    group_ranks=rank_generator.get_ranks("ep"),
+                    local_rank=get_world_group().local_rank,
+                    backend=backend,
+                    parallel_mode="expert",
+                )
         else:
             raise RuntimeError("Expert parallelism enabled for a non-MoE model ")
 
-    init_dit_group(dit_parallel_size, backend)
+    global _DIT
+    if _DIT is None:
+        init_dit_group(dit_parallel_size, backend)
+
+
+def initialize_embedded_diffusion_parallel(
+    data_parallel_size: int = 1,
+    cfg_parallel_size: int = 1,
+    sequence_parallel_size: int | None = None,
+    ulysses_degree: int = 1,
+    ring_degree: int = 1,
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+    fully_shard_degree: int = 1,
+    hsdp_replicate_size: int = 1,
+    enable_expert_parallel: bool = False,
+    backend: str | None = None,
+) -> None:
+    """Initialize diffusion parallel groups inside an existing vLLM worker."""
+    initialize_model_parallel(
+        data_parallel_size=data_parallel_size,
+        cfg_parallel_size=cfg_parallel_size,
+        sequence_parallel_size=sequence_parallel_size,
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        fully_shard_degree=fully_shard_degree,
+        hsdp_replicate_size=hsdp_replicate_size,
+        enable_expert_parallel=enable_expert_parallel,
+        backend=backend,
+        reuse_existing_tensor_parallel=True,
+    )
 
 
 def destroy_model_parallel():

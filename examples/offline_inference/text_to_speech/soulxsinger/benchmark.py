@@ -20,13 +20,12 @@ from end2end import (
     SVC_DEPLOY_CONFIG,
     SVS_DEPLOY_CONFIG,
     add_inference_args,
-    build_multistage_sampling,
+    build_sampling,
     extract_audio,
     finalize_mode_args,
     resolve_preprocess_weights_dir,
 )
 
-from vllm_omni.diffusion.models.soulx_singer.preprocess.prompt import prepare_multistage_prompt
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
@@ -94,7 +93,7 @@ def main() -> None:
     omni_kwargs: dict = {
         "model": args.model,
         "deploy_config": deploy_config,
-        "async_chunk": False,
+        "async_chunk": False,  # SoulX-Singer currently supports only batch mode (pseudo-streaming was stashed)
     }
     if args.enable_diffusion_pipeline_profiler:
         omni_kwargs["enable_diffusion_pipeline_profiler"] = True
@@ -108,8 +107,9 @@ def main() -> None:
     print(f"Loading SoulX-Singer {mode} from {args.model} [{compile_mode}, dtype={dtype_label}]")
 
     omni = Omni(**omni_kwargs)
-    sampling_params_list = build_multistage_sampling(args, preprocess_weights_dir=preprocess_dir)
-    prompt_dict = prepare_multistage_prompt({"prompt_token_ids": [0]}, sampling_params_list)
+    kind = "svs" if args.svs else "svc"
+    sampling = build_sampling(args, preprocess_weights_dir=preprocess_dir, kind=kind)
+    prompt = {"prompt_token_ids": [0]}
 
     latencies_ms: list[float] = []
     rtfs: list[float] = []
@@ -121,7 +121,7 @@ def main() -> None:
         is_warmup = run_idx < args.warmup
         label = "warmup" if is_warmup else f"run {run_idx - args.warmup + 1}/{args.runs}"
         t0 = time.perf_counter()
-        outputs = list(omni.generate([prompt_dict], sampling_params_list))
+        outputs = list(omni.generate([prompt], sampling))
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         audio_sec = _audio_duration_sec(outputs)
         rtf = (elapsed_ms / 1000.0) / audio_sec if audio_sec > 0 else float("inf")

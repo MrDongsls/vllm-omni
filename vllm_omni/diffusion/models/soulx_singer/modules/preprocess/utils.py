@@ -1,5 +1,6 @@
 """Shared helpers for SoulX preprocess (I/O, config, checkpoints, pitch)."""
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +9,6 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import yaml
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
@@ -111,27 +111,6 @@ def _apply_hparams_str(config: dict[str, Any], hparams_str: str) -> None:
             node[leaf] = type(current)(raw_value) if current is not None else raw_value
 
 
-def load_roformer_yaml_config(config_path: str | Path):
-    """Load Roformer YAML configs that may contain ``!!python/tuple`` tags."""
-
-    class _TupleLoader(yaml.SafeLoader):
-        pass
-
-    def _construct_python_tuple(loader: yaml.SafeLoader, node: yaml.Node) -> tuple[Any, ...]:
-        return tuple(loader.construct_sequence(node))
-
-    yaml.add_constructor(
-        "tag:yaml.org,2002:python/tuple",
-        _construct_python_tuple,
-        Loader=_TupleLoader,
-    )
-    with Path(config_path).expanduser().open(encoding="utf-8") as handle:
-        raw = yaml.load(handle, Loader=_TupleLoader)
-    if not isinstance(raw, dict):
-        raise TypeError(f"Expected dict config, got {type(raw)}")
-    return OmegaConf.create(raw)
-
-
 def load_yaml_config(
     config: str | Path,
     *,
@@ -165,7 +144,7 @@ def load_yaml_config(
                     logger.warning("Skipping missing base config: %s", base_path)
                     continue
                 pending.insert(0, base_path)
-        merged = OmegaConf.merge(merged, current)
+        merged = OmegaConf.merge(current, merged)
 
     result = OmegaConf.to_container(merged, resolve=True)
     if not isinstance(result, dict):
@@ -179,25 +158,6 @@ def load_rosvot_config(config: str | Path, *, hparams_str: str = "") -> dict[str
 
 
 # --- checkpoint loading ---
-
-
-def load_pt_state_dict(
-    module: nn.Module,
-    checkpoint_path: str,
-    *,
-    state_key: str | None = None,
-    strict: bool = False,
-) -> None:
-    ckpt: Any = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    if state_key is not None and isinstance(ckpt, dict) and state_key in ckpt:
-        state_dict = ckpt[state_key]
-    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
-        state_dict = ckpt["state_dict"]
-    elif isinstance(ckpt, dict) and "model" in ckpt:
-        state_dict = ckpt["model"]
-    else:
-        state_dict = ckpt
-    module.load_state_dict(state_dict, strict=strict)
 
 
 def load_model_ckpt(
@@ -280,22 +240,6 @@ def denorm_f0(f0, uv, pitch_norm="log", f0_mean=400, f0_std=100, pitch_padding=N
     return f0
 
 
-def resample_align_curve(points: np.ndarray, original_timestep: float, target_timestep: float, align_length=-1):
-    t_max = (len(points) - 1) * original_timestep
-    curve_interp = np.interp(
-        np.arange(0, t_max, target_timestep),
-        original_timestep * np.arange(len(points)),
-        points,
-    ).astype(points.dtype)
-    if align_length > 0:
-        delta_l = align_length - len(curve_interp)
-        if delta_l < 0:
-            curve_interp = curve_interp[:align_length]
-        elif delta_l > 0:
-            curve_interp = np.concatenate((curve_interp, np.full(delta_l, fill_value=curve_interp[-1])), axis=0)
-    return curve_interp
-
-
 def boundary2Interval(bd):
     is_torch = isinstance(bd, torch.Tensor)
     if is_torch:
@@ -315,3 +259,34 @@ def boundary2Interval(bd):
     if is_torch:
         return torch.LongTensor(ret).to(device)
     return ret
+
+
+# --- import helpers (ROSVOT / RMVPE) ---
+
+
+def _load_rosvot_core(source_dir: str | Path | None) -> tuple[type, type]:
+    if source_dir is None:
+        raise ValueError("ROSVOT_SOURCE_DIR is not set")
+
+    src = Path(source_dir).resolve()
+    standard_root = src if (src / "modules" / "rosvot").is_dir() else None
+    if standard_root is None:
+        standard_root = next(
+            (c for c in [src, *src.parents[:6]] if (c / "modules" / "rosvot").is_dir()),
+            None,
+        )
+    if standard_root is not None:
+        if str(standard_root) not in sys.path:
+            sys.path.insert(0, str(standard_root))
+
+        from modules.rosvot.rosvot import MidiExtractor  # type: ignore
+        from utils.audio.mel import MelNet  # type: ignore
+
+        logger.info("[rosvot] loaded core from %s", standard_root)
+        return MidiExtractor, MelNet
+
+    else:
+        raise RuntimeError(
+            "ROSVOT core not found. git clone https://github.com/RickyL-2000/ROSVOT "
+            "and set ROSVOT_SOURCE_DIR or pass rosvot_source_dir."
+        )

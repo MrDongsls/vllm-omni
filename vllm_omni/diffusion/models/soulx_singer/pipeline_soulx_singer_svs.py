@@ -1,6 +1,7 @@
-import os
+"""SoulX-Singer SVS (score-driven) pipeline implementation."""
+
 from collections.abc import Iterable
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -15,39 +16,91 @@ from vllm_omni.diffusion.models.soulx_singer.modules import (
 from vllm_omni.diffusion.models.soulx_singer.pipeline_soulx_singer_base import (
     FlowMatchingAudioPipeline,
 )
+from vllm_omni.diffusion.models.soulx_singer.preprocess.ipc_codec import (
+    SOULX_PREPROCESSED_KEY,
+    get_soulx_preprocessed_payload,
+)
 from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
-    SOULX_SVS_KIND,
-    consume_payload,
+    has_precomputed,
 )
 from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import (
     attach_preprocess_for_diffusion_request,
     build_metadata_processor,
+    is_warmup_request,
+    normalize_svs_control_extra_args,
+    resolve_preprocess_audio,
 )
 from vllm_omni.diffusion.models.soulx_singer.utils import (
-    _patch_torchaudio_load,
     f0_to_coarse,
     resolve_pitch_shift,
+    validate_soulx_extra_args,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
 
-_DEFAULT_NUM_INFERENCE_STEPS = 32
-_DEFAULT_GUIDANCE_SCALE = 1.0
-
 
 def get_soulxsinger_pre_process_func(od_config: OmniDiffusionConfig):
     """Validate/load SVS preprocess payload for single-stage or stage-1 DiT."""
     metadata_processor = build_metadata_processor(od_config)
+    _pipeline = None
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        nonlocal _pipeline
+
+        extra_args = validate_soulx_extra_args(
+            "svs",
+            dict(getattr(request.sampling_params, "extra_args", None) or {}),
+        )
+
+        # Inline build: when no warmup/no precomputed paths/no IPC payload,
+        # build the preprocess payload directly from audio file paths.
+        if not (is_warmup_request(request) or has_precomputed(extra_args, "svs")):
+            prompt = request.prompts[0]
+            if not isinstance(prompt, str) and not get_soulx_preprocessed_payload(prompt):  # type: ignore[arg-type]
+                prompt_audio, target_audio = resolve_preprocess_audio(prompt, extra_args)  # type: ignore[arg-type]
+                if prompt_audio is not None and target_audio is not None:
+                    if _pipeline is None:
+                        from vllm_omni.diffusion.models.soulx_singer.modules.preprocess.pipeline import (
+                            SoulXPreprocessPipeline,
+                        )
+
+                        _pipeline = SoulXPreprocessPipeline(
+                            od_config=od_config,
+                            vocal_sep=bool(extra_args.get("vocal_sep", False)),
+                            verbose=bool(extra_args.get("preprocess_verbose", False)),
+                            extra_args=extra_args,
+                        )
+                    payload = _pipeline.build_svs_payload_from_audio(
+                        prompt_audio=prompt_audio,
+                        target_audio=target_audio,
+                        metadata_processor=metadata_processor,
+                        language=str(extra_args.get("language", "Mandarin")),
+                        vocal_sep=extra_args.get("vocal_sep"),
+                        prompt_vocal_sep=extra_args.get("prompt_vocal_sep"),
+                        target_vocal_sep=extra_args.get("target_vocal_sep"),
+                        prompt_max_merge_duration_ms=extra_args.get("prompt_max_merge_duration"),
+                        target_max_merge_duration_ms=extra_args.get("target_max_merge_duration"),
+                    )
+                    payload.setdefault("kind", "svs")
+                    prompt.setdefault("additional_information", {})[SOULX_PREPROCESSED_KEY] = payload  # type: ignore[union-attr, assignment]
+
         return attach_preprocess_for_diffusion_request(
             request,
-            kind=SOULX_SVS_KIND,
+            kind="svs",
             metadata_processor=metadata_processor,
         )
 
     return pre_process_func
+
+
+def get_soulxsinger_post_process_func(od_config: OmniDiffusionConfig):
+    """Convert pipeline audio tensor output for offline consumers."""
+
+    def post_process_func(audio: torch.Tensor):
+        return audio.detach().cpu().float().numpy()
+
+    return post_process_func
 
 
 def _expand_states(h: torch.Tensor, mel2token: torch.Tensor) -> torch.Tensor:
@@ -186,7 +239,7 @@ class PipelineSoulXSingerSVS(FlowMatchingAudioPipeline):
         if prompt_mel is None:
             prompt_wav = prompt_meta["wav"]
             with self._stage_timer("mel"):
-                prompt_mel = self.mel(prompt_wav.float() if prompt_wav.dtype != torch.float32 else prompt_wav)
+                prompt_mel = self._mel_from_wav(prompt_wav)
 
         if prompt_mel.shape[1] > len_prompt_mel:
             prompt_mel = prompt_mel[:, :len_prompt_mel, :]
@@ -218,92 +271,84 @@ class PipelineSoulXSingerSVS(FlowMatchingAudioPipeline):
         with self._stage_timer("vocoder"):
             return self._mel_to_audio(generated_mel)
 
+    def infer_svs_batch(
+        self,
+        payload: dict[str, Any],
+        *,
+        extra_args: dict[str, Any],
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        """Pure batch (non-streaming): run diffusion for each target segment in order and concat."""
+        prompt_meta_raw = payload.get("prompt_meta")
+        target_meta_list = payload["target_meta_list"]
+        control = str(extra_args.get("control", "score"))
+
+        prompt_meta = None
+        prompt_mel = None
+        if prompt_meta_raw:
+            prompt_meta = self._ensure_processed_meta(prompt_meta_raw)
+            prompt_meta = self._apply_control_mode(prompt_meta, control)
+            if prompt_meta and prompt_meta.get("wav") is not None:
+                prompt_mel = self._mel_from_wav(prompt_meta["wav"])
+
+        pieces: list[torch.Tensor] = []
+        pitch_shift = 0
+
+        for idx, target_raw in enumerate(target_meta_list):
+            target_meta = self._ensure_processed_meta(target_raw)
+            target_meta = self._apply_control_mode(target_meta, control)
+
+            if idx == 0:
+                pitch_shift = resolve_pitch_shift(
+                    auto_shift=bool(extra_args.get("auto_shift", False)),
+                    manual_shift=int(extra_args.get("pitch_shift", 0)),
+                    prompt_f0=prompt_meta["f0"] if prompt_meta else None,
+                    target_f0=target_meta["f0"],
+                    prompt_note_pitch=prompt_meta["note_pitch"] if prompt_meta else None,
+                    target_note_pitch=target_meta["note_pitch"],
+                )
+
+            seg = self._infer_svs_segment(
+                prompt_meta or {},
+                target_meta,
+                pitch_shift=pitch_shift,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                prompt_mel=prompt_mel,
+                generator=generator,
+            )
+            pieces.append(seg.squeeze())
+
+        if not pieces:
+            return torch.zeros(1, 0, device=self.device, dtype=torch.float32), pitch_shift
+
+        full = torch.cat(pieces, dim=-1)
+        return full.unsqueeze(0), pitch_shift
+
     @staticmethod
     def _apply_control_mode(meta: dict, control: str) -> dict:
         meta["note_pitch"] = meta["note_pitch"] if control == "score" else None
         meta["f0"] = meta["f0"] if control == "melody" else None
         return meta
 
+    def _ensure_processed_meta(self, meta: dict) -> dict:
+        if isinstance(meta.get("phoneme"), torch.Tensor):
+            return meta
+        return self.metadata_processor.process(meta, None)
+
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        sampling_params = req.sampling_params
-        extra_args = dict(getattr(sampling_params, "extra_args", None) or {})
-
-        control = extra_args.get("control")
-        if control is None:
-            control = "score"
-            logger.warning("control is not provided, using 'score' as default")
-        elif control not in ("score", "melody"):
-            raise ValueError(f"Invalid control: {control}. Must be one of: ['score', 'melody']")
-        extra_args["control"] = control
-        sampling_params.extra_args = extra_args
-
-        num_inference_steps = sampling_params.num_inference_steps or _DEFAULT_NUM_INFERENCE_STEPS
-        guidance_scale = sampling_params.guidance_scale or _DEFAULT_GUIDANCE_SCALE
-
-        auto_shift = extra_args.get("auto_shift", False)
-        pitch_shift = int(extra_args.get("pitch_shift", 0))
-        generator = self._resolve_diffusion_generator(sampling_params)
-
-        with self._stage_timer("consume_payload"):
-            payload = consume_payload(req, SOULX_SVS_KIND, self.device)
-            prompt_meta = self._apply_control_mode(payload["prompt_meta"], control)
-            target_meta_list = payload["target_meta_list"]
-
-        sample_rate = self.audio_config.sample_rate
-        generated_len = int(target_meta_list[-1]["time"][1] / 1000 * sample_rate)
-        generated_merged = torch.zeros(generated_len, device=self.device, dtype=torch.float32)
-        last_pitch_shift = 0
-
-        prompt_wav = prompt_meta["wav"]
-        with self._stage_timer("mel"):
-            prompt_mel = self.mel(prompt_wav.float() if prompt_wav.dtype != torch.float32 else prompt_wav)
-
-        for target_raw in target_meta_list:
-            target_meta = self.metadata_processor.process(target_raw, None)
-            target_meta = self._apply_control_mode(target_meta, control)
-
-            last_pitch_shift = resolve_pitch_shift(
-                auto_shift=auto_shift,
-                manual_shift=pitch_shift,
-                prompt_f0=prompt_meta["f0"],
-                target_f0=target_meta["f0"],
-                prompt_note_pitch=prompt_meta["note_pitch"],
-                target_note_pitch=target_meta["note_pitch"],
-            )
-            segment_audio = self._infer_svs_segment(
-                prompt_meta,
-                target_meta,
-                pitch_shift=last_pitch_shift,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                prompt_mel=prompt_mel,
-                generator=generator,
-            )
-            segment_flat = segment_audio.squeeze()
-            start_sample_idx = int(target_raw["time"][0] / 1000 * sample_rate)
-            gen_len = min(segment_flat.shape[0], generated_len - start_sample_idx)
-            with self._stage_timer("merge"):
-                generated_merged[start_sample_idx : start_sample_idx + gen_len] = segment_flat[:gen_len]
-
-        merged_audio = generated_merged.unsqueeze(0)
-
-        return DiffusionOutput(
-            output=merged_audio,
-            custom_output={"f0_shift": last_pitch_shift},
-            stage_durations=self._profiler_stage_durations() or {},
+        return self._forward_batch_from_request(
+            req,
+            kind="svs",
+            custom_output_key="f0_shift",
+            infer_batch_fn=self.infer_svs_batch,
+            prepare_extra_args=lambda extra_args, _sampling: normalize_svs_control_extra_args(extra_args),
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         del weights
-        _patch_torchaudio_load()
-        weight_path = os.path.join(self.model_path, "model.pt")
-        if not os.path.isfile(weight_path):
-            raise FileNotFoundError(
-                f"Model weights not found at {weight_path}. Please check the pretrained model path."
-            )
-        state = torch.load(weight_path, map_location=self.device)
-        self.mel.float()
-        self.load_state_dict(state["state_dict"], strict=True)
-        self._finalize_loaded_dtypes()
-        logger.info("Loaded model weights from %s", weight_path)
+        self._load_soulx_checkpoint("model.pt")
+        return {name for name, _ in self.named_parameters()}

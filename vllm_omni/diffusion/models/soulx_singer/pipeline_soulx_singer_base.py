@@ -1,7 +1,7 @@
 import os
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, ClassVar
 
 import torch
@@ -9,7 +9,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin, _unwrap, _wrap
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import (
@@ -17,51 +17,18 @@ from vllm_omni.diffusion.models.interface import (
     SupportAudioOutput,
     SupportsComponentDiscovery,
 )
+from vllm_omni.diffusion.models.soulx_singer.preprocess.ipc_codec import consume_payload
 from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import build_metadata_processor
 from vllm_omni.diffusion.models.soulx_singer.utils import _patch_torchaudio_load, load_config
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
-PROJECT_ROOT = Path(__file__).parents[4]
-_SOULX_EXAMPLE_AUDIO_DIR = PROJECT_ROOT / "tests" / "assets" / "soulxsinger"
-
 _SOULX_PROFILER_TARGETS: ClassVar[list[str]] = [
     "forward",
 ]
-
-
-def _resolve_phoneset_path(model_dir: str) -> str:
-    """Resolve phoneme vocabulary; prefer model checkpoint, fall back to bundled fixtures."""
-    candidates = (
-        Path(model_dir) / "phoneme" / "phone_set.json",
-        Path(model_dir) / "phone_set.json",
-        _SOULX_EXAMPLE_AUDIO_DIR / "phoneme" / "phone_set.json",
-    )
-    for path in candidates:
-        if path.is_file():
-            return str(path)
-    raise FileNotFoundError(
-        "SoulX-Singer phoneset not found. Expected one of: "
-        f"{[str(p) for p in candidates]}. "
-        "Copy phoneme/phone_set.json into the model directory or use bundled test assets."
-    )
-
-
-def get_soulxsinger_post_process_func(od_config: OmniDiffusionConfig):
-    """Convert pipeline audio tensor output for offline consumers."""
-    del od_config
-
-    def post_process_func(
-        audio: torch.Tensor,
-        output_type: str = "np",
-    ):
-        if output_type in ("latent", "pt"):
-            return audio
-        return audio.detach().cpu().float().numpy()
-
-    return post_process_func
 
 
 class FlowMatchingAudioPipeline(
@@ -127,6 +94,23 @@ class FlowMatchingAudioPipeline(
     def _mel_to_audio(self, generated_mel: torch.Tensor, *, squeeze: bool = False) -> torch.Tensor:
         audio = self.vocoder(generated_mel.transpose(1, 2)[0:1, ...].float()).float()
         return audio.squeeze() if squeeze else audio
+
+    def _mel_from_wav(self, wav: torch.Tensor) -> torch.Tensor:
+        if wav.dtype != torch.float32:
+            wav = wav.float()
+        return self.mel(wav)
+
+    def _load_soulx_checkpoint(self, checkpoint_name: str) -> None:
+        weight_path = os.path.join(self.model_path, checkpoint_name)
+        if not os.path.isfile(weight_path):
+            raise FileNotFoundError(
+                f"Model weights not found at {weight_path}. Please check the pretrained model path."
+            )
+        state = torch.load(weight_path, map_location=self.device)
+        self.mel.float()
+        self.load_state_dict(state["state_dict"], strict=True)
+        self._finalize_loaded_dtypes()
+        logger.info("Loaded model weights from %s", weight_path)
 
     def _setup_soulx_profiler(self, *, extra_targets: list[str] | None = None) -> None:
         """Enable stage timing when ``od_config.enable_diffusion_pipeline_profiler`` is set."""
@@ -339,3 +323,40 @@ class FlowMatchingAudioPipeline(
             xt = xt + flow_pred * h_tensor
 
         return xt
+
+    def _forward_batch_from_request(
+        self,
+        req: OmniDiffusionRequest,
+        *,
+        kind: str,
+        custom_output_key: str,
+        infer_batch_fn: Callable[..., tuple[torch.Tensor, int]],
+        prepare_extra_args: Callable[[dict[str, Any], Any], dict[str, Any]] | None = None,
+    ) -> DiffusionOutput:
+        sampling_params = req.sampling_params
+        extra_args = dict(getattr(sampling_params, "extra_args", None) or {})
+        if prepare_extra_args is not None:
+            extra_args = prepare_extra_args(extra_args, sampling_params)
+            sampling_params.extra_args = extra_args
+
+        num_inference_steps = sampling_params.num_inference_steps or 32
+        guidance_scale = sampling_params.guidance_scale or 3.0
+        generator = self._resolve_diffusion_generator(sampling_params)
+
+        with self._stage_timer("consume_payload"):
+            payload = consume_payload(req, kind, self.device)
+
+        with self._stage_timer("infer_segments"):
+            audio, pitch_shift = infer_batch_fn(
+                payload,
+                extra_args=extra_args,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+            )
+
+        return DiffusionOutput(
+            output=audio,
+            custom_output={custom_output_key: pitch_shift},
+            stage_durations=self._profiler_stage_durations() or {},
+        )

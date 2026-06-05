@@ -1,4 +1,4 @@
-"""E2E offline multistage tests for SoulX-Singer (preprocess → SVS/SVC)."""
+"""E2E offline inference tests for SoulX-Singer (single-stage, preprocess inline)."""
 
 import functools
 import importlib
@@ -10,13 +10,12 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import numpy as np
 import pytest
-from vllm.sampling_params import SamplingParams
 
+from tests.e2e.offline_inference.soulx_test_env import ensure_rosvot_source_dir
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
-from vllm_omni.diffusion.models.soulx_singer.preprocess.prompt import prepare_multistage_prompt
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 PROMPT_AUDIO = get_asset_path("soulxsinger/zh_prompt.mp3")
@@ -31,6 +30,12 @@ if not PROMPT_AUDIO.is_file() or not TARGET_AUDIO.is_file():
     )
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion, pytest.mark.tts]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _soulx_rosvot_env() -> None:
+    ensure_rosvot_source_dir()
+
 
 _CASES = (
     pytest.param(
@@ -92,10 +97,14 @@ def soulx_weights() -> tuple[Path, Path]:
 def _model_view(base: Path, name: str, architecture: str) -> str:
     view = base / ".pytest_soulx_views" / name
     view.mkdir(parents=True, exist_ok=True)
-    for fname in ("config.yaml", "model.pt", "model-svc.pt"):
+    for fname in ("config.yaml",):
         src, dst = base / fname, view / fname
         if src.is_file() and not dst.exists():
             dst.symlink_to(src.resolve())
+    ckpt = "model.pt" if architecture == "SoulXSingerPipeline" else "model-svc.pt"
+    src, dst = base / ckpt, view / ckpt
+    if src.is_file() and not dst.exists():
+        dst.symlink_to(src.resolve())
     phoneset = base / "phoneme" / "phone_set.json"
     if not phoneset.is_file():
         phoneset = PHONE_SET
@@ -104,7 +113,10 @@ def _model_view(base: Path, name: str, architecture: str) -> str:
         dst = view / "phoneme" / "phone_set.json"
         if not dst.exists():
             dst.symlink_to(phoneset.resolve())
-    (view / "config.json").write_text(json.dumps({"model_type": "soulxsinger", "architectures": [architecture]}) + "\n")
+    if not (view / "config.json").is_file():
+        (view / "config.json").write_text(
+            json.dumps({"model_type": "soulxsinger", "architectures": [architecture]}) + "\n"
+        )
     return str(view.resolve())
 
 
@@ -142,9 +154,7 @@ def test_soulxsinger_multistage_from_audio(
         stage_configs_path=get_deploy_config_path(deploy_yaml),
         async_chunk=False,
     ) as runner:
-        sampling = runner.get_default_sampling_params_list()
-        sampling[0] = SamplingParams(max_tokens=1)
-        sampling[1] = OmniDiffusionSamplingParams(
+        sampling = OmniDiffusionSamplingParams(
             num_inference_steps=4,
             guidance_scale=3.0,
             seed=42,
@@ -155,7 +165,7 @@ def test_soulxsinger_multistage_from_audio(
                 **extra_args,
             },
         )
-        prompt = prepare_multistage_prompt({"prompt_token_ids": [0]}, sampling)
+        prompt = {"prompt_token_ids": [0]}
         outputs = runner.generate([prompt], sampling)
 
     assert outputs and outputs[0].error is None, outputs[0].error if outputs else "no output"
@@ -165,4 +175,4 @@ def test_soulxsinger_multistage_from_audio(
     assert 12_000 <= audio.size
     assert np.isfinite(audio).all() and float(np.max(np.abs(audio))) > 1e-4
     duration_s = audio.size / SAMPLE_RATE
-    assert 15.0 <= duration_s <= 70.0, f"duration={duration_s:.1f}s"
+    assert 50.0 <= duration_s <= 52.0, f"duration={duration_s:.1f}s"

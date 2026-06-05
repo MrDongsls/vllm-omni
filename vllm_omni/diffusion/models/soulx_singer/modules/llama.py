@@ -6,6 +6,8 @@ from transformers import LlamaConfig, LlamaModel
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
+
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -103,6 +105,17 @@ class LlamaNARDecoderLayer(LlamaDecoderLayer):
 class DiffLlama(LlamaModel):
     # Regional torch.compile in DiffusionModelRunner targets these blocks.
     _repeated_blocks = ["LlamaNARDecoderLayer"]
+    _layerwise_offload_blocks_attrs = ["layers"]
+
+    # Sequence parallelism: shard mel sequence before the first decoder layer and
+    # gather after the output projection. Tensor parallelism still requires
+    # migrating attention to vLLM parallel linear layers.
+    _sp_plan = {
+        "layers.0": {
+            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
+        },
+        "mel_out_mlp": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     @staticmethod
     def _is_transformer_block(name: str, module: nn.Module) -> bool:

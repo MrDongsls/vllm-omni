@@ -1,12 +1,12 @@
-"""Resolve SoulX preprocess checkpoint locations via vLLM-Omni model loading helpers."""
+"""Resolve SoulX preprocess checkpoint locations."""
 
 import os
 from pathlib import Path
 
+from huggingface_hub import snapshot_download
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
 
@@ -22,17 +22,15 @@ def resolve_preprocess_weights_root(
     extra_args = extra_args or {}
     candidates: list[Path] = []
 
-    if override := extra_args.get("preprocess_weights_dir"):
-        candidates.append(Path(str(override)).expanduser())
     if env_override := os.environ.get("SOULX_PREPROCESS_WEIGHTS_DIR"):
         candidates.append(Path(env_override).expanduser())
 
+    # assume model weight dir and preprocess weight dir share the same parent directory
     model_dir = Path(od_config.model).expanduser()
     candidates.extend(
         [
             model_dir / "preprocess",
             model_dir.parent / "SoulX-Singer-Preprocess",
-            model_dir.parent / "pretrained_models" / "SoulX-Singer-Preprocess",
         ]
     )
 
@@ -46,11 +44,7 @@ def resolve_preprocess_weights_root(
         "SoulX preprocess weights not found locally; downloading %s",
         _PREPROCESS_WEIGHTS_REPO,
     )
-    downloaded = download_weights_from_hf_specific(
-        _PREPROCESS_WEIGHTS_REPO,
-        cache_dir=None,
-        allow_patterns=["*"],
-    )
+    downloaded = snapshot_download(_PREPROCESS_WEIGHTS_REPO, allow_patterns=["*"])
     return Path(downloaded).resolve()
 
 

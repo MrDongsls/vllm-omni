@@ -1,9 +1,16 @@
+"""Rule-based vocal segmentation from F0 contour (no neural net)."""
+
+from __future__ import annotations
+
 import time
 from dataclasses import dataclass
+from typing import ClassVar
 
 import numpy as np
 import torch.nn as nn
 from vllm.logger import init_logger
+
+from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportsComponentDiscovery
 
 logger = init_logger(__name__)
 
@@ -171,8 +178,13 @@ def _voiced_to_segments(
     return segments
 
 
-class VocalSegmenter(nn.Module):
-    """Split vocal audio into in-memory segments from an f0 contour."""
+class VocalSegmenter(nn.Module, SupportAudioInput, SupportsComponentDiscovery):
+    support_audio_input: ClassVar[bool] = True
+    _dit_modules: ClassVar[list[str]] = []
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = []
+    _resident_modules: ClassVar[list[str]] = ["."]
+    _layerwise_offload_blocks_attrs: ClassVar[list[str]] = []
 
     def __init__(self, config: VocalSegmentConfig | None = None, *, verbose: bool = False):
         super().__init__()

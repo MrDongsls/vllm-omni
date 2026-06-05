@@ -1,6 +1,8 @@
+"""SoulX-Singer SVC (voice conversion) pipeline implementation."""
+
 import os
 from collections.abc import Iterable
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -18,43 +20,86 @@ from vllm_omni.diffusion.models.soulx_singer.modules import (
 from vllm_omni.diffusion.models.soulx_singer.pipeline_soulx_singer_base import (
     FlowMatchingAudioPipeline,
 )
+from vllm_omni.diffusion.models.soulx_singer.preprocess.ipc_codec import (
+    SOULX_PREPROCESSED_KEY,
+    get_soulx_preprocessed_payload,
+)
 from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
-    SOULX_SVC_KIND,
-    consume_payload,
+    has_precomputed,
 )
 from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import (
     attach_preprocess_for_diffusion_request,
+    is_warmup_request,
+    resolve_preprocess_audio,
 )
 from vllm_omni.diffusion.models.soulx_singer.utils import (
-    _patch_torchaudio_load,
     f0_to_coarse,
     load_config,
     resolve_pitch_shift,
+    validate_soulx_extra_args,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
 
-_DEFAULT_NUM_INFERENCE_STEPS = 32
-_DEFAULT_GUIDANCE_SCALE = 3.0
-_LONG_AUDIO_SEGMENT_THRESHOLD_SEC = 30.0
-
 
 def get_soulxsinger_svc_pre_process_func(od_config: OmniDiffusionConfig):
-    """Validate/load SVC preprocess payload for single-stage or stage-1 DiT."""
     hf_config = load_config(os.path.join(od_config.model, "config.yaml"))
     sample_rate = hf_config.audio.sample_rate
     device = get_local_device()
+    _pipeline = None
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        nonlocal _pipeline
+
+        extra_args = validate_soulx_extra_args(
+            "svc",
+            dict(getattr(request.sampling_params, "extra_args", None) or {}),
+        )
+
+        # Inline build: when no warmup/no precomputed paths/no IPC payload,
+        # build the preprocess payload directly from audio file paths.
+        if not (is_warmup_request(request) or has_precomputed(extra_args, "svc")):
+            prompt = request.prompts[0]
+            if not isinstance(prompt, str) and not get_soulx_preprocessed_payload(prompt):  # type: ignore[arg-type]
+                prompt_audio, target_audio = resolve_preprocess_audio(prompt, extra_args)  # type: ignore[arg-type]
+                if prompt_audio is not None and target_audio is not None:
+                    if _pipeline is None:
+                        from vllm_omni.diffusion.models.soulx_singer.modules.preprocess.pipeline import (
+                            SoulXPreprocessPipeline,
+                        )
+
+                        _pipeline = SoulXPreprocessPipeline(
+                            od_config=od_config,
+                            vocal_sep=bool(extra_args.get("vocal_sep", False)),
+                            verbose=bool(extra_args.get("preprocess_verbose", False)),
+                            extra_args=extra_args,
+                        )
+                    payload = _pipeline.build_svc_payload_from_audio(
+                        prompt_audio=prompt_audio,
+                        target_audio=target_audio,
+                        sample_rate=sample_rate,
+                        device=device,
+                        vocal_sep=extra_args.get("vocal_sep"),
+                    )
+                    payload.setdefault("kind", "svc")
+                    prompt.setdefault("additional_information", {})[SOULX_PREPROCESSED_KEY] = payload  # type: ignore[union-attr, assignment]
+
         return attach_preprocess_for_diffusion_request(
             request,
-            kind=SOULX_SVC_KIND,
+            kind="svc",
             sample_rate=sample_rate,
             device=device,
         )
 
     return pre_process_func
+
+
+def get_soulxsinger_post_process_func(od_config: OmniDiffusionConfig):
+    def post_process_func(audio: torch.Tensor):
+        return audio.detach().cpu().float().numpy()
+
+    return post_process_func
 
 
 class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
@@ -97,94 +142,6 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
 
         self._setup_soulx_profiler()
 
-    @staticmethod
-    def build_vocal_segments(
-        f0,
-        *,
-        f0_rate: int = 50,
-        ignore_silent_frames_thresh: int = 5,
-        min_duration_sec_per_segment: float = 5.0,
-        max_duration_sec_per_segment: float = 30.0,
-        num_overlaps: int = 1,
-        ignore_silent_frames: bool = True,
-    ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-        """Build vocal segments from an F0 contour for chunked SVC inference."""
-        if isinstance(f0, torch.Tensor):
-            f0_np = f0.detach().float().cpu().numpy()
-        else:
-            f0_np = np.asarray(f0, dtype=np.float32)
-        f0_np = np.squeeze(f0_np)
-
-        total_frames = int(f0_np.shape[0])
-        if total_frames == 0:
-            return [], []
-
-        min_frames = max(1, int(round(min_duration_sec_per_segment * f0_rate)))
-        max_frames = max(1, int(round(max_duration_sec_per_segment * f0_rate)))
-
-        split_points = [0]
-
-        def append_split_point(point: int):
-            point = int(max(0, min(point, total_frames)))
-            while point - split_points[-1] > max_frames:
-                split_points.append(split_points[-1] + max_frames)
-            if point > split_points[-1]:
-                split_points.append(point)
-
-        idx = 0
-        while idx < total_frames:
-            if f0_np[idx] == 0:
-                run_start = idx
-                while idx < total_frames and f0_np[idx] == 0:
-                    idx += 1
-                run_end = idx
-                if (run_end - run_start) >= ignore_silent_frames_thresh:
-                    split_point = max(run_end - 5, (run_start + run_end) // 2)
-                    append_split_point(split_point)
-            else:
-                idx += 1
-        append_split_point(total_frames)
-
-        segments: list[tuple[float, float]] = []
-        overlap_segments: list[tuple[float, float]] = []
-
-        def append_segment(start_idx: int, end_idx: int, overlaps: int = num_overlaps):
-            segments.append((split_points[start_idx] / f0_rate, split_points[end_idx] / f0_rate))
-            overlap_start_idx = start_idx
-            if start_idx > 0 and (split_points[end_idx] - split_points[start_idx - overlaps]) <= max_frames:
-                overlap_start_idx = start_idx - overlaps
-            overlap_segments.append((split_points[overlap_start_idx] / f0_rate, split_points[end_idx] / f0_rate))
-
-        segment_start, segment_end = 0, 1
-        while segment_start < len(split_points) - 1:
-            while (
-                segment_end < len(split_points)
-                and (split_points[segment_end] - split_points[segment_start]) < min_frames
-            ):
-                segment_end += 1
-
-            if segment_end >= len(split_points):
-                append_segment(segment_start, len(split_points) - 1, overlaps=num_overlaps)
-                break
-            append_segment(segment_start, segment_end, overlaps=num_overlaps)
-            segment_start = segment_end
-            segment_end = segment_start + 1
-
-        if ignore_silent_frames:
-            filtered_idx = []
-            for i, seg in enumerate(overlap_segments):
-                start_frame = int(seg[0] * f0_rate)
-                end_frame = int(seg[1] * f0_rate)
-                seg_frames = end_frame - start_frame
-                voice_frames = np.sum(f0_np[start_frame:end_frame] > 0)
-                if voice_frames / seg_frames > 0.05 and voice_frames >= 10:
-                    filtered_idx.append(i)
-
-            overlap_segments = [overlap_segments[i] for i in filtered_idx]
-            segments = [segments[i] for i in filtered_idx]
-
-        return overlap_segments, segments
-
     def _encode_condition(self, *, whisper_features: torch.Tensor, f0_coarse: torch.Tensor) -> torch.Tensor:
         cond = whisper_features + self.f0_encoder(f0_coarse)
         return self._to_trunk_dtype(cond)[0]
@@ -197,6 +154,8 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
                 sr=self.audio_config.sample_rate,
                 output_dtype=trunk_dtype,
             )
+
+    _encode_target_whisper_feature = _encode_prompt_whisper_feature
 
     def _infer_segment(
         self,
@@ -260,39 +219,121 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
             generated_audio = F.pad(generated_audio, (0, target_len - generated_audio.shape[-1]))
         return generated_audio
 
-    @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        sampling_params = req.sampling_params
-        extra_args = dict(getattr(sampling_params, "extra_args", None) or {})
+    def _build_vocal_segments(
+        self,
+        f0: torch.Tensor,
+        *,
+        hop_size: int,
+        sample_rate: int,
+        uv_frames_th: int = 10,
+        min_duration_sec: float = 15.0,
+        max_duration_sec: float = 30.0,
+        ignore_silent: bool = True,
+    ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """Build vocal segments based on F0 contour.
 
-        num_inference_steps = sampling_params.num_inference_steps or _DEFAULT_NUM_INFERENCE_STEPS
-        guidance_scale = sampling_params.guidance_scale or _DEFAULT_GUIDANCE_SCALE
+        Mirrors upstream ``SoulXSingerSVC.build_vocal_segments``.
+        Returns (overlap_segments, segments) tuples of (start_sec, end_sec).
+        """
+        f0_np = (
+            f0.detach().float().cpu().numpy().squeeze() if isinstance(f0, torch.Tensor) else np.asarray(f0).squeeze()
+        )
+        total_frames = int(f0_np.shape[0])
+        if total_frames == 0:
+            return [], []
 
-        with self._stage_timer("consume_payload"):
-            payload = consume_payload(req, SOULX_SVC_KIND, self.device)
-            prompt_wav = payload["prompt_wav"]
-            target_wav = payload["target_wav"]
-            prompt_f0 = payload["prompt_f0"]
-            target_f0 = payload["target_f0"]
+        f0_rate = sample_rate // hop_size
+        min_frames = max(1, int(round(min_duration_sec * f0_rate)))
+        max_frames = max(1, int(round(max_duration_sec * f0_rate)))
 
-        auto_shift = extra_args.get("auto_shift", False)
-        pitch_shift = extra_args.get("pitch_shift", 0)
+        split_points = [0]
+
+        def append_split_point(point: int) -> None:
+            point = int(max(0, min(point, total_frames)))
+            while point - split_points[-1] > max_frames:
+                split_points.append(split_points[-1] + max_frames)
+            if point > split_points[-1]:
+                split_points.append(point)
+
+        idx = 0
+        while idx < total_frames:
+            if f0_np[idx] == 0:
+                run_start = idx
+                while idx < total_frames and f0_np[idx] == 0:
+                    idx += 1
+                run_end = idx
+                if (run_end - run_start) >= uv_frames_th:
+                    split_point = max(run_end - 5, (run_start + run_end) // 2)
+                    append_split_point(split_point)
+            else:
+                idx += 1
+        append_split_point(total_frames)
+
+        segments: list[tuple[int, int]] = []
+        overlap_segments: list[tuple[int, int]] = []
+        num_overlaps = 1
+
+        def append_segment(start_idx: int, end_idx: int, overlaps: int = num_overlaps) -> None:
+            segments.append((split_points[start_idx], split_points[end_idx]))
+            overlap_start_idx = start_idx
+            if start_idx > 0 and (split_points[end_idx] - split_points[start_idx - overlaps]) <= max_frames:
+                overlap_start_idx = start_idx - overlaps
+            overlap_segments.append((split_points[overlap_start_idx], split_points[end_idx]))
+
+        seg_start, seg_end = 0, 1
+        while seg_start < len(split_points) - 1:
+            while seg_end < len(split_points) and (split_points[seg_end] - split_points[seg_start]) < min_frames:
+                seg_end += 1
+            if seg_end >= len(split_points):
+                append_segment(seg_start, len(split_points) - 1)
+                break
+            append_segment(seg_start, seg_end)
+            seg_start = seg_end
+            seg_end = seg_start + 1
+
+        if ignore_silent:
+            filtered_idx = []
+            for i, (ov_start, ov_end) in enumerate(overlap_segments):
+                voice_ratio = np.sum(f0_np[ov_start:ov_end] > 0) / max(1, ov_end - ov_start)
+                voiced_frames = np.sum(f0_np[ov_start:ov_end] > 0)
+                if voice_ratio > 0.05 and voiced_frames >= 10:
+                    filtered_idx.append(i)
+            overlap_segments = [overlap_segments[i] for i in filtered_idx]
+            segments = [segments[i] for i in filtered_idx]
+
+        # convert indices to seconds
+        overlap_sec = [(s / f0_rate, e / f0_rate) for s, e in overlap_segments]
+        seg_sec = [(s / f0_rate, e / f0_rate) for s, e in segments]
+        return overlap_sec, seg_sec
+
+    def infer_svc_batch(
+        self,
+        payload: dict[str, Any],
+        *,
+        extra_args: dict[str, Any],
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        """Batch SVC with chunked inference for long audio (matches upstream)."""
+        prompt_wav = payload["prompt_wav"]
+        target_wav = payload["target_wav"]
+        prompt_f0 = payload["prompt_f0"]
+        target_f0 = payload["target_f0"]
+
         pitch_shift = resolve_pitch_shift(
-            auto_shift=auto_shift,
-            manual_shift=int(pitch_shift),
+            auto_shift=bool(extra_args.get("auto_shift", False)),
+            manual_shift=int(extra_args.get("pitch_shift", 0)),
             prompt_f0=prompt_f0,
             target_f0=target_f0,
         )
-        generator = self._resolve_diffusion_generator(sampling_params)
 
-        with self._stage_timer("mel"):
-            prompt_mel = self.mel(prompt_wav.float() if prompt_wav.dtype != torch.float32 else prompt_wav)
+        prompt_mel = self._mel_from_wav(prompt_wav)
 
-        prompt_feature = self._encode_prompt_whisper_feature(prompt_wav)
-        f0_rate = self.audio_config.sample_rate // self.audio_config.hop_size
-        target_duration_sec = target_wav.shape[-1] / self.audio_config.sample_rate
-
-        if target_duration_sec < _LONG_AUDIO_SEGMENT_THRESHOLD_SEC:
+        # Long audio: chunk by vocal segments (same as upstream)
+        max_sec = 30.0 * self.audio_config.sample_rate
+        if target_wav.shape[-1] < max_sec:
+            # Short audio: one-shot
             generated_audio = self._infer_segment(
                 prompt_mel=prompt_mel,
                 prompt_wav=prompt_wav,
@@ -302,30 +343,23 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
                 pitch_shift=pitch_shift,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
-                prompt_feature=prompt_feature,
                 generator=generator,
             )
-            if generated_audio.dim() == 1:
-                generated_audio = generated_audio.unsqueeze(0)
-            return DiffusionOutput(
-                output=generated_audio,
-                custom_output={"pitch_shift": pitch_shift},
-                stage_durations=self._profiler_stage_durations() or {},
-            )
+            return generated_audio.unsqueeze(0), pitch_shift
 
-        overlap_segments, segments = self.build_vocal_segments(
+        # Build vocal segments
+        overlap_segments, segments = self._build_vocal_segments(
             target_f0,
-            f0_rate=f0_rate,
-            ignore_silent_frames_thresh=10,
-            min_duration_sec_per_segment=min(15.0, max(target_duration_sec, 1e-6)),
-            max_duration_sec_per_segment=30.0,
-            ignore_silent_frames=True,
+            hop_size=self.audio_config.hop_size,
+            sample_rate=self.audio_config.sample_rate,
         )
-        if not segments:
-            overlap_segments = [(0.0, target_duration_sec)]
-            segments = [(0.0, target_duration_sec)]
+        if len(segments) == 0:
+            segments = [(0.0, target_wav.shape[-1] / self.audio_config.sample_rate)]
+            overlap_segments = [(0.0, target_wav.shape[-1] / self.audio_config.sample_rate)]
 
+        f0_rate = self.audio_config.sample_rate // self.audio_config.hop_size
         generated_audio = torch.zeros_like(target_wav)
+
         for idx in range(len(segments)):
             overlap_start_sec, overlap_end_sec = overlap_segments[idx]
             seg_start_sec, seg_end_sec = segments[idx]
@@ -340,44 +374,38 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
             f0_start = max(0, min(f0_start, target_f0.shape[-1]))
             f0_end = max(f0_start, min(f0_end, target_f0.shape[-1]))
 
-            segment_target_wav = target_wav[:, wav_start:wav_end]
-            segment_target_f0 = target_f0[:, f0_start:f0_end]
+            segment_gt_wav = target_wav[:, wav_start:wav_end]
+            segment_gt_f0 = target_f0[:, f0_start:f0_end]
 
-            segment_generated_audio = self._infer_segment(
+            segment_generated = self._infer_segment(
                 prompt_mel=prompt_mel,
                 prompt_wav=prompt_wav,
-                target_wav=segment_target_wav,
+                target_wav=segment_gt_wav,
                 prompt_f0=prompt_f0,
-                target_f0=segment_target_f0,
+                target_f0=segment_gt_f0,
                 pitch_shift=pitch_shift,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
-                prompt_feature=prompt_feature,
                 generator=generator,
             )
 
-            segment_start = int(round(seg_start_sec * self.audio_config.sample_rate))
-            segment_end = int(round(seg_end_sec * self.audio_config.sample_rate))
-            generated_audio[:, segment_start:segment_end] = segment_generated_audio[
-                segment_start - wav_start : segment_end - wav_start
-            ]
+            seg_start = int(round(seg_start_sec * self.audio_config.sample_rate))
+            seg_end = int(round(seg_end_sec * self.audio_config.sample_rate))
+            segment_generated = segment_generated[seg_start - wav_start : seg_end - wav_start]
+            generated_audio[:, seg_start:seg_end] = segment_generated
 
-        return DiffusionOutput(
-            output=generated_audio,
-            custom_output={"pitch_shift": pitch_shift},
-            stage_durations=self._profiler_stage_durations() or {},
+        return generated_audio.unsqueeze(0), pitch_shift
+
+    @torch.inference_mode()
+    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        return self._forward_batch_from_request(
+            req,
+            kind="svc",
+            custom_output_key="pitch_shift",
+            infer_batch_fn=self.infer_svc_batch,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        _patch_torchaudio_load()
         del weights
-        weight_path = os.path.join(self.model_path, "model-svc.pt")
-        if not os.path.isfile(weight_path):
-            raise FileNotFoundError(
-                f"Model weights not found at {weight_path}. Please check the pretrained model path."
-            )
-        state = torch.load(weight_path, map_location=self.device)
-        self.mel.float()
-        self.load_state_dict(state["state_dict"], strict=True)
-        self._finalize_loaded_dtypes()
-        logger.info("Loaded model weights from %s", weight_path)
+        self._load_soulx_checkpoint("model-svc.pt")
+        return {name for name, _ in self.named_parameters()}

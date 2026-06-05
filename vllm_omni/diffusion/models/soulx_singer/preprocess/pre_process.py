@@ -1,60 +1,105 @@
-"""Shared ``pre_process_func`` helpers for SoulX-Singer pipelines."""
+"""Shared ``pre_process_func`` helpers for SoulX-Singer pipelines (batch / full-payload only)."""
 
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.models.soulx_singer.modules.preprocess.module import SoulXPreprocessModule
-from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
-    SOULX_PRECOMPUTED_KEYS,
-    SOULX_SVC_KIND,
-    SOULX_SVS_KIND,
-    attach_preprocessed,
-    build_dummy_payload,
+from vllm_omni.diffusion.models.soulx_singer.modules.preprocess.pipeline import SoulXPreprocessPipeline
+from vllm_omni.diffusion.models.soulx_singer.preprocess.ipc_codec import (
+    SOULX_PREPROCESSED_KEY,
     get_soulx_preprocessed_payload,
+)
+from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
+    SOULX_PRECOMPUTED_KEYS_BY_KIND,
+    build_dummy_payload,
     has_precomputed,
 )
-from vllm_omni.diffusion.models.soulx_singer.utils import MetadataProcessor, load_config
+from vllm_omni.diffusion.models.soulx_singer.utils import (
+    MetadataProcessor,
+    load_config,
+    resolve_phoneset_path,
+    validate_soulx_extra_args,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 
+logger = init_logger(__name__)
+
 
 def is_warmup_request(request: OmniDiffusionRequest) -> bool:
-    request_ids = getattr(request, "request_ids", None) or ()
-    return len(request_ids) == 1 and request_ids[0] == "dummy_req_id"
+    return request.is_dummy_run()
 
 
-def normalize_prompt(prompt: Any) -> dict[str, Any]:
-    if isinstance(prompt, str):
-        return OmniTextPrompt(prompt=prompt)
-    return prompt
+def resolve_preprocess_audio(prompt: dict[str, Any], extra_args: dict[str, Any]) -> tuple[Any, Any]:
+    mm = prompt.get("multi_modal_data") or {}
+    prompt_audio = mm.get("audio") if isinstance(mm, dict) else None
+    if prompt_audio is None:
+        prompt_audio = extra_args.get("prompt_audio")
+    return prompt_audio, extra_args.get("target_audio")
 
 
-def prepare_runtime_inputs(runtime_info: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Normalize stage-0 runtime buffer into prompt + extra_args."""
-    if runtime_info is None:
-        info: dict[str, Any] = {}
-    elif isinstance(runtime_info, dict):
-        info = dict(runtime_info)
-    elif isinstance(runtime_info, list):
-        info = dict(runtime_info[0]) if runtime_info else {}
-    else:
-        info = {}
+def _preprocess_inputs_missing_error(kind: str) -> ValueError:
+    return ValueError(
+        f"SoulX-Singer {kind} requires precomputed paths "
+        f"{list(SOULX_PRECOMPUTED_KEYS_BY_KIND[kind])}, an attached soulx_preprocessed payload "
+        f"(multi-stage preprocess stage), or run with pipeline soulxsinger_{kind}."
+    )
 
-    extra_args = dict(info.get("extra_args") or {})
-    prompt = dict(info.get("prompt") or {})
-    if not prompt.get("multi_modal_data"):
-        mm = info.get("multi_modal_data") or {}
-        prompt_audio = mm.get("audio") if isinstance(mm, dict) else None
-        if prompt_audio is None:
-            prompt_audio = extra_args.get("prompt_audio")
-        if prompt_audio is not None:
-            prompt.setdefault("multi_modal_data", {})["audio"] = prompt_audio
-    return prompt, extra_args
+
+def build_precomputed_payload(
+    kind: str,
+    extra_args: dict[str, Any],
+    *,
+    metadata_processor,
+    sample_rate: int | None,
+    device,
+) -> dict[str, Any]:
+    if kind == "svs":
+        return SoulXPreprocessPipeline.build_svs_payload_from_paths(
+            prompt_metadata_path=str(extra_args["prompt_metadata_path"]),
+            target_metadata_path=str(extra_args["target_metadata_path"]),
+            audio_path=str(extra_args["audio_path"]),
+            metadata_processor=metadata_processor,
+        )
+    if sample_rate is None or device is None:
+        raise ValueError("svc precomputed payload requires sample_rate and device")
+    return SoulXPreprocessPipeline.build_svc_payload_from_paths(  # type: ignore
+        prompt_wav_path=str(extra_args["prompt_wav_path"]),
+        target_wav_path=str(extra_args["target_wav_path"]),
+        prompt_f0_path=str(extra_args["prompt_f0_path"]),
+        target_f0_path=str(extra_args["target_f0_path"]),
+        sample_rate=int(sample_rate),
+        device=device,
+    )
+
+
+def build_warmup_payload(
+    kind: str,
+    *,
+    metadata_processor,
+    device,
+    sample_rate: int | None,
+) -> dict[str, Any]:
+    if kind == "svs":
+        if metadata_processor is None:
+            raise ValueError("SVS warmup requires metadata_processor")
+        payload = build_dummy_payload("svs", torch.device("cpu"))
+        dummy_prompt = payload["prompt_meta"]
+        processed = metadata_processor.process(dict(payload["target_meta_list"][0]))
+        payload["prompt_meta"] = {
+            key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in processed.items()
+        }
+        if isinstance(dummy_prompt.get("wav"), torch.Tensor):
+            payload["prompt_meta"]["wav"] = dummy_prompt["wav"].clone()
+        return payload
+    if device is None or sample_rate is None:
+        raise ValueError("svc warmup requires device and sample_rate")
+    return build_dummy_payload("svc", device)
 
 
 def build_preprocess_payload(
@@ -67,28 +112,21 @@ def build_preprocess_payload(
     device,
     sample_rate: int,
 ) -> dict[str, Any]:
-    mm = prompt.get("multi_modal_data") or {}
-    prompt_audio = mm.get("audio") if isinstance(mm, dict) else None
-    if prompt_audio is None:
-        prompt_audio = extra_args.get("prompt_audio")
-    target_audio = extra_args.get("target_audio")
+    if has_precomputed(extra_args, kind):
+        return build_precomputed_payload(
+            kind,
+            extra_args,
+            metadata_processor=metadata_processor,
+            sample_rate=sample_rate,
+            device=device,
+        )
 
-    if kind == SOULX_SVC_KIND:
-        if has_precomputed(extra_args, SOULX_SVC_KIND):
-            return SoulXPreprocessModule.build_svc_payload_from_paths(
-                prompt_wav_path=str(extra_args["prompt_wav_path"]),
-                target_wav_path=str(extra_args["target_wav_path"]),
-                prompt_f0_path=str(extra_args["prompt_f0_path"]),
-                target_f0_path=str(extra_args["target_f0_path"]),
-                sample_rate=sample_rate,
-                device=device,
-            )
-        if prompt_audio is None or target_audio is None:
-            raise ValueError(
-                "SoulX-Singer SVC preprocess requires precomputed paths or "
-                "multi_modal_data['audio'] + extra_args['target_audio']."
-            )
-        return preprocess.build_svc_payload_from_audio(
+    prompt_audio, target_audio = resolve_preprocess_audio(prompt, extra_args)
+    if prompt_audio is None or target_audio is None:
+        raise _preprocess_inputs_missing_error(kind)
+
+    if kind == "svc":
+        return preprocess.build_svc_payload_from_audio(  # type: ignore
             prompt_audio=prompt_audio,
             target_audio=target_audio,
             sample_rate=sample_rate,
@@ -96,19 +134,7 @@ def build_preprocess_payload(
             vocal_sep=extra_args.get("vocal_sep"),
         )
 
-    if has_precomputed(extra_args, SOULX_SVS_KIND):
-        return SoulXPreprocessModule.build_svs_payload_from_paths(
-            prompt_metadata_path=str(extra_args["prompt_metadata_path"]),
-            target_metadata_path=str(extra_args["target_metadata_path"]),
-            audio_path=str(extra_args["audio_path"]),
-            metadata_processor=metadata_processor,
-        )
-    if prompt_audio is None or target_audio is None:
-        raise ValueError(
-            "SoulX-Singer SVS preprocess requires precomputed metadata paths or "
-            "multi_modal_data['audio'] + extra_args['target_audio']."
-        )
-    return preprocess.build_svs_payload_from_audio(
+    return preprocess.build_svs_payload_from_audio(  # type: ignore
         prompt_audio=prompt_audio,
         target_audio=target_audio,
         metadata_processor=metadata_processor,
@@ -130,68 +156,59 @@ def attach_preprocess_for_diffusion_request(
     device=None,
 ) -> OmniDiffusionRequest:
     """Resolve preprocess payload for stage-1 diffusion (warmup / IPC / precomputed paths)."""
-    extra_args = dict(getattr(request.sampling_params, "extra_args", None) or {})
+
+    extra_args = validate_soulx_extra_args(
+        kind,
+        dict(getattr(request.sampling_params, "extra_args", None) or {}),
+    )
     for i, prompt in enumerate(request.prompts):
-        prompt = normalize_prompt(prompt)
+        prompt = OmniTextPrompt(prompt=prompt) if isinstance(prompt, str) else prompt
 
         if is_warmup_request(request):
             request.sampling_params.num_inference_steps = 1
-            if kind == SOULX_SVS_KIND:
-                if metadata_processor is None:
-                    raise ValueError("SVS warmup requires metadata_processor")
-                payload = build_dummy_payload(SOULX_SVS_KIND, torch.device("cpu"))
-                dummy_prompt = payload["prompt_meta"]
-                processed = metadata_processor.process(dict(payload["target_meta_list"][0]))
-                payload["prompt_meta"] = {
-                    key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in processed.items()
-                }
-                if isinstance(dummy_prompt.get("wav"), torch.Tensor):
-                    payload["prompt_meta"]["wav"] = dummy_prompt["wav"].clone()
-            else:
-                if device is None or sample_rate is None:
-                    raise ValueError("SVC warmup requires device and sample_rate")
-                payload = build_dummy_payload(SOULX_SVC_KIND, device)
+            payload = build_warmup_payload(
+                kind,
+                metadata_processor=metadata_processor,
+                device=device,
+                sample_rate=sample_rate,
+            )
         elif get_soulx_preprocessed_payload(prompt):
             request.prompts[i] = prompt
             continue
         elif has_precomputed(extra_args, kind):
-            if kind == SOULX_SVS_KIND:
-                payload = SoulXPreprocessModule.build_svs_payload_from_paths(
-                    prompt_metadata_path=str(extra_args["prompt_metadata_path"]),
-                    target_metadata_path=str(extra_args["target_metadata_path"]),
-                    audio_path=str(extra_args["audio_path"]),
-                    metadata_processor=metadata_processor,
-                )
-            else:
-                payload = SoulXPreprocessModule.build_svc_payload_from_paths(
-                    prompt_wav_path=str(extra_args["prompt_wav_path"]),
-                    target_wav_path=str(extra_args["target_wav_path"]),
-                    prompt_f0_path=str(extra_args["prompt_f0_path"]),
-                    target_f0_path=str(extra_args["target_f0_path"]),
-                    sample_rate=int(sample_rate),
-                    device=device,
-                )
-        else:
-            raise ValueError(
-                f"SoulX-Singer {kind} requires precomputed paths "
-                f"{list(SOULX_PRECOMPUTED_KEYS[kind])}, an attached soulx_preprocessed payload "
-                f"(multi-stage preprocess stage), or run with pipeline soulxsinger_{kind}."
+            payload = build_precomputed_payload(
+                kind,
+                extra_args,
+                metadata_processor=metadata_processor,
+                sample_rate=sample_rate,
+                device=device,
             )
+        else:
+            raise _preprocess_inputs_missing_error(kind)
 
         if payload.get("kind") != kind:
             raise ValueError(f"Invalid {kind} preprocess payload kind: {payload.get('kind')}")
-        attach_preprocessed(prompt, payload)
+        prompt.setdefault("additional_information", {})[SOULX_PREPROCESSED_KEY] = payload
         request.prompts[i] = prompt
 
-    if kind == SOULX_SVS_KIND:
-        extra_args.setdefault("control", extra_args.get("control", "score"))
+    if kind == "svs":
+        extra_args = normalize_svs_control_extra_args(extra_args)
     request.sampling_params.extra_args = extra_args
     return request
 
 
-def build_metadata_processor(od_config: OmniDiffusionConfig):
-    from vllm_omni.diffusion.models.soulx_singer.pipeline_soulx_singer_base import _resolve_phoneset_path
+def normalize_svs_control_extra_args(extra_args: dict[str, Any]) -> dict[str, Any]:
+    control = extra_args.get("control")
+    if control is None:
+        control = "score"
+        logger.warning("control is not provided, using 'score' as default")
+    elif control not in ("score", "melody"):
+        raise ValueError(f"Invalid control: {control}. Must be one of: ['score', 'melody']")
+    extra_args["control"] = control
+    return extra_args
 
+
+def build_metadata_processor(od_config: OmniDiffusionConfig):
     model_dir = od_config.model
     config_path = Path(model_dir) / "config.yaml"
     hf_config = load_config(str(config_path))
@@ -200,6 +217,6 @@ def build_metadata_processor(od_config: OmniDiffusionConfig):
     return MetadataProcessor(
         hop_size=audio_config.hop_size,
         sample_rate=audio_config.sample_rate,
-        phoneset_path=_resolve_phoneset_path(model_dir),
+        phoneset_path=resolve_phoneset_path(model_dir),
         device=str(get_local_device()),
     )

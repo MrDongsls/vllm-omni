@@ -467,12 +467,11 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 
 ## SoulX-Singer
 
-Flow-matching DiT for **singing voice synthesis (SVS)** and **singing voice conversion (SVC)** @ 24 kHz.
-`end2end.py` runs integrated preprocess (stage 0) → DiT (stage 1). Deploy: `vllm_omni/deploy/soulxsinger_svs.yaml` / `soulxsinger_svc.yaml`.
-
-HF repo has `model.pt` (SVS) and `model-svc.pt` (SVC); use separate view dirs + `config.json` `architectures` (below). **`phoneme/phone_set.json` is not on HF** — copy from upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) into `$BASE/phoneme/`.
+Singing voice synthesis (SVS) and conversion (SVC) at 24 kHz. Script: `soulxsinger/end2end.py`. Deploy: `vllm_omni/deploy/soulxsinger_svs.yaml` or `soulxsinger_svc.yaml`.
 
 ### Prerequisites
+
+Download DiT and preprocess weights, then set up separate SVS / SVC view directories. Copy `phoneme/phone_set.json` from upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) into the SVS base dir — HuggingFace does not ship it.
 
 ```bash
 # 1. DiT weights
@@ -509,14 +508,40 @@ cat > "$SVC_DIR/config.json" <<'EOF'
 EOF
 ```
 
-`config.yaml` hyper-parameters live under `$BASE`; `config.json` only routes SVS vs SVC.
+`config.yaml` hyper-parameters live under `$BASE`; each view's `config.json` `architectures` field is the single source of truth for SVS vs SVC. Point `--model` at the matching directory (`$BASE` for SVS, `$SVC_DIR` for SVC). Deploy YAML is chosen automatically from `config.json`; optional `--svs` / `--svc` only assert the mode matches.
 
-**Mandarin SVS (integrated preprocess):** `pip install funasr==1.3.0 g2pM g2p_en`. English: NeMo / NLTK in Notes (legacy preprocess).
+**Online preprocess** is the default: pass `--prompt-audio` and `--target-audio`, and the worker runs vocal separation, F0, and (for SVS) lyrics/MIDI before DiT. Install only what your run needs:
+
+```bash
+pip install "BS-RoFormer"   # vocal sep + F0 on GPU — SVS and SVC
+```
+
+Mandarin SVS also needs FunASR and Chinese G2P; `ffmpeg` must be on `PATH`:
+
+```bash
+pip install funasr==1.3.0 g2pM g2p_en
+```
+
+SVS with `--control score` or `melody` needs ROSVOT at runtime (no pip package):
+
+```bash
+git clone https://github.com/RickyL-2000/ROSVOT
+export ROSVOT_SOURCE_DIR=/path/to/ROSVOT
+```
+
+English SVS adds NeMo ASR and NLTK data; pass `--language English`:
+
+```bash
+pip install "nemo_toolkit[asr]==2.6.1" lhotse==1.32.2
+python -c "import nltk; nltk.download('cmudict'); nltk.download('averaged_perceptron_tagger_eng')"
+```
+
+**Precomputed metadata** is the alternative: pass both `--prompt-metadata-path` and `--target-metadata-path` and skip online ASR/ROSVOT — none of the packages above are required. JSON can be produced by integrated preprocess on a prior run, or by upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) `preprocess/` scripts if you prefer to run that outside vLLM-Omni.
 
 ### Quick start
 
 ```bash
-# SVS — defaults: zh_prompt.mp3 + music.mp3 (vendored under tests/assets/soulxsinger/)
+# SVS — default demo audio: tests/assets/soulxsinger/zh_prompt.mp3 + music.mp3
 python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
     --model "$BASE" \
     --preprocess-weights-dir "$PREPROCESS" \
@@ -524,37 +549,19 @@ python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
     --num-inference-steps 32 \
     -o output.wav
 
-# SVC — $SVC_DIR needs model-svc.pt only
 python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
-    --model "$SVC_DIR" --svc \
+    --model "$SVC_DIR" \
     --preprocess-weights-dir "$PREPROCESS" \
+    --svc \
+    --num-inference-steps 32 \
     -o output_svc.wav
-```
 
-`SOULX_PREPROCESS_WEIGHTS_DIR` makes `--preprocess-weights-dir` optional. Long SVS targets are merged in one request.
-
-**SVS precomputed metadata (optional):** pass **both** `--prompt-metadata-path` and `--target-metadata-path` to skip online ASR/ROSVOT:
-
-```bash
-python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
-    --model "$BASE" \
-    --prompt-metadata-path path/to/prompt/metadata.json \
-    --target-metadata-path path/to/target/metadata.json \
-    --prompt-wav-path path/to/prompt/vocal.wav \
-    -o output.wav
-```
+`SOULX_PREPROCESS_WEIGHTS_DIR` makes `--preprocess-weights-dir` optional. Long SVS targets are handled in one request. See `end2end.py --help` for `--pitch-shift`, `--vocal-sep`, `--auto-shift`, and language/control options.
 
 ### Notes
 
-- Output: 24 kHz mono WAV; no PCM streaming.
-- Defaults: `--guidance-scale 3.0`, `--seed 42`, `--auto-shift` **off** (upstream). Use `--auto-shift` when aligning pitch to the prompt.
-- SVS `--control`: `score` or `melody`. See `end2end.py --help` for `--pitch-shift`, `--vocal-sep`.
-- MIDI / lyric QC: upstream `midi_editor` only.
-- **External / legacy preprocess** (optional): if you prefer the upstream CLI instead of integrated stage-0, clone [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) and use its `preprocess/` env, then pass the resulting JSON paths via `--prompt-metadata-path` / `--target-metadata-path` as above:
-    - Install `ffmpeg` on `PATH` (e.g. `apt install ffmpeg`) — checked by `funasr` on import.
-    - `uv pip install "nemo_toolkit[asr]==2.6.1"` — English lyrics via Parakeet.
-    - `uv pip install lhotse==1.32.2` — pin after NeMo to avoid sampler mismatches.
-    - `python -c "import nltk; nltk.download('cmudict'); nltk.download('averaged_perceptron_tagger_eng')"` — English G2P.
-    - Set `language=English` in upstream `example/preprocess.sh` for English audio; default `Mandarin` uses Paraformer + Chinese G2P.
+- Output: 24 kHz mono WAV; batch only.
+- Defaults match upstream: `--guidance-scale 3.0`, `--seed 42`, `--auto-shift` off.
+- SVS `--control`: `score` or `melody`. MIDI / lyric QC: upstream `midi_editor` only.
 
 ---

@@ -22,11 +22,8 @@ class SegmentMetadata:
     origin_wav_fn: str | None = None
     wav: np.ndarray | None = None
 
-
-def _get_attr(seg: SegmentMetadata | dict[str, Any], name: str, default=None):
-    if isinstance(seg, dict):
-        return seg.get(name, default)
-    return getattr(seg, name, default)
+    def get(self, name: str, default: Any = None) -> Any:
+        return getattr(self, name, default)
 
 
 def _merge_group(
@@ -48,17 +45,17 @@ def _merge_group(
     for i, seg in enumerate(segments):
         if i > 0:
             prev_seg = segments[i - 1]
-            gap_ms = _get_attr(seg, "start_time_ms", 0) - _get_attr(prev_seg, "end_time_ms", 0)
+            gap_ms = seg.get("start_time_ms", 0) - prev_seg.get("end_time_ms", 0)
             if gap_ms > 0:
                 words.append("<SP>")
                 durs.append(gap_ms / 1000.0)
                 pitches.append(0)
                 types.append(1)
 
-        words.extend(_get_attr(seg, "note_text", []))
-        durs.extend(_get_attr(seg, "note_dur", []))
-        pitches.extend(_get_attr(seg, "note_pitch", []))
-        types.extend(_get_attr(seg, "note_type", []))
+        words.extend(seg.get("note_text", []))
+        durs.extend(seg.get("note_dur", []))
+        pitches.extend(seg.get("note_pitch", []))
+        types.extend(seg.get("note_type", []))
 
     if end_extension_ms > 0:
         words.append("<SP>")
@@ -76,15 +73,15 @@ def _merge_group(
             merged_pitches.append(pitch)
             merged_types.append(note_type)
 
-    languages = [_get_attr(s, "language", "Mandarin") for s in segments if _get_attr(s, "language")]
+    languages = [s.get("language", "Mandarin") for s in segments if s.get("language")]
     language = max(languages, key=languages.count) if languages else "Mandarin"
 
-    start_ms = int(_get_attr(segments[0], "start_time_ms", 0))
-    end_ms = int(_get_attr(segments[-1], "end_time_ms", 0)) + end_extension_ms
+    start_ms = int(segments[0].get("start_time_ms", 0))
+    end_ms = int(segments[-1].get("end_time_ms", 0)) + end_extension_ms
     start_sample = int(start_ms * sample_rate // 1000)
     end_sample = int(end_ms * sample_rate // 1000)
 
-    first_item_name = _get_attr(segments[0], "item_name", "segment")
+    first_item_name = segments[0].get("item_name", "segment")
     song_prefix = "_".join(str(first_item_name).split("_")[:-1])
     item_name = f"{song_prefix}_{start_ms}_{end_ms}"
 
@@ -106,7 +103,7 @@ def _merge_group(
         note_dur=merged_durs,
         note_pitch=merged_pitches,
         note_type=merged_types,
-        origin_wav_fn=_get_attr(segments[0], "origin_wav_fn", ""),
+        origin_wav_fn=segments[0].get("origin_wav_fn", ""),
         wav=segment_audio if output_dir is None else None,
     )
 
@@ -138,55 +135,3 @@ def convert_metadata(item: SegmentMetadata, f0: np.ndarray | None = None) -> dic
         "note_type": " ".join(map(str, item.note_type)),
         "f0": " ".join(f"{x:.1f}" for x in f0_arr),
     }
-
-
-def merge_short_segments(
-    audio: np.ndarray,
-    sample_rate: int,
-    segments: list[SegmentMetadata | dict[str, Any]],
-    output_dir: Path | str | None = None,
-    *,
-    max_gap_ms: int = 10000,
-    max_duration_ms: int = 60000,
-    end_extension_ms: int = 0,
-) -> list[SegmentMetadata]:
-    merge_dir = Path(output_dir) if output_dir is not None else None
-    merged_segments: list[SegmentMetadata] = []
-    current_group: list[SegmentMetadata | dict[str, Any]] = []
-    current_len = 0
-    prev_end = -1
-
-    for seg in segments:
-        start_time = int(_get_attr(seg, "start_time_ms", 0))
-        end_time = int(_get_attr(seg, "end_time_ms", 0))
-        if current_group and (
-            start_time - prev_end > max_gap_ms or current_len + end_time - start_time > max_duration_ms
-        ):
-            merged_segments.append(
-                _merge_group(
-                    audio,
-                    sample_rate,
-                    current_group,
-                    merge_dir,
-                    end_extension_ms=end_extension_ms,
-                )
-            )
-            current_group = []
-            current_len = 0
-
-        current_group.append(seg)
-        current_len += end_time - start_time
-        prev_end = end_time
-
-    if current_group:
-        merged_segments.append(
-            _merge_group(
-                audio,
-                sample_rate,
-                current_group,
-                merge_dir,
-                end_extension_ms=end_extension_ms,
-            )
-        )
-
-    return merged_segments

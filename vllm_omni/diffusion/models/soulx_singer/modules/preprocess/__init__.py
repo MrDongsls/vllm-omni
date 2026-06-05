@@ -1,10 +1,7 @@
 """Preprocess neural network modules for SoulX-Singer."""
 
-from .module import SoulXPreprocessModule, SoulXPreprocessPipeline
-from .stack import SoulXPreprocessStack
+from .pipeline import SoulXPreprocessPipeline
 
 __all__ = [
-    "SoulXPreprocessModule",
     "SoulXPreprocessPipeline",
-    "SoulXPreprocessStack",
 ]

@@ -28,6 +28,11 @@ SEPARATE_CFG_ENABLERS = [
     cd_backend.enable_cache_for_cosmos3,
 ]
 
+PATTERN_3_ENABLERS = [
+    cd_backend.enable_cache_for_stable_audio_open,
+    cd_backend.enable_cache_for_soulx_singer,
+]
+
 SAMPLE_CACHE_CONFIG = DiffusionCacheConfig()
 
 

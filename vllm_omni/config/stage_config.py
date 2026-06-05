@@ -835,6 +835,8 @@ def _build_engine_args(
     ``engine_extras`` can still carry a stage-specific ``dtype``).
     """
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch}
+    if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
+        engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type:
         engine_args["engine_output_type"] = ps.engine_output_type
     if next_stage_proc:
@@ -1003,7 +1005,10 @@ class StageConfig:
         if self.hf_config_name:
             engine_args["hf_config_name"] = self.hf_config_name
 
-        if StageType(self.stage_type) == StageType.DIFFUSION:
+        if StageType(self.stage_type) == StageType.DIFFUSION or self.model_stage in (
+            "soulx_svs_dit",
+            "soulx_svc_dit",
+        ):
             _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
 
         # CLI overrides take precedence over YAML defaults

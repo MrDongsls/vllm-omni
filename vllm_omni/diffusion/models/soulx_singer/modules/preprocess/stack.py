@@ -1,8 +1,9 @@
 """Lazy-loaded SoulX preprocess model tree."""
 
+import os
 import tempfile
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import ClassVar
 
 import numpy as np
 import soundfile as sf
@@ -13,12 +14,12 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 
 from .asr import LyricModel
-from .bs_roformer.separator import MelBandRoformerSeparator
-from .pe.mel_grid_f0 import extract_f0_file
-from .pe.rmvpe.inference import RMVPE
-from .rosvot.inference import RosvotModel
-from .segmentation import VocalSegmenter
+from .mel_grid_f0 import extract_f0_file
+from .rmvpe import RMVPE
+from .rosvot import RosvotModel
+from .segmenter import VocalSegmenter
 from .utils import resample_mono
+from .vocal_sep import MelBandRoformerSeparator
 
 logger = init_logger(__name__)
 
@@ -46,7 +47,6 @@ class SoulXPreprocessStack(nn.Module, SupportsComponentDiscovery):
         self.target_sr = target_sr
         self.hop_size = hop_size
         self.verbose = verbose
-
         self._rmvpe: nn.Module | None = None
         self._vocal_sep: nn.Module | None = None
         self._segmenter: nn.Module | None = None
@@ -57,13 +57,13 @@ class SoulXPreprocessStack(nn.Module, SupportsComponentDiscovery):
     def device(self) -> torch.device:
         return torch.device(self.device_str)
 
-    def ensure_rmvpe(self) -> RMVPE:
+    def ensure_rmvpe(self):
         if self._rmvpe is None:
             if self.verbose:
                 logger.info("[rmvpe] loading shared pitch model")
             self._rmvpe = RMVPE(self.weights["rmvpe"], device=self.device_str)
             self.add_module("rmvpe", self._rmvpe)
-        return cast(RMVPE, self._rmvpe)
+        return self._rmvpe
 
     def ensure_vocal_sep(self):
         if self._vocal_sep is None:
@@ -76,11 +76,7 @@ class SoulXPreprocessStack(nn.Module, SupportsComponentDiscovery):
             ).to(self.device)
             self.add_module("vocal_sep", self._vocal_sep)
             if self.verbose:
-                logger.info(
-                    "[vocal extraction] ready on %s, sr=%s",
-                    self.device_str,
-                    self._vocal_sep.sample_rate,
-                )
+                logger.info("[vocal extraction] ready on %s, sr=%s", self.device_str, self._vocal_sep.sample_rate)
         return self._vocal_sep
 
     def ensure_segmenter(self):
@@ -107,11 +103,12 @@ class SoulXPreprocessStack(nn.Module, SupportsComponentDiscovery):
         if self._rosvot is None:
             if self.verbose:
                 logger.info("[note transcription] loading ROSVOT")
-            pe = self.ensure_rmvpe()
+            rosvot_src = os.environ.get("ROSVOT_SOURCE_DIR")
             self._rosvot = RosvotModel(
                 self.weights["rosvot"],
-                pe=pe,
+                pe=self.ensure_rmvpe(),
                 verbose=self.verbose,
+                rosvot_source_dir=rosvot_src,
             ).to(self.device)
             self.add_module("rosvot", self._rosvot)
         return self._rosvot
@@ -131,18 +128,14 @@ class SoulXPreprocessStack(nn.Module, SupportsComponentDiscovery):
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp_path = tmp.name
-            sf.write(
-                tmp_path,
-                np.asarray(vocal, dtype=np.float32).squeeze(),
-                int(sample_rate),
-            )
+            sf.write(tmp_path, np.asarray(vocal, dtype=np.float32).squeeze(), int(sample_rate))
             return extract_f0_file(rmvpe, tmp_path, **kwargs)
         finally:
             if tmp_path is not None:
                 Path(tmp_path).unlink(missing_ok=True)
 
     def extract_vocal(self, audio: str | tuple[np.ndarray, int]) -> tuple[np.ndarray, int]:
-        sep = cast(MelBandRoformerSeparator, self.ensure_vocal_sep())
+        sep = self.ensure_vocal_sep()
         if isinstance(audio, tuple):
             mix, sr = audio
             mix = np.asarray(mix, dtype=np.float32).squeeze()

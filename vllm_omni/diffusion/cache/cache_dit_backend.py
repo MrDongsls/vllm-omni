@@ -611,6 +611,60 @@ def enable_cache_for_stable_audio_open(pipeline: Any, cache_config: Any) -> Call
     return refresh_cache_context
 
 
+def enable_cache_for_soulx_singer(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for SoulX-Singer SVS/SVC pipelines.
+
+    SoulX uses a Llama-style ``DiffLlama`` backbone (``layers`` ModuleList) with
+    static condition embeddings injected before the block loop, similar to
+    Stable Audio Open. Pattern_3 is required for cross-attention-style conditioning.
+    """
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    calibrator_config = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+
+    transformer = pipeline.transformer
+    cache_dit.enable_cache(
+        BlockAdapter(
+            transformer=transformer,
+            blocks=transformer.layers,
+            forward_pattern=ForwardPattern.Pattern_3,
+            params_modifiers=[
+                ParamsModifier(
+                    cache_config=db_cache_config,
+                    calibrator_config=calibrator_config,
+                )
+            ],
+        ),
+        cache_config=db_cache_config,
+    )
+
+    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        scm_supported_steps = num_inference_steps >= 8 or num_inference_steps in (4, 6)
+
+        if cache_config.scm_steps_mask_policy is None or not scm_supported_steps:
+            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+        else:
+            updated_scm_config = DBCacheConfig().reset(
+                num_inference_steps=num_inference_steps,
+                steps_computation_mask=cache_dit.steps_mask(
+                    mask_policy=cache_config.scm_steps_mask_policy,
+                    total_steps=num_inference_steps,
+                ),
+                steps_computation_policy=cache_config.scm_steps_policy,
+            )
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                cache_config=updated_scm_config,
+                verbose=verbose,
+            )
+
+    return refresh_cache_context
+
+
 def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for StableDiffusion3Pipeline.
 
@@ -2034,6 +2088,8 @@ CUSTOM_DIT_ENABLERS.update(
         "LongCatImagePipeline": enable_cache_for_longcat_image,
         "LongCatImageEditPipeline": enable_cache_for_longcat_image,
         "StableAudioPipeline": enable_cache_for_stable_audio_open,
+        "SoulXSingerPipeline": enable_cache_for_soulx_singer,
+        "SoulXSingerSVCPipeline": enable_cache_for_soulx_singer,
         "StableDiffusion3Pipeline": enable_cache_for_sd3,
         "LTX2Pipeline": enable_cache_for_ltx2,
         "LTX2ImageToVideoPipeline": enable_cache_for_ltx2,
