@@ -1005,10 +1005,7 @@ class StageConfig:
         if self.hf_config_name:
             engine_args["hf_config_name"] = self.hf_config_name
 
-        if StageType(self.stage_type) == StageType.DIFFUSION or self.model_stage in (
-            "soulx_svs_dit",
-            "soulx_svc_dit",
-        ):
+        if StageType(self.stage_type) == StageType.DIFFUSION:
             _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
 
         # CLI overrides take precedence over YAML defaults

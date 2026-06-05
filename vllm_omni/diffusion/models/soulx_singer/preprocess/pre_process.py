@@ -10,13 +10,11 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.soulx_singer.modules.preprocess.pipeline import SoulXPreprocessPipeline
-from vllm_omni.diffusion.models.soulx_singer.preprocess.ipc_codec import (
-    SOULX_PREPROCESSED_KEY,
-    get_soulx_preprocessed_payload,
-)
 from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
     SOULX_PRECOMPUTED_KEYS_BY_KIND,
+    SOULX_PREPROCESSED_KEY,
     build_dummy_payload,
+    get_soulx_preprocessed_payload,
     has_precomputed,
 )
 from vllm_omni.diffusion.models.soulx_singer.utils import (

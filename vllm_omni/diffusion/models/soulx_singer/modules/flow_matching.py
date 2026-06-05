@@ -106,6 +106,8 @@ class FlowMatchingTransformer(nn.Module):
         # internal RoPE head dimension is correct
         llama_config = LlamaConfig(
             vocab_size=0,
+            bos_token_id=None,
+            eos_token_id=None,
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
             num_hidden_layers=num_layers,

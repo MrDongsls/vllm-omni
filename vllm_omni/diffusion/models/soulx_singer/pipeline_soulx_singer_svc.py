@@ -20,11 +20,9 @@ from vllm_omni.diffusion.models.soulx_singer.modules import (
 from vllm_omni.diffusion.models.soulx_singer.pipeline_soulx_singer_base import (
     FlowMatchingAudioPipeline,
 )
-from vllm_omni.diffusion.models.soulx_singer.preprocess.ipc_codec import (
+from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
     SOULX_PREPROCESSED_KEY,
     get_soulx_preprocessed_payload,
-)
-from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
     has_precomputed,
 )
 from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import (

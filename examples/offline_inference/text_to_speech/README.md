@@ -471,13 +471,13 @@ Singing voice synthesis (SVS) and conversion (SVC) at 24 kHz. Script: `soulxsing
 
 ### Prerequisites
 
-Download DiT and preprocess weights, then set up separate SVS / SVC view directories. Copy `phoneme/phone_set.json` from upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) into the SVS base dir — HuggingFace does not ship it.
+Download DiT and preprocess weights, then set up separate SVS / SVC view directories. Copy `soulxsinger/utils/phoneme/phone_set.json` from upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) into the model weights dir as `phoneme/phone_set.json` — HuggingFace does not ship it.
 
 ```bash
 # 1. DiT weights
-BASE=path/to/SoulX-Singer
-PREPROCESS=path/to/SoulX-Singer-Preprocess
-SVC_DIR=path/to/SoulX-Singer-svc
+export BASE=path/to/SoulX-Singer
+export PREPROCESS=path/to/SoulX-Singer-Preprocess
+export SVC_DIR=path/to/SoulX-Singer-svc
 
 huggingface-cli download Soul-AILab/SoulX-Singer --local-dir "$BASE"
 
@@ -486,7 +486,6 @@ huggingface-cli download Soul-AILab/SoulX-Singer-Preprocess --local-dir "$PREPRO
 export SOULX_PREPROCESS_WEIGHTS_DIR="$PREPROCESS"
 
 # 3. SVS / SVC view directories
-SVC_DIR=path/to/SoulX-Singer-svc
 mkdir -p "$SVC_DIR"
 cp $BASE/{config.yaml,README.md,assets} $SVC_DIR
 mv $BASE/model-svc.pt $SVC_DIR/model-svc.pt
@@ -519,14 +518,8 @@ pip install "BS-RoFormer"   # vocal sep + F0 on GPU — SVS and SVC
 Mandarin SVS also needs FunASR and Chinese G2P; `ffmpeg` must be on `PATH`:
 
 ```bash
-pip install funasr==1.3.0 g2pM g2p_en
-```
-
-SVS with `--control score` or `melody` needs ROSVOT at runtime (no pip package):
-
-```bash
-git clone https://github.com/RickyL-2000/ROSVOT
-export ROSVOT_SOURCE_DIR=/path/to/ROSVOT
+# install optional dependencies:
+pip install -e ".[soulx-svs]"
 ```
 
 English SVS adds NeMo ASR and NLTK data; pass `--language English`:
@@ -555,6 +548,7 @@ python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
     --svc \
     --num-inference-steps 32 \
     -o output_svc.wav
+```
 
 `SOULX_PREPROCESS_WEIGHTS_DIR` makes `--preprocess-weights-dir` optional. Long SVS targets are handled in one request. See `end2end.py --help` for `--pitch-shift`, `--vocal-sep`, `--auto-shift`, and language/control options.
 

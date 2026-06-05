@@ -2,7 +2,6 @@
 
 import functools
 import importlib
-import json
 import os
 from pathlib import Path
 
@@ -11,7 +10,6 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 import numpy as np
 import pytest
 
-from tests.e2e.offline_inference.soulx_test_env import ensure_rosvot_source_dir
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniRunner
@@ -20,7 +18,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 PROMPT_AUDIO = get_asset_path("soulxsinger/zh_prompt.mp3")
 TARGET_AUDIO = get_asset_path("soulxsinger/music.mp3")
-PHONE_SET = get_asset_path("soulxsinger/phoneme/phone_set.json")
 SAMPLE_RATE = 24_000
 
 if not PROMPT_AUDIO.is_file() or not TARGET_AUDIO.is_file():
@@ -31,15 +28,8 @@ if not PROMPT_AUDIO.is_file() or not TARGET_AUDIO.is_file():
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion, pytest.mark.tts]
 
-
-@pytest.fixture(scope="session", autouse=True)
-def _soulx_rosvot_env() -> None:
-    ensure_rosvot_source_dir()
-
-
 _CASES = (
     pytest.param(
-        "svs",
         "SoulXSingerPipeline",
         "soulxsinger_svs.yaml",
         {
@@ -53,7 +43,6 @@ _CASES = (
         id="svs",
     ),
     pytest.param(
-        "svc",
         "SoulXSingerSVCPipeline",
         "soulxsinger_svc.yaml",
         {"vocal_sep": False, "auto_shift": False, "pitch_shift": 0},
@@ -94,32 +83,6 @@ def soulx_weights() -> tuple[Path, Path]:
         pytest.skip(f"Set SOULXSINGER_MODEL_DIR / SOULX_PREPROCESS_WEIGHTS_DIR. ({exc})")
 
 
-def _model_view(base: Path, name: str, architecture: str) -> str:
-    view = base / ".pytest_soulx_views" / name
-    view.mkdir(parents=True, exist_ok=True)
-    for fname in ("config.yaml",):
-        src, dst = base / fname, view / fname
-        if src.is_file() and not dst.exists():
-            dst.symlink_to(src.resolve())
-    ckpt = "model.pt" if architecture == "SoulXSingerPipeline" else "model-svc.pt"
-    src, dst = base / ckpt, view / ckpt
-    if src.is_file() and not dst.exists():
-        dst.symlink_to(src.resolve())
-    phoneset = base / "phoneme" / "phone_set.json"
-    if not phoneset.is_file():
-        phoneset = PHONE_SET
-    if phoneset.is_file():
-        (view / "phoneme").mkdir(parents=True, exist_ok=True)
-        dst = view / "phoneme" / "phone_set.json"
-        if not dst.exists():
-            dst.symlink_to(phoneset.resolve())
-    if not (view / "config.json").is_file():
-        (view / "config.json").write_text(
-            json.dumps({"model_type": "soulxsinger", "architectures": [architecture]}) + "\n"
-        )
-    return str(view.resolve())
-
-
 def _flatten_audio(audio_val) -> np.ndarray:
     import torch
 
@@ -132,10 +95,9 @@ def _flatten_audio(audio_val) -> np.ndarray:
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("view,architecture,deploy_yaml,extra_args,py_deps", _CASES)
+@pytest.mark.parametrize("architecture,deploy_yaml,extra_args,py_deps", _CASES)
 def test_soulxsinger_multistage_from_audio(
     soulx_weights: tuple[Path, Path],
-    view: str,
     architecture: str,
     deploy_yaml: str,
     extra_args: dict,
@@ -148,7 +110,17 @@ def test_soulxsinger_multistage_from_audio(
             pytest.fail(f"SoulX SVS requires {mod}: {exc}")
 
     base_dir, preprocess_dir = soulx_weights
-    model = _model_view(base_dir, view, architecture)
+
+    # SVS mode requires phone_set.json in the model directory
+    if architecture == "SoulXSingerPipeline":
+        if not (base_dir / "phoneme" / "phone_set.json").is_file() and not (base_dir / "phone_set.json").is_file():
+            pytest.skip(
+                "SoulX-Singer SVS test requires phoneme/phone_set.json. "
+                "Copy it from github.com/Soul-AILab/SoulX-Singer into the model dir. "
+                "See `examples/offline_inference/text_to_speech/README.md` for details."
+            )
+
+    model = str(base_dir)
     with OmniRunner(
         model,
         stage_configs_path=get_deploy_config_path(deploy_yaml),

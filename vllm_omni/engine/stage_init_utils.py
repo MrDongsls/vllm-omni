@@ -567,11 +567,7 @@ def get_stage_tp_size(stage_cfg: Any) -> int:
 def get_stage_devices_per_replica(stage_cfg: Any) -> int:
     """Return the number of devices consumed by one replica of *stage_cfg*."""
     engine_args = getattr(stage_cfg, "engine_args", {})
-    model_stage = _get_attr_or_item(engine_args, "model_stage")
-    if getattr(stage_cfg, "stage_type", "llm") == "diffusion" or model_stage in (
-        "soulx_svs_dit",
-        "soulx_svc_dit",
-    ):
+    if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
         parallel_config = _get_attr_or_item(engine_args, "parallel_config")
         if parallel_config is None:
             return 1

@@ -1,8 +1,4 @@
-"""ROSVOT note transcription adapter.
-
-Heavy core (MidiExtractor, MelNet, ...) loads from external git clone via sys.path.
-SoulX-specific glue (word alignment, note regulation, transcribe) stays here.
-"""
+"""ROSVOT note transcription."""
 
 from __future__ import annotations
 
@@ -16,8 +12,13 @@ import torch.nn as nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.soulx_singer.modules.mel_transform import spectral_normalize_torch
+from vllm_omni.diffusion.models.soulx_singer.modules.note_transcription import (
+    BackboneNet,
+    ConvBlocks,
+    Embedding,
+)
 from vllm_omni.diffusion.models.soulx_singer.modules.preprocess.utils import (
-    _load_rosvot_core,
     boundary2Interval,
     denorm_f0,
     f0_to_coarse,
@@ -28,6 +29,7 @@ from vllm_omni.diffusion.models.soulx_singer.modules.preprocess.utils import (
     pad_or_cut_xd,
     resample_mono,
 )
+from vllm_omni.utils.audio import mel_filter_bank as librosa_mel_fn
 
 logger = init_logger(__name__)
 
@@ -94,6 +96,82 @@ def regulate_ill_slur(
     )
 
 
+def regulate_boundary(bd_logits, threshold, min_gap=18, ref_bd=None, ref_bd_min_gap=8, non_padding=None):
+    # this doesn't preserve gradient
+    device = bd_logits.device
+    bd_logits = torch.sigmoid(bd_logits).data.cpu()
+    # bd_logits[0] = bd_logits[-1] = 1e-5     # avoid itv invalid problem
+    bd = (bd_logits > threshold).long()
+    bd_res = torch.zeros_like(bd).long()
+    for i in range(bd.shape[0]):
+        bd_i = bd[i]
+        last_bd_idx = -1
+        start = -1
+        for j in range(bd_i.shape[0]):
+            if bd_i[j] == 1:
+                if 0 <= start < j:
+                    continue
+                elif start < 0:
+                    start = j
+            else:
+                if 0 <= start < j:
+                    if j - 1 > start:
+                        bd_idx = start + int(torch.argmax(bd_logits[i, start:j]).item())
+                    else:
+                        bd_idx = start
+                    if bd_idx - last_bd_idx < min_gap and last_bd_idx > 0:
+                        bd_idx = round((bd_idx + last_bd_idx) / 2)
+                        bd_res[i, last_bd_idx] = 0
+                    bd_res[i, bd_idx] = 1
+                    last_bd_idx = bd_idx
+                    start = -1
+
+    # assert ref_bd_min_gap <= min_gap // 2
+    if ref_bd is not None and ref_bd_min_gap > 0:
+        ref = ref_bd.data.cpu()
+        for i in range(bd_res.shape[0]):
+            ref_bd_i = ref[i]
+            ref_bd_i_js = []
+            for j in range(ref_bd_i.shape[0]):
+                if ref_bd_i[j] == 1:
+                    ref_bd_i_js.append(j)
+                    seg_sum = torch.sum(bd_res[i, max(0, j - ref_bd_min_gap) : j + ref_bd_min_gap])
+                    if seg_sum == 0:
+                        bd_res[i, j] = 1
+                    elif seg_sum == 1 and bd_res[i, j] != 1:
+                        bd_res[i, max(0, j - ref_bd_min_gap) : j + ref_bd_min_gap] = ref_bd_i[
+                            max(0, j - ref_bd_min_gap) : j + ref_bd_min_gap
+                        ]
+                    elif seg_sum > 1:
+                        for k in range(1, ref_bd_min_gap + 1):
+                            if bd_res[i, max(0, j - k)] == 1 and ref_bd_i[max(0, j - k)] != 1:
+                                bd_res[i, max(0, j - k)] = 0
+                                break
+                            if (
+                                bd_res[i, min(bd_res.shape[1] - 1, j + k)] == 1
+                                and ref_bd_i[min(bd_res.shape[1] - 1, j + k)] != 1
+                            ):
+                                bd_res[i, min(bd_res.shape[1] - 1, j + k)] = 0
+                                break
+                        bd_res[i, j] = 1
+            # final check
+            assert torch.sum(bd_res[i, ref_bd_i_js]) == len(ref_bd_i_js), (
+                f"{torch.sum(bd_res[i, ref_bd_i_js])} {len(ref_bd_i_js)}"
+            )
+
+    bd_res = bd_res.to(device)
+
+    # force valid begin and end
+    bd_res[:, 0] = 0
+    if non_padding is not None:
+        for i in range(bd_res.shape[0]):
+            bd_res[i, sum(non_padding[i]) - 1 :] = 0
+    else:
+        bd_res[:, -1] = 0
+
+    return bd_res
+
+
 def _align_word(word_durs: list[float], mel_len: int, hop_size: int, audio_sample_rate: int) -> np.ndarray:
     mel2word = np.zeros([mel_len], int)
     start_time = 0.0
@@ -103,6 +181,221 @@ def _align_word(word_durs: list[float], mel_len: int, hop_size: int, audio_sampl
         mel2word[start_frame:end_frame] = i_word + 1
         start_time += wd
     return mel2word
+
+
+class PitchDecoder(nn.Module):
+    def __init__(self, hparams):
+        super().__init__()
+        self.hidden_size = hidden_size = hparams["hidden_size"]
+        self.dropout = hparams.get("dropout", 0.0)
+        self.note_bd_out = nn.Linear(hidden_size, 1)
+        self.note_bd_temperature = max(1e-7, hparams.get("note_bd_temperature", 1.0))
+
+        # note prediction
+        self.pitch_attn_num_head = hparams.get("pitch_attn_num_head", 1)
+        self.multihead_dot_attn = nn.Linear(hidden_size, self.pitch_attn_num_head)
+        self.post = ConvBlocks(
+            hidden_size,
+            out_dims=hidden_size,
+            dilations=None,
+            kernel_size=3,
+            layers_in_block=1,
+            c_multiple=1,
+            post_net_kernel=3,
+        )
+        self.pitch_out = nn.Linear(hidden_size, hparams.get("note_num", 100) + 4)
+        self.note_num = hparams.get("note_num", 100)
+        self.note_start = hparams.get("note_start", 30)
+        self.pitch_temperature = max(1e-7, hparams.get("note_pitch_temperature", 1.0))
+
+    def forward(self, feat, note_bd, train=True):
+        bsz, T, _ = feat.shape
+
+        attn = torch.sigmoid(self.multihead_dot_attn(feat))  # [B, T, C] -> [B, T, num_head]
+        attn_feat = feat.unsqueeze(3) * attn.unsqueeze(2)  # [B, T, C, 1] x [B, T, 1, num_head] -> [B, T, C, num_head]
+        attn_feat = torch.mean(attn_feat, dim=-1)  # [B, T, C, num_head] -> [B, T, C]
+        mel2note = torch.cumsum(note_bd, 1)
+        note_length = torch.max(torch.sum(note_bd, dim=1)).item() + 1  # max length
+        note_lengths = torch.sum(note_bd, dim=1) + 1  # [B]
+
+        attn = torch.mean(attn, dim=-1, keepdim=True)  # [B, T, num_head] -> [B, T, 1]
+        denom = mel2note.new_zeros(bsz, note_length, dtype=attn.dtype).scatter_add_(
+            dim=1, index=mel2note, src=attn.squeeze(-1)
+        )  # [B, T] -> [B, note_length] count the note frames of each note (with padding excluded)
+        frame2note = mel2note.unsqueeze(-1).repeat(1, 1, self.hidden_size)  # [B, T] -> [B, T, C], with padding included
+        note_aggregate = frame2note.new_zeros(bsz, note_length, self.hidden_size, dtype=attn_feat.dtype).scatter_add_(
+            dim=1, index=frame2note, src=attn_feat
+        )  # [B, T, C] -> [B, note_length, C]
+        note_aggregate = note_aggregate / (denom.unsqueeze(-1) + 1e-5)
+        note_logits = self.post(note_aggregate)
+        note_logits = self.pitch_out(note_logits) / self.pitch_temperature
+        # note_logits = torch.clamp(note_logits, min=-16., max=16.)     # don't know need it or not
+
+        note_pred = torch.softmax(note_logits, dim=-1)  # [B, note_length, note_num]
+        note_pred = torch.argmax(note_pred, dim=-1)  # [B, note_length]
+        # for some reason, note idx maybe 130 (why?)
+        note_pred[note_pred > self.note_num] = 0
+        note_pred[note_pred < self.note_start] = 0
+
+        return note_lengths, note_logits, note_pred
+
+
+class MidiExtractor(nn.Module):
+    def __init__(self, hparams):
+        super().__init__()
+        self.hparams = hparams.copy()
+        self.hidden_size = hidden_size = hparams["hidden_size"]
+        self.note_bd_threshold = hparams.get("note_bd_threshold", 0.5)
+        self.note_bd_min_gap = round(
+            hparams.get("note_bd_min_gap", 100) * hparams["audio_sample_rate"] / 1000 / hparams["hop_size"]
+        )
+        self.note_bd_ref_min_gap = round(
+            hparams.get("note_bd_ref_min_gap", 50) * hparams["audio_sample_rate"] / 1000 / hparams["hop_size"]
+        )
+
+        self.mel_proj = nn.Conv1d(hparams["use_mel_bins"], hidden_size, kernel_size=3, padding=1)
+        self.mel_encoder = ConvBlocks(
+            hidden_size,
+            out_dims=hidden_size,
+            dilations=None,
+            kernel_size=3,
+            layers_in_block=2,
+            c_multiple=1,
+            post_net_kernel=3,
+        )
+        self.use_pitch = hparams.get("use_pitch_embed", True)
+        if self.use_pitch:
+            self.pitch_embed = Embedding(300, hidden_size, 0, "kaiming")
+            self.uv_embed = Embedding(3, hidden_size, 0, "kaiming")
+        self.use_wbd = hparams.get("use_wbd", True)
+        if self.use_wbd:
+            self.word_bd_embed = Embedding(3, hidden_size, 0, "kaiming")
+        self.cond_encoder = ConvBlocks(
+            hidden_size,
+            out_dims=hidden_size,
+            dilations=None,
+            kernel_size=3,
+            layers_in_block=1,
+            c_multiple=1,
+            post_net_kernel=3,
+        )
+
+        # backbone
+        self.net = BackboneNet(hparams)
+
+        # note bd prediction
+        self.note_bd_out = nn.Linear(hidden_size, 1)
+        self.note_bd_temperature = max(1e-7, hparams.get("note_bd_temperature", 1.0))
+
+        # note prediction
+        self.pitch_decoder = PitchDecoder(hparams)
+
+    def run_encoder(self, mel, word_bd=None, pitch=None, uv=None):
+        mel_embed = self.mel_proj(mel.transpose(1, 2)).transpose(1, 2)
+        mel_embed = self.mel_encoder(mel_embed)
+        pitch_embed = word_bd_embed = 0
+        if self.use_pitch and pitch is not None and uv is not None:
+            pitch_embed = self.pitch_embed(pitch) + self.uv_embed(uv)  # [B, T, C]
+        if self.use_wbd and word_bd is not None:
+            word_bd_embed = self.word_bd_embed(word_bd)
+        feat = self.cond_encoder(mel_embed + pitch_embed + word_bd_embed)
+        return feat
+
+    def forward(self, mel, word_bd=None, note_bd=None, pitch=None, uv=None, non_padding=None, train=True):
+        ret = {}
+        bsz, T, _ = mel.shape
+
+        feat = self.run_encoder(mel, word_bd, pitch, uv)
+        feat = self.net(feat)  # [B, T, C]
+
+        # note bd prediction
+        # dropout has been dropped (inference mode)
+        note_bd_logits = self.note_bd_out(feat).squeeze(-1) / self.note_bd_temperature
+        note_bd_logits = torch.clamp(note_bd_logits, min=-16.0, max=16.0)
+        ret["note_bd_logits"] = note_bd_logits  # [B, T]
+        if note_bd is None or not train:
+            note_bd = regulate_boundary(
+                note_bd_logits,
+                self.note_bd_threshold,
+                self.note_bd_min_gap,
+                word_bd,
+                self.note_bd_ref_min_gap,
+                non_padding,
+            )
+            ret["note_bd_pred"] = note_bd  # [B, T]
+
+        # note pitch prediction
+        note_lengths, note_logits, note_pred = self.pitch_decoder(feat, note_bd, train)
+        ret["note_lengths"], ret["note_logits"], ret["note_pred"] = note_lengths, note_logits, note_pred
+
+        return ret
+
+
+class MelNet(nn.Module):
+    def __init__(self, hparams, device="cpu") -> None:
+        super().__init__()
+        self.n_fft = hparams["fft_size"]
+        self.num_mels = hparams["audio_num_mel_bins"]
+        self.sampling_rate = hparams["audio_sample_rate"]
+        self.hop_size = hparams["hop_size"]
+        self.win_size = hparams["win_size"]
+        self.fmin = hparams["fmin"]
+        self.fmax = hparams["fmax"]
+        self.device = device
+
+        mel = librosa_mel_fn(
+            sr=self.sampling_rate,
+            n_fft=self.n_fft,
+            n_mels=self.num_mels,
+            fmin=self.fmin,
+            fmax=self.fmax,
+        )
+        self.mel_basis = mel.float().to(self.device)
+        self.hann_window = torch.hann_window(self.win_size).to(self.device)
+
+    def to(self, device, **kwagrs):
+        super().to(device=device, **kwagrs)
+        self.mel_basis = self.mel_basis.to(device)
+        self.hann_window = self.hann_window.to(device)
+        self.device = device
+
+    def forward(self, y, center=False, complex=False):
+        if isinstance(y, np.ndarray):
+            y = torch.FloatTensor(y)
+        if len(y.shape) == 1:
+            y = y.unsqueeze(0)
+        y = y.clamp(min=-1.0, max=1.0).to(self.device)
+
+        pad_length = math.ceil(y.shape[1] / self.hop_size) * self.hop_size - y.shape[1]
+        y = torch.nn.functional.pad(
+            y.unsqueeze(1),
+            [int((self.n_fft - self.hop_size) / 2), int((self.n_fft - self.hop_size) / 2 + pad_length)],
+            mode="reflect",
+        )
+        y = y.squeeze(1)
+
+        spec = torch.stft(
+            y,
+            self.n_fft,
+            hop_length=self.hop_size,
+            win_length=self.win_size,
+            window=self.hann_window,
+            center=center,
+            pad_mode="reflect",
+            normalized=False,
+            onesided=True,
+            return_complex=True,
+        )
+        if not complex:
+            spec = torch.view_as_real(spec)
+            spec = torch.sqrt(spec.pow(2).sum(-1) + (1e-9))  # [B, n_fft, T]
+            spec = torch.matmul(self.mel_basis, spec)
+            spec = spectral_normalize_torch(spec)
+            spec = spec.transpose(1, 2)  # [B, T, n_fft]
+        else:
+            B, C, T, _ = spec.shape
+            spec = spec.transpose(1, 2)  # [B, T, n_fft, 2]
+        return spec
 
 
 class RosvotModel(nn.Module, SupportAudioInput, SupportsComponentDiscovery):
@@ -131,7 +424,6 @@ class RosvotModel(nn.Module, SupportAudioInput, SupportsComponentDiscovery):
         if verbose:
             logger.info("ROSVOT config: %s", resolved_config)
 
-        MidiExtractor, MelNet = _load_rosvot_core(rosvot_source_dir)
         self.midi = MidiExtractor(self.hparams)
         self.mel_net = MelNet(self.hparams)
         self.pe = pe if pe is not None and self.hparams.get("use_pitch_embed", False) else None

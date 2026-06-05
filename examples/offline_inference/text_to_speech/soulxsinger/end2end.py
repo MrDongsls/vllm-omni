@@ -26,7 +26,6 @@ import numpy as np
 import soundfile as sf
 
 from vllm_omni.diffusion.models.soulx_singer.utils import resolve_soulx_kind, validate_soulx_extra_args
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -215,19 +214,16 @@ def add_inference_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed", type=int, default=42)
 
 
-def finalize_mode_args(args: argparse.Namespace) -> argparse.Namespace:
-    if args.auto_shift is None:
-        # Upstream ``SoulXSinger.infer`` defaults to ``auto_shift=False``.
-        args.auto_shift = False
-    return args
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SoulX-Singer offline SVS / SVC (preprocess + DiT)")
     add_inference_args(parser)
     parser.add_argument("--output", "-o", type=str, default="output.wav")
-    nullify_stage_engine_defaults(parser)
-    return finalize_mode_args(parser.parse_args())
+    args = parser.parse_args()
+
+    if args.auto_shift is None:
+        # Upstream ``SoulXSinger.infer`` defaults to ``auto_shift=False``.
+        args.auto_shift = False
+    return args
 
 
 def main() -> None:

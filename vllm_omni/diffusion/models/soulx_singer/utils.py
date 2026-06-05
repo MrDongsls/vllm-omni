@@ -5,30 +5,16 @@ from typing import Any, Literal
 import numpy as np
 import torch
 import torchaudio
+from huggingface_hub import snapshot_download
 from omegaconf import DictConfig, OmegaConf
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+
 logger = init_logger(__name__)
 
-_PROJECT_ROOT = Path(__file__).parents[4]
-_SOULX_EXAMPLE_AUDIO_DIR = _PROJECT_ROOT / "tests" / "assets" / "soulxsinger"
-
-
-def resolve_phoneset_path(model_dir: str) -> str:
-    """Resolve phoneme vocabulary; prefer model checkpoint, fall back to bundled fixtures."""
-    candidates = (
-        Path(model_dir) / "phoneme" / "phone_set.json",
-        Path(model_dir) / "phone_set.json",
-        _SOULX_EXAMPLE_AUDIO_DIR / "phoneme" / "phone_set.json",
-    )
-    for path in candidates:
-        if path.is_file():
-            return str(path)
-    raise FileNotFoundError(
-        "SoulX-Singer phoneset not found. Expected one of: "
-        f"{[str(p) for p in candidates]}. "
-        "Copy phoneme/phone_set.json into the model directory or use bundled test assets."
-    )
+_MODEL_WEIGHTS_REPO = "Soul-AILab/SoulX-Singer"
+_PREPROCESS_WEIGHTS_REPO = "Soul-AILab/SoulX-Singer-Preprocess"
 
 
 def _patch_torchaudio_load() -> None:
@@ -175,6 +161,65 @@ def validate_soulx_extra_args(kind: SoulXKind, extra_args: dict[str, Any] | None
     return extra_args
 
 
+# ---------------- utils for model weights ----------------
+
+
+def resolve_preprocess_weights_root(od_config: OmniDiffusionConfig) -> Path:
+    """Locate preprocess weights on disk or download from Hugging Face."""
+
+    # default local dir
+    if Path(od_config.model).parent.is_dir():
+        local_dir = Path(od_config.model).parent / "SoulX-Singer-Preprocess"
+    else:
+        local_dir = Path(__file__).parents[5] / "pretrained" / "SoulX-Singer-Preprocess"
+
+    local_dir = local_dir.expanduser()
+    if local_dir.is_dir():
+        logger.info("Using SoulX preprocess weights from %s", local_dir)
+        return local_dir
+
+    logger.info(
+        "SoulX preprocess weights not found locally; downloading %s",
+        _PREPROCESS_WEIGHTS_REPO,
+    )
+    downloaded = snapshot_download(
+        _PREPROCESS_WEIGHTS_REPO,
+        allow_patterns=["*"],
+        local_dir=local_dir,
+    )
+    return Path(downloaded)
+
+
+def preprocess_weight_paths(weights_root: Path) -> dict[str, str]:
+    """Map upstream relative paths to absolute paths under ``weights_root``."""
+    root = weights_root.resolve()
+    return {
+        "rmvpe": str(root / "rmvpe/rmvpe.pt"),
+        "sep_ckpt": str(root / "mel-band-roformer-karaoke/mel_band_roformer_karaoke_becruily.ckpt"),
+        "sep_config": str(root / "mel-band-roformer-karaoke/config_karaoke_becruily.yaml"),
+        "asr_zh": str(root / "speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"),
+        "asr_en": str(root / "parakeet-tdt-0.6b-v2/parakeet-tdt-0.6b-v2.nemo"),
+        "rosvot": str(root / "rosvot/rosvot/model.pt"),
+    }
+
+
+def resolve_phoneset_path(model_dir: str) -> str:
+    """Resolve phoneme vocabulary; must be present in model directory."""
+    candidates = (
+        Path(model_dir) / "phoneme" / "phone_set.json",
+        Path(model_dir) / "phone_set.json",
+    )
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+    raise FileNotFoundError(
+        "SoulX-Singer phoneset not found. Expected one of: "
+        f"{[str(p) for p in candidates]}. "
+        "Copy phone_set.json into the model directory. "
+        "See `examples/offline_inference/text_to_speech/README.md` for instructions."
+    )
+
+
 # ---------------- utils for data processing ----------------
 
 
@@ -287,7 +332,7 @@ class MetadataProcessor:
         self,
         hop_size: int,
         sample_rate: int,
-        phoneset_path: str = "soulxsinger/utils/phoneme/phone_set.json",
+        phoneset_path: str,
         device: str = "cuda",
     ):
         """Initialize data processor.

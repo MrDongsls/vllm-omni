@@ -22,11 +22,9 @@ from end2end import (
     add_inference_args,
     build_sampling,
     extract_audio,
-    finalize_mode_args,
     resolve_preprocess_weights_dir,
 )
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 
@@ -80,8 +78,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="With --output, also write measured runs as <stem>_run1.wav, _run2.wav, ...",
     )
-    nullify_stage_engine_defaults(parser)
-    return finalize_mode_args(parser.parse_args())
+    return parser.parse_args()
 
 
 def main() -> None:

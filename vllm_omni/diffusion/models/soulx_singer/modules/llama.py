@@ -167,6 +167,8 @@ class DiffLlama(LlamaModel):
             attention_dropout=attention_dropout,
             use_cache=False,
             attn_implementation="eager",
+            bos_token_id=None,
+            eos_token_id=None,
         )
 
         self.layers = nn.ModuleList(

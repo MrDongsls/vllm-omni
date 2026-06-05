@@ -16,11 +16,9 @@ from vllm_omni.diffusion.models.soulx_singer.modules import (
 from vllm_omni.diffusion.models.soulx_singer.pipeline_soulx_singer_base import (
     FlowMatchingAudioPipeline,
 )
-from vllm_omni.diffusion.models.soulx_singer.preprocess.ipc_codec import (
+from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
     SOULX_PREPROCESSED_KEY,
     get_soulx_preprocessed_payload,
-)
-from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
     has_precomputed,
 )
 from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import (
@@ -149,6 +147,7 @@ class PipelineSoulXSingerSVS(FlowMatchingAudioPipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
+        self.metadata_processor = build_metadata_processor(od_config)
 
         self.f0_encoder = nn.Embedding(self.f0_bin, self.f0_dim)
         self.preflow = nn.Sequential(

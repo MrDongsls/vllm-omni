@@ -17,8 +17,7 @@ from vllm_omni.diffusion.models.interface import (
     SupportAudioOutput,
     SupportsComponentDiscovery,
 )
-from vllm_omni.diffusion.models.soulx_singer.preprocess.ipc_codec import consume_payload
-from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import build_metadata_processor
+from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import consume_payload
 from vllm_omni.diffusion.models.soulx_singer.utils import _patch_torchaudio_load, load_config
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -26,7 +25,7 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
-_SOULX_PROFILER_TARGETS: ClassVar[list[str]] = [
+_SOULX_PROFILER_TARGETS = [
     "forward",
 ]
 
@@ -86,8 +85,6 @@ class FlowMatchingAudioPipeline(
         self.vocab_size = self.encoder_config.vocab_size
         self.pitch_dim = self.encoder_config.pitch_dim
         self.type_dim = self.encoder_config.type_dim
-
-        self.metadata_processor = build_metadata_processor(od_config)
 
         _patch_torchaudio_load()
 

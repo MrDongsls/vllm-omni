@@ -1,6 +1,7 @@
 # SoulX-Singer SVC: single-stage DiT (preprocess inline in pre_process_func).
 #
 # Use: vllm serve <SoulX-Singer-svc> --omni
+pipeline: soulxsinger_svc
 async_chunk: false
 dtype: float16
 trust_remote_code: true

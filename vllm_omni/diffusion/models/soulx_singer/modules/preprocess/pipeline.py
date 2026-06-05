@@ -24,13 +24,11 @@ from vllm_omni.diffusion.models.soulx_singer.preprocess.metadata_utils import (
     _merge_group,
     convert_metadata,
 )
-from vllm_omni.diffusion.models.soulx_singer.preprocess.weights import (
-    preprocess_weight_paths,
-    resolve_preprocess_weights_root,
-)
 from vllm_omni.diffusion.models.soulx_singer.utils import (
     load_config,
     load_wav,
+    preprocess_weight_paths,
+    resolve_preprocess_weights_root,
     resolve_soulx_kind,
 )
 
@@ -111,7 +109,7 @@ class SoulXPreprocessPipeline(nn.Module, SupportAudioInput, SupportsComponentDis
 
     def _ensure_stack(self, extra_args: dict[str, Any] | None = None) -> None:
         extra_args = extra_args or {}
-        weights_root = resolve_preprocess_weights_root(self.od_config, extra_args)
+        weights_root = resolve_preprocess_weights_root(self.od_config)
         if self.stack is not None and self._weights_root == weights_root:
             return
         weights = preprocess_weight_paths(weights_root)
@@ -126,9 +124,8 @@ class SoulXPreprocessPipeline(nn.Module, SupportAudioInput, SupportsComponentDis
         self._weights_root = weights_root
 
     def forward(self, req) -> DiffusionOutput:
-        from vllm_omni.diffusion.models.soulx_singer.preprocess.ipc_codec import (
+        from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
             SOULX_PREPROCESSED_KEY,
-            encode_ipc,
         )
         from vllm_omni.diffusion.models.soulx_singer.preprocess.pre_process import (
             build_metadata_processor,
@@ -148,18 +145,17 @@ class SoulXPreprocessPipeline(nn.Module, SupportAudioInput, SupportsComponentDis
         if self._metadata_processor is None:
             self._metadata_processor = build_metadata_processor(self.od_config)
 
-        kind = self.kind
         device = get_local_device()
         if is_warmup_request(req):
             payload = build_warmup_payload(
-                kind,
+                self.kind,
                 metadata_processor=self._metadata_processor,
                 device=device,
                 sample_rate=self.target_sr,
             )
         else:
             payload = build_preprocess_payload(
-                kind,
+                self.kind,
                 prompt=prompt,
                 extra_args=extra_args,
                 preprocess=self,
@@ -168,13 +164,11 @@ class SoulXPreprocessPipeline(nn.Module, SupportAudioInput, SupportsComponentDis
                 sample_rate=self.target_sr,
             )
 
-        handoff = encode_ipc(payload)
-        handoff[SOULX_PREPROCESSED_KEY] = payload
         # Non-None placeholder so DiffusionEngine forwards custom_output to stage-1
         # (output=None triggers an early return that drops handoff).
         return DiffusionOutput(
             output=torch.zeros(0),
-            custom_output=handoff,
+            custom_output={SOULX_PREPROCESSED_KEY: payload},
             to_cpu=True,
         )
 

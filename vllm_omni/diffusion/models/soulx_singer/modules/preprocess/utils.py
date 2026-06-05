@@ -1,6 +1,5 @@
 """Shared helpers for SoulX preprocess (I/O, config, checkpoints, pitch)."""
 
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -259,34 +258,3 @@ def boundary2Interval(bd):
     if is_torch:
         return torch.LongTensor(ret).to(device)
     return ret
-
-
-# --- import helpers (ROSVOT / RMVPE) ---
-
-
-def _load_rosvot_core(source_dir: str | Path | None) -> tuple[type, type]:
-    if source_dir is None:
-        raise ValueError("ROSVOT_SOURCE_DIR is not set")
-
-    src = Path(source_dir).resolve()
-    standard_root = src if (src / "modules" / "rosvot").is_dir() else None
-    if standard_root is None:
-        standard_root = next(
-            (c for c in [src, *src.parents[:6]] if (c / "modules" / "rosvot").is_dir()),
-            None,
-        )
-    if standard_root is not None:
-        if str(standard_root) not in sys.path:
-            sys.path.insert(0, str(standard_root))
-
-        from modules.rosvot.rosvot import MidiExtractor  # type: ignore
-        from utils.audio.mel import MelNet  # type: ignore
-
-        logger.info("[rosvot] loaded core from %s", standard_root)
-        return MidiExtractor, MelNet
-
-    else:
-        raise RuntimeError(
-            "ROSVOT core not found. git clone https://github.com/RickyL-2000/ROSVOT "
-            "and set ROSVOT_SOURCE_DIR or pass rosvot_source_dir."
-        )
