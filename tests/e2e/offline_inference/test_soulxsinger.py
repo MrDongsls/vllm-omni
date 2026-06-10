@@ -2,7 +2,9 @@
 
 import functools
 import importlib
+import json
 import os
+import shutil
 from pathlib import Path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -53,30 +55,30 @@ _CASES = (
 
 
 @functools.lru_cache(maxsize=1)
-def _resolve_weights() -> tuple[Path, Path]:
-    for key in ("SOULXSINGER_MODEL_DIR", "SOULXSINGER_BASE_MODEL_DIR"):
-        if raw := os.environ.get(key):
-            base = Path(raw).expanduser().resolve()
-            if (base / "config.yaml").is_file():
-                break
-    else:
-        from huggingface_hub import snapshot_download
+def _resolve_weights() -> tuple[Path, Path, Path]:
+    from huggingface_hub import snapshot_download
 
-        base = Path(snapshot_download("Soul-AILab/SoulX-Singer", allow_patterns=["*"]))
+    base = Path(snapshot_download("Soul-AILab/SoulX-Singer", allow_patterns=["*"]))
+
+    # make a temporary svc directory
+    svc_dir = base.parent / "SoulX-Singer-SVC"
+    svc_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(base / "config.yaml", svc_dir / "config.yaml")
+    shutil.move(base / "model-svc.pt", svc_dir / "model-svc.pt")
 
     if raw := os.environ.get("SOULX_PREPROCESS_WEIGHTS_DIR"):
         pre = Path(raw).expanduser().resolve()
         if (pre / "rmvpe" / "rmvpe.pt").is_file():
-            return base, pre
+            return base, svc_dir, pre
 
     from huggingface_hub import snapshot_download
 
     pre = Path(snapshot_download("Soul-AILab/SoulX-Singer-Preprocess", allow_patterns=["*"]))
-    return base, pre
+    return base, svc_dir, pre
 
 
 @pytest.fixture(scope="session")
-def soulx_weights() -> tuple[Path, Path]:
+def soulx_weights() -> tuple[Path, Path, Path]:
     try:
         return _resolve_weights()
     except Exception as exc:
@@ -97,7 +99,7 @@ def _flatten_audio(audio_val) -> np.ndarray:
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("architecture,deploy_yaml,extra_args,py_deps", _CASES)
 def test_soulxsinger_multistage_from_audio(
-    soulx_weights: tuple[Path, Path],
+    soulx_weights: tuple[Path, Path, Path],
     architecture: str,
     deploy_yaml: str,
     extra_args: dict,
@@ -109,18 +111,30 @@ def test_soulxsinger_multistage_from_audio(
         except ImportError as exc:
             pytest.fail(f"SoulX SVS requires {mod}: {exc}")
 
-    base_dir, preprocess_dir = soulx_weights
+    base_dir, svc_dir, preprocess_dir = soulx_weights
 
     # SVS mode requires phone_set.json in the model directory
     if architecture == "SoulXSingerPipeline":
+        json.dump(
+            {"model_type": "soulxsinger", "architectures": ["SoulXSingerPipeline"], "max_num_seqs": 1},
+            open(base_dir / "config.json", "w"),
+            indent=4,
+        )
+        model = str(base_dir)
         if not (base_dir / "phoneme" / "phone_set.json").is_file() and not (base_dir / "phone_set.json").is_file():
             pytest.skip(
                 "SoulX-Singer SVS test requires phoneme/phone_set.json. "
                 "Copy it from github.com/Soul-AILab/SoulX-Singer into the model dir. "
                 "See `examples/offline_inference/text_to_speech/README.md` for details."
             )
+    if architecture == "SoulXSingerSVCPipeline":
+        json.dump(
+            {"model_type": "soulxsinger", "architectures": ["SoulXSingerSVCPipeline"], "max_num_seqs": 1},
+            open(svc_dir / "config.json", "w"),
+            indent=4,
+        )
+        model = str(svc_dir)
 
-    model = str(base_dir)
     with OmniRunner(
         model,
         stage_configs_path=get_deploy_config_path(deploy_yaml),
