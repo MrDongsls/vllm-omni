@@ -301,7 +301,7 @@ class PipelineSoulXSingerSVS(FlowMatchingAudioPipeline):
 
             if idx == 0:
                 pitch_shift = resolve_pitch_shift(
-                    auto_shift=bool(extra_args.get("auto_shift", False)),
+                    auto_shift=bool(extra_args.get("auto_shift", True)),
                     manual_shift=int(extra_args.get("pitch_shift", 0)),
                     prompt_f0=prompt_meta["f0"] if prompt_meta else None,
                     target_f0=target_meta["f0"],

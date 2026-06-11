@@ -3,7 +3,6 @@
 #
 # Usage:
 #   MODEL=/path/to/SoulX-Singer PREPROCESS=/path/to/Preprocess \
-#   ROSVOT_SOURCE_DIR=/path/to/rosvolt ./run_server.sh
 #
 # Audio paths in client extra_args must be readable on the server host.
 
@@ -11,7 +10,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
-ROSVOT_SOURCE_DIR=$ROSVOT_SOURCE_DIR
 
 MODEL="${MODEL:-Soul-AILab/SoulX-Singer}"
 MODE="${MODE:-svs}"

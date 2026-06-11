@@ -615,7 +615,6 @@ Download DiT and preprocess weights, then set up separate SVS / SVC view directo
 # SVS (default)
 export MODEL=/path/to/SoulX-Singer
 export PREPROCESS=/path/to/SoulX-Singer-Preprocess
-export ROSVOT_SOURCE_DIR=/path/to/rosvolt
 bash examples/online_serving/text_to_speech/soulxsinger/run_server.sh
 
 # SVC
@@ -645,10 +644,19 @@ python examples/online_serving/text_to_speech/soulxsinger/openai_chat_client.py 
     -o output.wav
 ```
 
+Use precomputed metadata to skip online preprocess with following command:
+```bash
+python examples/online_serving/text_to_speech/soulxsinger/openai_chat_client.py \
+    --prompt-metadata-path /path/on/server/zh_prompt.json \
+    --target-metadata-path /path/on/server/music.json \
+    --audio-path /path/on/server/zh_prompt.mp3 \
+    -o output.wav
+```
+
 `SOULX_PREPROCESS_WEIGHTS_DIR` makes `--preprocess-weights-dir` optional. See `openai_chat_client.py --help` for `--vocal-sep`, `--language`, `--num-inference-steps`, `--guidance-scale`, and `--seed`.
 
 ### Notes
 
 - Output: 24 kHz mono WAV; batch only.
-- Defaults match upstream: `--guidance-scale 3.0`, `--seed 42`, `--auto-shift` off.
+- Defaults match upstream: `--guidance-scale 3.0`, `--seed 42`, `--auto-shift` on.
 - SVS `--control`: `score` or `melody`. MIDI / lyric QC: upstream `midi_editor` only.

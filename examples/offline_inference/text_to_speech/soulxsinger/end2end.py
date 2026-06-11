@@ -163,19 +163,19 @@ def add_inference_args(parser: argparse.ArgumentParser) -> None:
         "--prompt-metadata-path",
         type=str,
         default=None,
-        help="SVS: precomputed prompt metadata.json (skips online ASR/ROSVOT for prompt)",
+        help="SVS precomputed prompt metadata.json (skips online ASR/ROSVOT for prompt)",
     )
     parser.add_argument(
         "--target-metadata-path",
         type=str,
         default=None,
-        help="SVS: precomputed target metadata.json (skips online ASR/ROSVOT for target)",
+        help="SVS precomputed target metadata.json (skips online ASR/ROSVOT for target)",
     )
     parser.add_argument(
         "--prompt-wav-path",
         type=str,
         default=None,
-        help="SVS: prompt vocal wav for metadata processor when using --prompt-metadata-path (default: --prompt-audio)",
+        help="SVS prompt vocal wav for metadata processor when using --prompt-metadata-path (default: --prompt-audio)",
     )
     parser.add_argument(
         "--preprocess-weights-dir",
@@ -192,7 +192,7 @@ def add_inference_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--control",
         type=str,
-        default="score",
+        default="melody",
         choices=["score", "melody"],
         help="SVS control mode",
     )
@@ -205,13 +205,18 @@ def add_inference_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--auto-shift",
         action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Auto pitch shift to align target pitch with prompt (default: off, same as upstream infer)",
+        default=True,
+        help="Auto pitch shift to align target pitch with prompt",
     )
     parser.add_argument("--pitch-shift", type=int, default=0)
     parser.add_argument("--num-inference-steps", type=int, default=32)
     parser.add_argument("--guidance-scale", type=float, default=3.0)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Optional CFM RNG seed. Omit for non-deterministic sampling.",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -219,10 +224,6 @@ def parse_args() -> argparse.Namespace:
     add_inference_args(parser)
     parser.add_argument("--output", "-o", type=str, default="output.wav")
     args = parser.parse_args()
-
-    if args.auto_shift is None:
-        # Upstream ``SoulXSinger.infer`` defaults to ``auto_shift=False``.
-        args.auto_shift = False
     return args
 
 

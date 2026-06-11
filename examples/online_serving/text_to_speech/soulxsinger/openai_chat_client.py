@@ -71,53 +71,101 @@ def main() -> int:
         default=str(default_assets / "music.mp3"),
         help="Target accompaniment path on the server (extra_args['target_audio'])",
     )
+    parser.add_argument(
+        "--prompt-metadata-path",
+        default=None,
+        help="SVS precomputed prompt metadata.json",
+    )
+    parser.add_argument(
+        "--target-metadata-path",
+        default=None,
+        help="SVS precomputed target metadata.json",
+    )
+    parser.add_argument(
+        "--audio-path",
+        default=None,
+        help="SVS prompt vocal wav for precomputed metadata",
+    )
     parser.add_argument("--preprocess-weights-dir", default=None)
     parser.add_argument("--output", "-o", default="soulxsinger_out.wav")
     parser.add_argument("--svc", action="store_true", help="Use SVC mode knobs")
     parser.add_argument("--language", default="Mandarin")
     parser.add_argument("--num-inference-steps", type=int, default=32)
     parser.add_argument("--guidance-scale", type=float, default=3.0)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Optional CFM seed. Omit for non-deterministic sampling.",
+    )
+    parser.add_argument(
+        "--auto-shift",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto pitch shift (default: on, original upstream infer.sh)",
+    )
+    parser.add_argument(
+        "--control",
+        default="melody",
+        choices=["melody", "score"],
+        help="SVS control mode",
+    )
     parser.add_argument("--vocal-sep", action="store_true")
     args = parser.parse_args()
 
-    prompt_path = Path(args.prompt_audio).expanduser().resolve()
-    if not prompt_path.is_file():
-        print(f"ERROR: prompt audio not found: {prompt_path}", file=sys.stderr)
+    meta_paths = (args.prompt_metadata_path, args.target_metadata_path, args.audio_path)
+    if any(meta_paths) and not all(meta_paths):
+        print(
+            "ERROR: precomputed metadata requires --prompt-metadata-path, "
+            "--target-metadata-path, and --audio-path together.",
+            file=sys.stderr,
+        )
         return 2
 
     extra_args: dict = {
-        "prompt_audio": str(prompt_path),
-        "target_audio": str(Path(args.target_audio).expanduser().resolve()),
         "vocal_sep": args.vocal_sep,
-        "auto_shift": False,
+        "auto_shift": args.auto_shift,
         "pitch_shift": 0,
     }
-    if args.preprocess_weights_dir:
-        extra_args["preprocess_weights_dir"] = str(Path(args.preprocess_weights_dir).expanduser().resolve())
+    if all(meta_paths):
+        extra_args.update(
+            {
+                "prompt_metadata_path": str(Path(args.prompt_metadata_path).expanduser().resolve()),
+                "target_metadata_path": str(Path(args.target_metadata_path).expanduser().resolve()),
+                "audio_path": str(Path(args.audio_path).expanduser().resolve()),
+            }
+        )
+        content = [{"type": "text", "text": "soulx-singer"}]
+    else:
+        prompt_path = Path(args.prompt_audio).expanduser().resolve()
+        if not prompt_path.is_file():
+            print(f"ERROR: prompt audio not found: {prompt_path}", file=sys.stderr)
+            return 2
+        extra_args["prompt_audio"] = str(prompt_path)
+        extra_args["target_audio"] = str(Path(args.target_audio).expanduser().resolve())
+        if args.preprocess_weights_dir:
+            extra_args["preprocess_weights_dir"] = str(Path(args.preprocess_weights_dir).expanduser().resolve())
+        content = [
+            {"type": "text", "text": "soulx-singer"},
+            {
+                "type": "input_audio",
+                "input_audio": {"data": _audio_to_data_url(prompt_path), "format": "mp3"},
+            },
+        ]
     if not args.svc:
         extra_args["language"] = args.language
-        extra_args["control"] = "score"
+        extra_args["control"] = args.control
 
     payload = {
         "model": args.model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "soulx-singer"},
-                    {
-                        "type": "input_audio",
-                        "input_audio": {"data": _audio_to_data_url(prompt_path), "format": "mp3"},
-                    },
-                ],
-            }
-        ],
+        "modalities": ["audio"],
+        "messages": [{"role": "user", "content": content}],
         "num_inference_steps": args.num_inference_steps,
         "guidance_scale": args.guidance_scale,
-        "seed": args.seed,
         "extra_args": extra_args,
     }
+    if args.seed is not None:
+        payload["seed"] = args.seed
 
     print(f"POST http://localhost:{args.port}/v1/chat/completions")
     response = requests.post(

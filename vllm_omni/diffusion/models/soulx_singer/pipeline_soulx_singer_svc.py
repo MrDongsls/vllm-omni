@@ -320,7 +320,7 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
         target_f0 = payload["target_f0"]
 
         pitch_shift = resolve_pitch_shift(
-            auto_shift=bool(extra_args.get("auto_shift", False)),
+            auto_shift=bool(extra_args.get("auto_shift", True)),
             manual_shift=int(extra_args.get("pitch_shift", 0)),
             prompt_f0=prompt_f0,
             target_f0=target_f0,

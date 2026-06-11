@@ -555,7 +555,7 @@ python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
 ### Notes
 
 - Output: 24 kHz mono WAV; batch only.
-- Defaults match upstream: `--guidance-scale 3.0`, `--seed 42`, `--auto-shift` off.
+- Defaults match upstream: `--guidance-scale 3.0`, `--seed 42`, `--auto-shift` on.
 - SVS `--control`: `score` or `melody`. MIDI / lyric QC: upstream `midi_editor` only.
 
 ---
