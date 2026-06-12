@@ -27,10 +27,20 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.model_executor.models.utils import (
+    PPMissingLayer,
+    make_empty_intermediate_tensors_factory,
+    make_layers,
+)
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import (
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -1054,69 +1064,92 @@ class Cosmos3VFMTransformer(nn.Module):
 
         dtype = od_config.dtype
         quant_config = getattr(od_config, "quantization_config", None) if od_config else None
+        is_pp_first_rank = is_pipeline_first_stage()
+        is_pp_last_rank = is_pipeline_last_stage()
 
-        self.language_model = Cosmos3LanguageModel(
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            num_hidden_layers=self.num_hidden_layers,
-            num_attention_heads=self.num_attention_heads,
-            num_key_value_heads=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            vocab_size=self.vocab_size,
-            rms_norm_eps=self.rms_norm_eps,
-            rope_theta=self.rope_theta,
-            mrope_section=self.mrope_section,
-            quant_config=quant_config,
-            prefix="language_model",
-        )
-
-        # Video projection layers are small; not worth quantizing.
-        self.proj_in = nn.Linear(self.patch_latent_dim, self.hidden_size)
-        self.proj_out = nn.Linear(self.hidden_size, self.patch_latent_dim)
-        self.time_embedder = TimestepEmbedder(self.hidden_size, target_dtype=dtype)
-        if self.action_gen:
-            self.action_proj_in = DomainAwareLinear(
-                self.action_dim,
-                self.hidden_size,
-                self.num_embodiment_domains,
-                dtype=dtype,
+        if is_pp_first_rank:
+            self.language_model = Cosmos3LanguageModel(
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                num_hidden_layers=self.num_hidden_layers,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                vocab_size=self.vocab_size,
+                rms_norm_eps=self.rms_norm_eps,
+                rope_theta=self.rope_theta,
+                mrope_section=self.mrope_section,
+                quant_config=quant_config,
+                prefix="language_model",
             )
-            self.action_proj_out = DomainAwareLinear(
-                self.hidden_size,
-                self.action_dim,
-                self.num_embodiment_domains,
-                dtype=dtype,
+
+            # Video projection layers are small; not worth quantizing.
+            self.proj_in = nn.Linear(self.patch_latent_dim, self.hidden_size)
+            self.time_embedder = TimestepEmbedder(self.hidden_size, target_dtype=dtype)
+        else:
+            self.language_model = PPMissingLayer()
+            self.proj_in = PPMissingLayer()
+            self.time_embedder = PPMissingLayer()
+        if is_pp_last_rank:
+            self.proj_out = nn.Linear(self.hidden_size, self.patch_latent_dim)
+        else:
+            self.proj_out = PPMissingLayer()
+
+        if self.action_gen:
+            self.action_proj_in = (
+                DomainAwareLinear(
+                    self.action_dim,
+                    self.hidden_size,
+                    self.num_embodiment_domains,
+                    dtype=dtype,
+                )
+                if is_pp_first_rank
+                else PPMissingLayer()
+            )
+            self.action_proj_out = (
+                DomainAwareLinear(
+                    self.hidden_size,
+                    self.action_dim,
+                    self.num_embodiment_domains,
+                    dtype=dtype,
+                )
+                if is_pp_last_rank
+                else PPMissingLayer()
             )
             self.action_modality_embed = nn.Parameter(torch.zeros(self.hidden_size, dtype=dtype))
         if self.sound_gen:
-            self.audio_proj_in = nn.Linear(self.sound_dim, self.hidden_size)
-            self.audio_proj_out = nn.Linear(self.hidden_size, self.sound_dim)
+            self.audio_proj_in = nn.Linear(self.sound_dim, self.hidden_size) if is_pp_first_rank else PPMissingLayer()
+            self.audio_proj_out = nn.Linear(self.hidden_size, self.sound_dim) if is_pp_last_rank else PPMissingLayer()
             self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
 
-        self.gen_layers = nn.ModuleList(
-            [
-                Cosmos3GenDecoderLayer(
-                    layer_idx=i,
-                    hidden_size=self.hidden_size,
-                    intermediate_size=self.intermediate_size,
-                    num_attention_heads=self.num_attention_heads,
-                    num_key_value_heads=self.num_key_value_heads,
-                    head_dim=self.head_dim,
-                    rms_norm_eps=self.rms_norm_eps,
-                    quant_config=quant_config,
-                    prefix=f"gen_layers.{i}",
-                )
-                for i in range(self.num_hidden_layers)
-            ]
+        self.start_layer, self.end_layer, self.gen_layers = make_layers(
+            self.num_hidden_layers,
+            lambda prefix: Cosmos3GenDecoderLayer(
+                layer_idx=prefix.split(".")[-1],
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                rms_norm_eps=self.rms_norm_eps,
+                quant_config=quant_config,
+                prefix=prefix,
+            ),
+            prefix="gen_layers",
         )
 
-        self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
-        self.gen_sp_prepare = Cosmos3GenSPPrepare()
+        self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps) if is_pp_last_rank else PPMissingLayer()
+        self.gen_sp_prepare = Cosmos3GenSPPrepare() if is_pp_first_rank else PPMissingLayer()
         self.gen_sp_gather = nn.Identity()
 
         # Cached state (populated on first forward, reused across denoising steps)
         self.cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self.cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
+
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_gen"],
+            self.hidden_size,
+        )
 
     @property
     def device(self) -> torch.device:
@@ -1282,6 +1315,42 @@ class Cosmos3VFMTransformer(nn.Module):
         self.cached_kv = None
         self.cached_freqs_gen = None
 
+    def _maybe_load_und_cache_from_intermediate_tensors(
+        self,
+        intermediate_tensors: IntermediateTensors,
+    ) -> None:
+        """Load UND K/V and GEN RoPE freqs forwarded from an upstream PP stage."""
+        if "freqs_cos" not in intermediate_tensors.tensors:
+            return
+        cos = intermediate_tensors["freqs_cos"]
+        sin = intermediate_tensors["freqs_sin"]
+        self.cached_freqs_gen = (cos, sin)
+        cached_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for i in range(self.num_hidden_layers):
+            k_key = f"cached_k_{i}"
+            v_key = f"cached_v_{i}"
+            if k_key not in intermediate_tensors.tensors:
+                break
+            cached_kv.append((intermediate_tensors[k_key], intermediate_tensors[v_key]))
+        if len(cached_kv) != self.num_hidden_layers:
+            raise RuntimeError(
+                "Cosmos3 PP intermediate tensors are missing UND cache entries "
+                f"(expected {self.num_hidden_layers}, got {len(cached_kv)})."
+            )
+        self.cached_kv = cached_kv
+
+    def _build_pp_intermediate_tensors(self, hidden_gen: torch.Tensor) -> IntermediateTensors:
+        """Pack GEN hidden states and UND cache for the next PP stage."""
+        tensors: dict[str, torch.Tensor] = {"hidden_gen": hidden_gen}
+        if self.cached_kv is not None and self.cached_freqs_gen is not None:
+            cos, sin = self.cached_freqs_gen
+            tensors["freqs_cos"] = cos
+            tensors["freqs_sin"] = sin
+            for i, (k, v) in enumerate(self.cached_kv):
+                tensors[f"cached_k_{i}"] = k
+                tensors[f"cached_v_{i}"] = v
+        return IntermediateTensors(tensors)
+
     @staticmethod
     def _validate_gen_sequence_parallel(
         *,
@@ -1334,9 +1403,10 @@ class Cosmos3VFMTransformer(nn.Module):
         action_start_frame_offset: int = 1,
         action_fps: float | None = None,
         sound_latents: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | IntermediateTensors:
         """
         Args:
             hidden_states: [B, C, t, h, w] noisy latents
@@ -1387,96 +1457,107 @@ class Cosmos3VFMTransformer(nn.Module):
         # Query Ulysses state at runtime
         ulysses_size, _, _ = _get_ulysses_state()
 
-        # Patchify latents and project to hidden space
-        hidden_video = self.proj_in(self.patchify(hidden_states, t, h, w))
-        s_video = hidden_video.shape[1]
-        s_action = 0
-        hidden_action = None
-        s_sound = 0
-        hidden_sound = None
-        if action_latents is not None:
-            if action_latents.shape[0] != hidden_states.shape[0]:
-                raise ValueError(
-                    "Cosmos3 action and video batch sizes must match: "
-                    f"video={hidden_states.shape[0]}, action={action_latents.shape[0]}."
-                )
-            if action_domain_ids is None:
-                action_domain_ids = torch.zeros(action_latents.shape[0], dtype=torch.long, device=action_latents.device)
-            hidden_action = self.action_proj_in(self.pack_action(action_latents), action_domain_ids)
-            hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
-            s_action = hidden_action.shape[1]
-        if sound_latents is not None:
-            if sound_latents.shape[0] != hidden_states.shape[0]:
-                raise ValueError(
-                    "Cosmos3 sound and video batch sizes must match: "
-                    f"video={hidden_states.shape[0]}, sound={sound_latents.shape[0]}."
-                )
-            hidden_sound = self.audio_proj_in(self.pack_sound(sound_latents))
-            hidden_sound = hidden_sound + self.audio_modality_embed.to(hidden_sound.dtype)
-            s_sound = hidden_sound.shape[1]
-
-        # Timestep embedding (fp32 for precision).
-        # For I2V: only add to noisy tokens, not conditioned ones.
-        # Conditioned frames are clean context and should not receive
-        # the diffusion timestep signal.
-        with torch.autocast("cuda", enabled=True, dtype=torch.float32):
-            time_embed = self.time_embedder(timestep * self.timestep_scale)
-        time_embed = time_embed.to(hidden_states.dtype)
-
-        if noisy_frame_mask is not None:
-            # Build per-token mask from per-frame mask.
-            # noisy_frame_mask: [B, 1, t, 1, 1] → token mask: [B, t*hp*wp, 1]
-            token_noisy_mask = (
-                noisy_frame_mask[:, 0, :, 0, 0]  # [B, t]
-                .unsqueeze(-1)  # [B, t, 1]
-                .expand(-1, -1, hp * wp)  # [B, t, hp*wp]
-                .reshape(hidden_video.shape[0], -1, 1)  # [B, t*hp*wp, 1]
-            )
-            hidden_video = hidden_video + time_embed.unsqueeze(1) * token_noisy_mask
-        else:
-            hidden_video = hidden_video + time_embed.unsqueeze(1)
-
-        if hidden_action is not None:
-            if action_noisy_mask is None:
-                hidden_action = hidden_action + time_embed.unsqueeze(1)
-            else:
-                if action_noisy_mask.shape != (hidden_action.shape[0], hidden_action.shape[1], 1):
+        if is_pipeline_first_stage():
+            # Patchify latents and project to hidden space
+            hidden_video = self.proj_in(self.patchify(hidden_states, t, h, w))
+            s_video = hidden_video.shape[1]
+            s_action = 0
+            hidden_action = None
+            s_sound = 0
+            hidden_sound = None
+            if action_latents is not None:
+                if action_latents.shape[0] != hidden_states.shape[0]:
                     raise ValueError(
-                        "Cosmos3 action_noisy_mask must have shape [B, T_action, 1], "
-                        f"got {tuple(action_noisy_mask.shape)}."
+                        "Cosmos3 action and video batch sizes must match: "
+                        f"video={hidden_states.shape[0]}, action={action_latents.shape[0]}."
                     )
-                hidden_action = hidden_action + time_embed.unsqueeze(1) * action_noisy_mask.to(hidden_action.dtype)
+                if action_domain_ids is None:
+                    action_domain_ids = torch.zeros(
+                        action_latents.shape[0], dtype=torch.long, device=action_latents.device
+                    )
+                hidden_action = self.action_proj_in(self.pack_action(action_latents), action_domain_ids)
+                hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
+                s_action = hidden_action.shape[1]
+            if sound_latents is not None:
+                if sound_latents.shape[0] != hidden_states.shape[0]:
+                    raise ValueError(
+                        "Cosmos3 sound and video batch sizes must match: "
+                        f"video={hidden_states.shape[0]}, sound={sound_latents.shape[0]}."
+                    )
+                hidden_sound = self.audio_proj_in(self.pack_sound(sound_latents))
+                hidden_sound = hidden_sound + self.audio_modality_embed.to(hidden_sound.dtype)
+                s_sound = hidden_sound.shape[1]
 
-        if hidden_sound is not None:
-            hidden_sound = hidden_sound + time_embed.unsqueeze(1)
-        hidden_parts = [hidden_video]
-        if hidden_action is not None:
-            hidden_parts.append(hidden_action)
-        if hidden_sound is not None:
-            hidden_parts.append(hidden_sound)
-        hidden_gen = torch.cat(hidden_parts, dim=1)
+            # Timestep embedding (fp32 for precision).
+            # For I2V: only add to noisy tokens, not conditioned ones.
+            # Conditioned frames are clean context and should not receive
+            # the diffusion timestep signal.
+            with torch.autocast("cuda", enabled=True, dtype=torch.float32):
+                time_embed = self.time_embedder(timestep * self.timestep_scale)
+            time_embed = time_embed.to(hidden_states.dtype)
 
-        # Run UND pathway once and cache K/V (replicated across all ranks)
-        if self.cached_kv is None:
-            freqs_und, freqs_gen = self._compute_rope_freqs(
-                text_mask,
-                t,
-                hp,
-                wp,
-                fps,
-                hidden_states.device,
-                hidden_states.dtype,
-                t_action=s_action,
-                action_start_frame_offset=action_start_frame_offset,
-                action_fps=action_fps,
-                t_sound=s_sound,
-            )
-            cached_kv_full = self.language_model(text_ids, freqs_und)
-            self.cached_freqs_gen = freqs_gen
+            if noisy_frame_mask is not None:
+                # Build per-token mask from per-frame mask.
+                # noisy_frame_mask: [B, 1, t, 1, 1] → token mask: [B, t*hp*wp, 1]
+                token_noisy_mask = (
+                    noisy_frame_mask[:, 0, :, 0, 0]  # [B, t]
+                    .unsqueeze(-1)  # [B, t, 1]
+                    .expand(-1, -1, hp * wp)  # [B, t, hp*wp]
+                    .reshape(hidden_video.shape[0], -1, 1)  # [B, t*hp*wp, 1]
+                )
+                hidden_video = hidden_video + time_embed.unsqueeze(1) * token_noisy_mask
+            else:
+                hidden_video = hidden_video + time_embed.unsqueeze(1)
 
-            # Trim to real text length (remove padding).  K/V stay replicated;
-            # the framework Attention layer head-slices them via joint_key/value.
-            self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+            if hidden_action is not None:
+                if action_noisy_mask is None:
+                    hidden_action = hidden_action + time_embed.unsqueeze(1)
+                else:
+                    if action_noisy_mask.shape != (hidden_action.shape[0], hidden_action.shape[1], 1):
+                        raise ValueError(
+                            "Cosmos3 action_noisy_mask must have shape [B, T_action, 1], "
+                            f"got {tuple(action_noisy_mask.shape)}."
+                        )
+                    hidden_action = hidden_action + time_embed.unsqueeze(1) * action_noisy_mask.to(hidden_action.dtype)
+
+            if hidden_sound is not None:
+                hidden_sound = hidden_sound + time_embed.unsqueeze(1)
+            hidden_parts = [hidden_video]
+            if hidden_action is not None:
+                hidden_parts.append(hidden_action)
+            if hidden_sound is not None:
+                hidden_parts.append(hidden_sound)
+            hidden_gen = torch.cat(hidden_parts, dim=1)
+
+            # Run UND pathway once and cache K/V (replicated across all ranks)
+            if self.cached_kv is None:
+                freqs_und, freqs_gen = self._compute_rope_freqs(
+                    text_mask,
+                    t,
+                    hp,
+                    wp,
+                    fps,
+                    hidden_states.device,
+                    hidden_states.dtype,
+                    t_action=s_action,
+                    action_start_frame_offset=action_start_frame_offset,
+                    action_fps=action_fps,
+                    t_sound=s_sound,
+                )
+                cached_kv_full = self.language_model(text_ids, freqs_und)
+                self.cached_freqs_gen = freqs_gen
+
+                # Trim to real text length (remove padding).  K/V stay replicated;
+                # the framework Attention layer head-slices them via joint_key/value.
+                self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+        else:
+            if intermediate_tensors is None:
+                raise RuntimeError("Cosmos3 GEN PP non-first stages require intermediate_tensors from the prior stage.")
+            hidden_gen = intermediate_tensors["hidden_gen"]
+            self._maybe_load_und_cache_from_intermediate_tensors(intermediate_tensors)
+            s_video = t * hp * wp
+            s_action = int(action_latents.shape[1]) if action_latents is not None else 0
+            s_sound = int(sound_latents.shape[2]) if sound_latents is not None else 0
 
         # Run GEN layers.  UND K/V (replicated) is passed to each layer;
         # the Cosmos3CrossAttention forwards them as joint_key/value so the
@@ -1493,25 +1574,25 @@ class Cosmos3VFMTransformer(nn.Module):
             ulysses_size=ulysses_size,
         )
         freqs_cos, freqs_sin = self.cached_freqs_gen
-        hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
+        if is_pipeline_first_stage():
+            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
         freqs_gen = (freqs_cos, freqs_sin)
 
         if len(self.gen_layers) == len(self.cached_kv):
-            for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
-                hidden_gen = layer(
+            for i in range(self.start_layer, self.end_layer):
+                hidden_gen = self.gen_layers[i](
                     hidden_gen,
-                    k_und=k_und,
-                    v_und=v_und,
+                    k_und=self.cached_kv[i][0],
+                    v_und=self.cached_kv[i][1],
                     freqs_cos=freqs_cos,
                     freqs_sin=freqs_sin,
                 )
-                # Cache-dit's block wrapper may return a tuple; unwrap it.
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
         else:
             # Cache-dit patches gen_layers to a grouped wrapper.
-            for layer in self.gen_layers:
-                hidden_gen = layer(
+            for i in range(self.start_layer, self.end_layer):
+                hidden_gen = self.gen_layers[i](
                     hidden_gen,
                     cached_kv=self.cached_kv,
                     freqs_gen=freqs_gen,
@@ -1520,6 +1601,9 @@ class Cosmos3VFMTransformer(nn.Module):
                     hidden_gen = hidden_gen[0]
 
             hidden_gen = self.gen_sp_gather(hidden_gen)
+
+        if not is_pipeline_last_stage():
+            return self._build_pp_intermediate_tensors(hidden_gen)
 
         # Final norm and project back to latent space
         hidden_gen = self.norm_moe_gen(hidden_gen)
@@ -1548,4 +1632,5 @@ class Cosmos3VFMTransformer(nn.Module):
 
     def post_load_weights(self) -> None:
         """Post-load processing: ensure correct dtypes."""
-        self.time_embedder.to(torch.float32)
+        if is_pipeline_first_stage():
+            self.time_embedder.to(torch.float32)
