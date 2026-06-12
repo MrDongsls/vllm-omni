@@ -33,7 +33,7 @@ from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, is_pp_missing_parameter
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
@@ -41,6 +41,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
+from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
@@ -596,7 +597,12 @@ def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
 # Pipeline
 # ---------------------------------------------------------------------------
 class Cosmos3OmniDiffusersPipeline(
-    nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    PipelineParallelMixin,
+    CFGParallelMixin,
+    SupportImageInput,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
 ):
     """Cosmos3 text/image/video-to-video / text-to-image pipeline.
 
@@ -903,7 +909,11 @@ class Cosmos3OmniDiffusersPipeline(
             for name, tensor in weights:
                 total += 1
                 remapped = self._remap_ckpt_key(name)
-                if remapped is not None and (remapped in allowed or remapped in tp_aware):
+                if remapped is None:
+                    continue
+                if is_pp_missing_parameter(remapped, self.transformer):
+                    continue
+                if remapped in allowed or remapped in tp_aware:
                     kept += 1
                     yield remapped, tensor
             if _is_rank_zero():
