@@ -487,18 +487,19 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
-      - label: "TTS · SoulX-Singer SVC Test"
+      - label: "TTS · SoulX-Singer Test"
         source_file_dependencies:
           - tests/e2e/offline_inference/test_soulxsinger.py
           - vllm_omni/diffusion/models/soulx_singer/
           - vllm_omni/deploy/soulxsinger_svc.yaml
+          - vllm_omni/deploy/soulxsinger_svs.yaml
         timeout_in_minutes: 30
         commands:
           - |
             timeout 30m bash -c "
               export VLLM_LOGGING_LEVEL=DEBUG
               export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              pytest -s -v tests/e2e/offline_inference/test_soulxsinger.py -k svc -m 'advanced_model and cuda' --run-level 'advanced_model'
+              pytest -s -v tests/e2e/offline_inference/test_soulxsinger.py -k 'svc or precomputed' -m 'advanced_model and cuda' --run-level 'advanced_model'
             "
         agents:
           queue: "gpu_1_queue"
