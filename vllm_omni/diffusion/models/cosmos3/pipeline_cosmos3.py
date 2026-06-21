@@ -39,8 +39,13 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
 )
-from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMixin
+from vllm_omni.diffusion.distributed.pipeline_parallel import (
+    AsyncLatents,
+    PipelineParallelMixin,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
@@ -812,7 +817,13 @@ class Cosmos3OmniDiffusersPipeline(
         self.transformer.eval()
         if getattr(self.transformer, "sound_gen", False):
             sound_markers = ("audio_proj_in.", "audio_proj_out.", "audio_modality_embed")
-            missing = [marker.rstrip(".") for marker in sound_markers if not any(marker in name for name in loaded)]
+            # missing = [marker.rstrip(".") for marker in sound_markers if not any(marker in name for name in loaded)]
+            missing = [
+                marker.rstrip(".")
+                for marker in sound_markers
+                if not is_pp_missing_parameter(marker, self.transformer)
+                and not any(marker.rstrip(".") in name for name in loaded)
+            ]
             if missing:
                 raise ValueError(
                     "Cosmos3 transformer config enables sound generation, but "
@@ -821,7 +832,13 @@ class Cosmos3OmniDiffusersPipeline(
                 )
         if getattr(self.transformer, "action_gen", False):
             action_markers = ("action_proj_in.", "action_proj_out.", "action_modality_embed")
-            missing = [marker.rstrip(".") for marker in action_markers if not any(marker in name for name in loaded)]
+            # missing = [marker.rstrip(".") for marker in action_markers if not any(marker in name for name in loaded)]
+            missing = [
+                marker.rstrip(".")
+                for marker in action_markers
+                if not is_pp_missing_parameter(marker, self.transformer)
+                and not any(marker.rstrip(".") in name for name in loaded)
+            ]
             if missing:
                 raise ValueError(
                     "Cosmos3 transformer config enables action generation, but "
@@ -1588,7 +1605,9 @@ class Cosmos3OmniDiffusersPipeline(
         """
         do_cfg = guidance_scale > 1.0
         cfg_parallel = self._cfg_parallel_active() and do_cfg
+        # TODO: need to confirm reset cache will be done on every stage in pipeline parallel (rank 0, 1, ...)
         self.transformer.reset_cache()
+        self.transformer.reset_pp_step()
 
         def _cfg_active_at(t: torch.Tensor) -> bool:
             if guidance_interval is None:
@@ -1650,13 +1669,43 @@ class Cosmos3OmniDiffusersPipeline(
             sound_pred = noise_pred[idx] if has_sound else None
             return video_pred, action_pred, sound_pred
 
+        _has_multimodal = action_latents is not None or sound_latents is not None
+        if _has_multimodal:
+            _, _joint_shapes, _joint_numels = _pack_joint(latents, action_latents, sound_latents)
+        else:
+            _joint_shapes, _joint_numels = None, None
+
         def _step(
-            noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+            noise_pred: torch.Tensor | tuple[torch.Tensor, ...] | None,
             t: torch.Tensor,
             latents: torch.Tensor,
             action_latents: torch.Tensor | None,
             sound_latents: torch.Tensor | None,
         ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+            if noise_pred is None:
+                # Non-last PP rank: still need to participate in scheduler PP handshake
+                next_latents = self.scheduler_step_maybe_with_cfg(None, t, latents, do_true_cfg=False)
+                if _has_multimodal:
+                    if isinstance(next_latents, AsyncLatents):
+                        next_latents = next_latents._resolve()
+                    unpacked = _unpack_joint(next_latents, _joint_shapes, _joint_numels)
+                    latents = unpacked[0]
+                    idx = 1
+                    if action_latents is not None:
+                        action_latents = unpacked[idx]
+                        idx += 1
+                    if sound_latents is not None:
+                        sound_latents = unpacked[idx]
+                else:
+                    latents = next_latents
+                # action/sound latents unchanged on non-last ranks
+                outputs = [latents]
+                if action_latents is not None:
+                    outputs.append(action_latents)
+                if sound_latents is not None:
+                    outputs.append(sound_latents)
+                return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
             video_pred, action_pred, sound_pred = _split_noise_pred(noise_pred)
             if velocity_mask is not None:
                 video_pred = video_pred * velocity_mask
@@ -1665,11 +1714,13 @@ class Cosmos3OmniDiffusersPipeline(
                 if raw_action_dim is not None and 0 < raw_action_dim < action_pred.shape[-1]:
                     action_pred[..., raw_action_dim:] = 0
             if action_latents is None and sound_latents is None:
-                latents = self.scheduler.step(video_pred, t, latents, return_dict=False)[0]
+                latents = self.scheduler_step_maybe_with_cfg(video_pred, t, latents, do_true_cfg=False)
             else:
                 packed_noise, shapes, numels = _pack_joint(video_pred, action_pred, sound_pred)
                 packed_latents, _, _ = _pack_joint(latents, action_latents, sound_latents)
-                packed_next = self.scheduler.step(packed_noise, t, packed_latents, return_dict=False)[0]
+                packed_next = self.scheduler_step_maybe_with_cfg(packed_noise, t, packed_latents, do_true_cfg=False)
+                if isinstance(packed_next, AsyncLatents):
+                    packed_next = packed_next._resolve()
                 unpacked = _unpack_joint(packed_next, shapes, numels)
                 latents = unpacked[0]
                 idx = 1
@@ -1678,6 +1729,16 @@ class Cosmos3OmniDiffusersPipeline(
                     idx += 1
                 if sound_latents is not None:
                     sound_latents = unpacked[idx]
+
+            # Condition re-injection：only rank 0 have latents updated
+            if not is_pipeline_first_stage():
+                outputs = [latents]
+                if action_latents is not None:
+                    outputs.append(action_latents)
+                if sound_latents is not None:
+                    outputs.append(sound_latents)
+                return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
             if condition_latents is not None and velocity_mask is not None:
                 latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
             elif image_latent is not None:
@@ -1696,7 +1757,9 @@ class Cosmos3OmniDiffusersPipeline(
         def _assign_step_out(step_out: torch.Tensor | tuple[torch.Tensor, ...]) -> None:
             nonlocal latents, action_latents, sound_latents
             if action_latents is None and sound_latents is None:
-                assert isinstance(step_out, torch.Tensor)
+                # assert isinstance(step_out, torch.Tensor)
+                # latents could be AsyncLatents, which implements __torch_function__
+                # so it will be triggered automatically in self.transformer.forward
                 latents = step_out
                 return
             if not isinstance(step_out, tuple):
@@ -1753,36 +1816,56 @@ class Cosmos3OmniDiffusersPipeline(
                 cfg_active = _cfg_active_at(t)
 
                 self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
-                noise_cond = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep,
-                    text_ids=cond_ids,
-                    text_mask=cond_mask,
-                    action_latents=action_latents,
-                    sound_latents=sound_latents,
-                    **shared_kwargs,
+                noise_cond = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=False,
+                    true_cfg_scale=1.0,
+                    positive_kwargs=dict(
+                        hidden_states=latents,
+                        timestep=timestep,
+                        text_ids=cond_ids,
+                        text_mask=cond_mask,
+                        action_latents=action_latents,
+                        sound_latents=sound_latents,
+                        **shared_kwargs,
+                    ),
+                    negative_kwargs=None,
+                    cfg_normalize=False,
                 )
                 if cond_cache[0] is None:
                     cond_cache = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
 
                 if cfg_active or keep_uncond_for_cache:
                     self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
-                    noise_uncond = self.transformer(
-                        hidden_states=latents,
-                        timestep=timestep,
-                        text_ids=uncond_ids,
-                        text_mask=uncond_mask,
-                        action_latents=action_latents,
-                        sound_latents=sound_latents,
-                        **shared_kwargs,
+                    if uncond_cache[0] is None and not is_pipeline_last_stage():
+                        # refresh cache transfer for sequential CFG
+                        self.transformer.reset_pp_step()
+                    noise_uncond = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=False,
+                        true_cfg_scale=1.0,
+                        positive_kwargs=dict(
+                            hidden_states=latents,
+                            timestep=timestep,
+                            text_ids=uncond_ids,
+                            text_mask=uncond_mask,
+                            action_latents=action_latents,
+                            sound_latents=sound_latents,
+                            **shared_kwargs,
+                        ),
+                        negative_kwargs=None,
+                        cfg_normalize=False,
                     )
                     if uncond_cache[0] is None:
                         uncond_cache = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
+
                     # Outside the interval, scale=1.0 makes the combined result
                     # equal to noise_cond; the uncond pass is computed only to
                     # preserve cache-dit's cond/uncond parity.
                     step_scale = guidance_scale if cfg_active else 1.0
-                    noise_pred = self.combine_cfg_noise(noise_cond, noise_uncond, step_scale, cfg_normalize=False)
+                    if is_pipeline_last_stage():
+                        # Last stage: noise_cond or noise_uncond is expected
+                        noise_pred = self.combine_cfg_noise(noise_cond, noise_uncond, step_scale, cfg_normalize=False)
+                    else:
+                        noise_pred = None
                 else:
                     noise_pred = noise_cond
 
@@ -1791,18 +1874,26 @@ class Cosmos3OmniDiffusersPipeline(
         else:
             for t in self.progress_bar(timesteps):
                 timestep = t.unsqueeze(0)
-                noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep,
-                    text_ids=cond_ids,
-                    text_mask=cond_mask,
-                    action_latents=action_latents,
-                    sound_latents=sound_latents,
-                    **shared_kwargs,
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=False,
+                    true_cfg_scale=1.0,
+                    positive_kwargs=dict(
+                        hidden_states=latents,
+                        timestep=timestep,
+                        text_ids=cond_ids,
+                        text_mask=cond_mask,
+                        action_latents=action_latents,
+                        sound_latents=sound_latents,
+                        **shared_kwargs,
+                    ),
+                    negative_kwargs=None,
+                    cfg_normalize=False,
                 )
                 _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
 
         outputs = [latents]
+        if isinstance(outputs[0], AsyncLatents):
+            outputs[0] = outputs[0]._resolve()
         if action_latents is not None:
             outputs.append(action_latents)
         if sound_latents is not None:
