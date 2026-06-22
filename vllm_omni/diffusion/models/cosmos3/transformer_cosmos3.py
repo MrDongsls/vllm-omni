@@ -1199,7 +1199,13 @@ class Cosmos3VFMTransformer(nn.Module):
         p = self.latent_patch_size
         C = self.latent_channel_size
         hp, wp, H_padded, W_padded = self._pad_to_patch_size(h, w)
-
+        # expected = B * C * t * H_padded * W_padded
+        # if latents.numel() != expected:
+        #     raise ValueError(
+        #         f"Cosmos3 patchify received {latents.numel()} elements but expected "
+        #         f"{expected} for video_shape=({t},{h},{w}). The latents are likely still "
+        #         f"packed with action/sound modalities — unpack before calling forward."
+        #     )
         if H_padded != h or W_padded != w:
             latents = F.pad(latents, (0, W_padded - w, 0, H_padded - h))
 
@@ -1364,6 +1370,10 @@ class Cosmos3VFMTransformer(nn.Module):
         self.cached_kv = None
         self.cached_freqs_gen = None
 
+    def reset_pp_step(self) -> None:
+        # PP-aware flag to track if cache is shared across denoising steps
+        self._is_first_denoise_step = True
+
     def _maybe_load_und_cache_from_intermediate_tensors(
         self,
         intermediate_tensors: IntermediateTensors,
@@ -1391,13 +1401,18 @@ class Cosmos3VFMTransformer(nn.Module):
     def _build_pp_intermediate_tensors(self, hidden_gen: torch.Tensor) -> IntermediateTensors:
         """Pack GEN hidden states and UND cache for the next PP stage."""
         tensors: dict[str, torch.Tensor] = {"hidden_gen": hidden_gen}
-        if self.cached_kv is not None and self.cached_freqs_gen is not None:
+
+        # send cache to next stage when first denoising step
+        include_cache = (not is_pipeline_last_stage()) and self._is_first_denoise_step
+        if self.cached_kv is not None and include_cache:
             cos, sin = self.cached_freqs_gen
             tensors["freqs_cos"] = cos
             tensors["freqs_sin"] = sin
             for i, (k, v) in enumerate(self.cached_kv):
                 tensors[f"cached_k_{i}"] = k
                 tensors[f"cached_v_{i}"] = v
+
+        self._is_first_denoise_step = False
         return IntermediateTensors(tensors)
 
     @staticmethod
@@ -1726,5 +1741,4 @@ class Cosmos3VFMTransformer(nn.Module):
 
     def post_load_weights(self) -> None:
         """Post-load processing: ensure correct dtypes."""
-        if is_pipeline_first_stage():
-            self.time_embedder.to(torch.float32)
+        self.time_embedder.to(torch.float32)
