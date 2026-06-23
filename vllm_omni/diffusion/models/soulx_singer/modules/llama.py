@@ -2,10 +2,12 @@ import math
 
 import torch
 import torch.nn as nn
+from cache_dit import ForwardPattern
 from transformers import LlamaConfig, LlamaModel
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 
 
@@ -106,6 +108,15 @@ class DiffLlama(LlamaModel):
     # Regional torch.compile in DiffusionModelRunner targets these blocks.
     _repeated_blocks = ["LlamaNARDecoderLayer"]
     _layerwise_offload_blocks_attrs = ["layers"]
+
+    # cache-dit: Llama-style backbone with static condition embeddings injected
+    # before the decoder loop (like Stable Audio Open). Pattern_3 handles the
+    # cross-attention-style conditioning on the ``layers`` ModuleList.
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "layers": ForwardPattern.Pattern_3,
+        },
+    )
 
     # Sequence parallelism: shard mel sequence before the first decoder layer and
     # gather after the output projection. Tensor parallelism still requires

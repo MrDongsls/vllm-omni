@@ -107,6 +107,9 @@ from tqdm.asyncio import tqdm
 
 logger = logging.getLogger(__name__)
 
+_STAGE_METRICS_ENDPOINTS = {"/v1/chat/completions"}
+_RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
+
 
 class BaseDataset(ABC):
     def __init__(self, args, api_url: str, model: str):
@@ -1028,6 +1031,14 @@ def _save_generated_outputs(
         if not out.success or not out.response_body:
             continue
 
+        if isinstance(out.response_body, bytes):
+            fname = f"req_{idx:04d}.mp4"
+            fpath = os.path.join(save_dir, fname)
+            with open(fpath, "wb") as f:
+                f.write(out.response_body)
+            saved += 1
+            continue
+
         media_urls: list[str] = []
 
         # Chat-completions style: choices[*].message.content[*].image_url.url
@@ -1162,6 +1173,10 @@ async def benchmark(args):
     print("Loading requests...")
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
+
+    if args.return_stage_metrics and args.endpoint in _STAGE_METRICS_ENDPOINTS:
+        for req in requests_list:
+            req.extra_body.setdefault(_RETURN_STAGE_METRICS_FIELD, True)
 
     if args.endpoint == "/v1/images/edits":
         for req in requests_list:
@@ -1442,6 +1457,11 @@ if __name__ == "__main__":
         type=str,
         default="think",
         help=("bot_task form field for --endpoint /v1/images/edits (think, recaption, think_recaption, vanilla)."),
+    )
+    parser.add_argument(
+        "--return-stage-metrics",
+        action="store_true",
+        help="Request stage duration metrics from endpoints that support return_stage_metrics.",
     )
 
     args = parser.parse_args()
