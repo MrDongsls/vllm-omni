@@ -2127,6 +2127,7 @@ class Cosmos3OmniDiffusersPipeline(
         """
         do_cfg = guidance_scale > 1.0
         cfg_parallel = self._cfg_parallel_active() and do_cfg
+        step_scheduler = scheduler if scheduler is not None else self.scheduler
         self.transformer.reset_cache()
         self.transformer.reset_pp_step()
 
@@ -2205,7 +2206,9 @@ class Cosmos3OmniDiffusersPipeline(
         ) -> torch.Tensor | tuple[torch.Tensor, ...]:
             if noise_pred is None:
                 # Non-last PP rank: still need to participate in scheduler PP handshake
-                next_latents = self.scheduler_step_maybe_with_cfg(None, t, latents, do_true_cfg=False)
+                next_latents = self.scheduler_step_maybe_with_cfg(
+                    None, t, latents, do_true_cfg=False, per_request_scheduler=step_scheduler
+                )
                 if _has_multimodal:
                     if isinstance(next_latents, AsyncLatents):
                         next_latents = next_latents._resolve()
@@ -2238,11 +2241,15 @@ class Cosmos3OmniDiffusersPipeline(
                 if raw_action_dim is not None and 0 < raw_action_dim < action_pred.shape[-1]:
                     action_pred[..., raw_action_dim:] = 0
             if action_latents is None and sound_latents is None:
-                latents = self.scheduler_step_maybe_with_cfg(video_pred, t, latents, do_true_cfg=False)
+                latents = self.scheduler_step_maybe_with_cfg(
+                    video_pred, t, latents, do_true_cfg=False, per_request_scheduler=step_scheduler
+                )
             else:
                 packed_noise, shapes, numels = _pack_joint(video_pred, action_pred, sound_pred)
                 packed_latents, _, _ = _pack_joint(latents, action_latents, sound_latents)
-                packed_next = self.scheduler_step_maybe_with_cfg(packed_noise, t, packed_latents, do_true_cfg=False)
+                packed_next = self.scheduler_step_maybe_with_cfg(
+                    packed_noise, t, packed_latents, do_true_cfg=False, per_request_scheduler=step_scheduler
+                )
                 if isinstance(packed_next, AsyncLatents):
                     packed_next = packed_next._resolve()
                 unpacked = _unpack_joint(packed_next, shapes, numels)

@@ -1569,7 +1569,9 @@ class Cosmos3VFMTransformer(nn.Module):
                         f"video={hidden_states.shape[0]}, action={action_latents.shape[0]}."
                     )
                 if action_domain_ids is None:
-                    action_domain_ids = torch.zeros(action_latents.shape[0], dtype=torch.long, device=action_latents.device)
+                    action_domain_ids = torch.zeros(
+                        action_latents.shape[0], dtype=torch.long, device=action_latents.device
+                    )
                 hidden_action = self.action_proj_in(self.pack_action(action_latents), action_domain_ids)
                 hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
                 s_action = hidden_action.shape[1]
