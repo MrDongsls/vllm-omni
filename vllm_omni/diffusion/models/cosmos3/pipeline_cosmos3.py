@@ -2209,9 +2209,9 @@ class Cosmos3OmniDiffusersPipeline(
                 next_latents = self.scheduler_step_maybe_with_cfg(
                     None, t, latents, do_true_cfg=False, per_request_scheduler=step_scheduler
                 )
-                if _has_multimodal:
-                    if isinstance(next_latents, AsyncLatents):
-                        next_latents = next_latents._resolve()
+                if isinstance(next_latents, AsyncLatents):
+                    next_latents = next_latents._resolve()
+                if _has_multimodal and is_pipeline_first_stage():
                     unpacked = _unpack_joint(next_latents, _joint_shapes, _joint_numels)
                     latents = unpacked[0]
                     idx = 1
