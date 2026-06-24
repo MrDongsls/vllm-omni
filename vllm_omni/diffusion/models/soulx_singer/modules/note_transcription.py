@@ -540,7 +540,7 @@ class EncoderLayer(nn.Module):
         if self.concat_after:
             self.concat_linear = nn.Linear(2 * size, size)
 
-    def forward(self, x_input, mask, cache=None):
+    def forward(self, x_input, mask, cache=None) -> tuple:
         """
         Forward pass for the encoder layer.
 
