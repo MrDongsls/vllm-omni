@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
+
+from vllm_omni.outputs import OmniRequestOutput
 
 DREAMZERO_EXTRA_BODY_PARAMS: frozenset[str] = frozenset(
     {
@@ -25,6 +27,7 @@ CAMERA_FILES = {
     "observation/exterior_image_1_left": "exterior_image_2_left.mp4",
     "observation/wrist_image_left": "wrist_image_left.mp4",
 }
+DEFAULT_NUM_CHUNKS = 2
 
 
 def _load_video_frames(video_path: Path) -> np.ndarray:
@@ -75,23 +78,23 @@ def _make_obs(
     return obs
 
 
-def build_observations(source: dict[str, Any]) -> Iterable[dict[str, Any]]:
+def build_observations(source: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """Read 3 camera MP4s and yield DreamZero AR extra_args dicts.
 
     Yields a sequence (→ autoregressive mode). The first item carries
     ``reset=True``; all share one ``session_id``.
     """
-    video_dir = source.get("video_dir")
-    if video_dir is None:
-        raise ValueError("DreamZero requires source['video_dir'] with 3 camera MP4 files.")
-    video_dir = Path(video_dir)
+    data_dir = source.get("data_dir")
+    if data_dir is None:
+        raise ValueError("DreamZero requires source['data_dir'] with 3 camera MP4 files.")
+    data_dir = Path(data_dir)
     task = source.get("task", "")
-    num_chunks = int(source.get("num_chunks", 2))
+    num_chunks = int(source.get("num_chunks", DEFAULT_NUM_CHUNKS))
     session_id = source.get("session_id")
 
     camera_frames: dict[str, np.ndarray] = {}
     for camera_key, file_name in CAMERA_FILES.items():
-        path = video_dir / file_name
+        path = data_dir / file_name
         if not path.exists():
             raise FileNotFoundError(f"Camera video not found: {path}")
         camera_frames[camera_key] = _load_video_frames(path)
@@ -99,21 +102,23 @@ def build_observations(source: dict[str, Any]) -> Iterable[dict[str, Any]]:
     total = min(f.shape[0] for f in camera_frames.values())
     schedule = [[0]] + _build_frame_schedule(total, num_chunks)
 
+    extra_args = []
     for index, frame_indices in enumerate(schedule):
         obs = _make_obs(camera_frames, frame_indices, prompt=task)
         obs["session_id"] = session_id
-        extra_args: dict[str, Any] = {
-            "robot_obs": obs,
-            "session_id": session_id,
-            "prompt": task,  # carried for engine.generate(prompt, ...)
-        }
-        if index == 0:
-            extra_args["reset"] = True
-        yield extra_args
+        extra_args.append(
+            {
+                "reset": index == 0,
+                "robot_obs": obs,
+                "session_id": session_id,
+                "prompt": task,
+            }
+        )
+    return extra_args, {}
 
 
 def process_robot_actions(
-    output: Any,
+    output: OmniRequestOutput,
     **kwargs,
 ) -> dict[str, Any]:
     """Extract actions from DreamZero's DiffusionOutput.
@@ -127,24 +132,21 @@ def process_robot_actions(
     Returns:
         A dict with at least ``{"actions": np.ndarray, "metadata": {...}}``.
     """
-    del kwargs
-    output_dict = getattr(output, "output", output)
-    if isinstance(output_dict, dict):
-        actions = output_dict.get("actions")
-    else:
-        actions = getattr(output, "actions", None)
+    action_output = output.multimodal_output.get("actions")
+    action_array = np.asarray(action_output)
 
-    if actions is None:
-        raise KeyError("DreamZero output does not contain 'actions'.")
+    if not output.images:
+        raise RuntimeError("DreamZero output does not contain video latents in `images`.")
+    latents = output.images[0]
+    if not isinstance(latents, torch.Tensor):
+        raise TypeError(f"Expected tensor latents, got {type(latents)!r}")
 
-    if isinstance(actions, np.ndarray):
-        action_array = actions
-    else:
-        action_array = np.asarray(actions, dtype=np.float32)
+    latents = latents.detach().cpu()
+    if latents.dim() == 4:
+        latents = latents.unsqueeze(0)
+    if latents.dim() != 5:
+        raise ValueError(f"Unexpected latent shape: {tuple(latents.shape)}")
 
-    metadata: dict[str, Any] = {}
-    if isinstance(output_dict, dict):
-        if "video" in output_dict:
-            metadata["video_latents"] = output_dict["video"]
-
-    return {"actions": action_array, "metadata": metadata}
+    if latents.shape[1] < latents.shape[2]:
+        latents = latents.transpose(1, 2).contiguous()
+    return {"actions": action_array, "metadata": {"video_latents": latents}}

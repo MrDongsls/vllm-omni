@@ -28,6 +28,7 @@ INTERNVLA_A1_EXTRA_BODY_PARAMS: frozenset[str] = frozenset(
 INTERNVLA_A1_EXTRA_OUTPUT_PARAMS: frozenset[str] = frozenset()
 
 CAMERA_KEYS = ("image0", "image1", "image2")
+DEFAULT_SAMPLE_INDEX = 0
 
 
 def _normalize_vector(values: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
@@ -260,7 +261,7 @@ def collate_open_loop_samples(
     return batch_inputs, metadata
 
 
-def build_observations(source: dict[str, Any]) -> dict[str, Any]:
+def build_observations(source: dict[str, Any], **kwargs) -> dict[str, Any]:
     """Build one InternVLA-A1 extra_args dict from the A2D dataset.
 
     Returns a single dict (→ single-shot mode). ``_meta`` carries the
@@ -275,7 +276,7 @@ def build_observations(source: dict[str, Any]) -> dict[str, Any]:
     device = source.get("device", "cuda")
     dtype_name = source.get("dtype", "bfloat16")
     seed = int(source.get("seed", 42))
-    sample_index = int(source.get("sample_index", 0))
+    sample_index = int(source.get("sample_index", DEFAULT_SAMPLE_INDEX))
 
     config = InternVLAA1Config.from_pretrained(model_dir)
     config.device, config.dtype = device, dtype_name
@@ -293,17 +294,14 @@ def build_observations(source: dict[str, Any]) -> dict[str, Any]:
         generator=torch.Generator(device="cpu").manual_seed(seed),
         dtype=torch.float32,
     )
-
-    return {
-        "batch_inputs": batch_inputs,
-        "noise": noise,
-        "_meta": {
-            "physical_action_dim": dataset.physical_action_dim,
-            "action_stats": dataset.action_stats,
-            "action_mode": train_meta.action_mode,
-            "state_raw": meta["state_raw"],
-        },
+    observations = {"batch_inputs": batch_inputs, "noise": noise}
+    metadata = {
+        "physical_action_dim": dataset.physical_action_dim,
+        "action_stats": dataset.action_stats,
+        "action_mode": train_meta.action_mode,
+        "state_raw": meta["state_raw"],
     }
+    return observations, metadata
 
 
 def process_robot_actions(

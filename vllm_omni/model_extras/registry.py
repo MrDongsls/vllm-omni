@@ -108,7 +108,7 @@ ImageToVideoPromptBuilder = Callable[
     ],
     dict[str, Any],
 ]
-RobotObsBuilder = Callable[[dict], list[dict[str, Any]] | dict[str, Any]]
+RobotObsBuilder = Callable[..., tuple[list[dict[str, Any]] | dict[str, Any], dict[str, Any]]]
 ActionOutputProcessor = Callable[..., dict[str, Any]]
 
 
@@ -309,7 +309,8 @@ def build_image_to_video_prompt(
 def build_robot_observations(
     model_class_name: str | None,
     source: dict[str, Any],
-) -> list[dict[str, Any]] | dict[str, Any]:
+    **kwargs,
+) -> tuple[list[dict[str, Any]] | dict[str, Any], dict[str, Any]]:
     spec = _get_spec(model_class_name)
     builder: RobotObsBuilder | None = spec.get("robot_obs_builder") if spec is not None else None
     if builder is None:
@@ -317,7 +318,9 @@ def build_robot_observations(
             f"Model '{model_class_name}' has no robot_obs_builder registered; "
             "it cannot run through the shared robot_policy example."
         )
-    return builder(source)
+    # TODO: kwargs are forwarded to the builder opaquely; identify the most frequently used
+    #       parameters and replace **kwargs with explicit named arguments.
+    return builder(source, **kwargs)
 
 
 def process_robot_actions(

@@ -30,13 +30,21 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.model_extras import (
     build_robot_observations,
+    get_extra_body_params,
+    get_model_class_name,
     process_robot_actions,
 )
+
+DECODE_VIDEO_SUPPORTS = [
+    "dreamzero",
+]
 
 
 def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
@@ -65,11 +73,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-class-name", default=None, help="Override model class name.")
     parser.add_argument("--model-dir", default=None)
     parser.add_argument("--deploy-config", default=None)
-    parser.add_argument("--worker-extension-cls", default=None)
     parser.add_argument("--data-dir", type=Path, help="Directory containing organized assets needed by examples.")
     parser.add_argument("--task", default="", help="Task prompt string controls the robot trajectory planning.")
     parser.add_argument("--num-chunks", type=int, default=2)
-    parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
@@ -213,68 +219,60 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# def build_engine(args: argparse.Namespace, model_class_name: str) -> tuple[Any, bool]:
-#     """Build the inference engine. Returns (engine, is_omni)."""
-#     # InternVLA-A1 example is a bit special
-#     # TODO: migrate the omni engine build process from image_to_video.py
-#     if model_class_name == "InternVLAA1Pipeline":
-#         from vllm_omni.diffusion.data import OmniDiffusionConfig
-#         from vllm_omni.diffusion.registry import initialize_model
+def _write_mp4(model_class_name: str, frames: np.ndarray, fps: int) -> None:
+    import cv2
 
-#         model_dir = args.model_dir or args.model
-#         od_config = OmniDiffusionConfig(
-#             model=str(Path(model_dir).resolve()),
-#             model_class_name=model_class_name,
-#             dtype=args.dtype,
-#             custom_pipeline_args={"device": args.device, "dtype": args.dtype},
-#         )
-#         return initialize_model(od_config), False
-
-#     from vllm_omni.entrypoints.omni import Omni
-
-#     kwargs: dict[str, Any] = {"model": args.model, "model_class_name": model_class_name}
-#     if args.deploy_config:
-#         kwargs["deploy_config"] = str(args.deploy_config)
-#     if args.worker_extension_cls:
-#         kwargs["worker_extension_cls"] = args.worker_extension_cls
-#     if args.enforce_eager:
-#         kwargs["enforce_eager"] = True
-#     return Omni(**kwargs), True
+    omni_root = Path(__file__).expanduser().parents[3]
+    video_write_path = omni_root / f"example_video_{model_class_name}.mp4"
+    height, width = frames.shape[1:3]
+    writer = cv2.VideoWriter(
+        video_write_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {video_write_path}")
+    try:
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
 
 
-def run_autoregressive(engine, model_class_name, observations):
+def normalize_extra_body_params(
+    sampling_params,
+    extra_body: dict,
+    declared_extra_body: dict,
+):
+    if declared_extra_body:
+        apply_declared_extra_args(sampling_params, declared_extra_body, extra_body)
+    elif extra_body:
+        sampling_params.extra_args.update({k: v for k, v in extra_body.items() if v is not None})
+    return sampling_params
+
+
+def run_inference(omni: Omni, model_class_name, observations, extra_body, declared_extra_body) -> list[dict[str, Any]]:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    metadata = extra_body.get("metadata", {})
 
     results = []
     for index, extra_args in enumerate(observations):
         prompt = extra_args.get("prompt", "")
-        sp = OmniDiffusionSamplingParams(extra_args=extra_args)
-        raw = engine.generate(prompt, sampling_params_list=[sp])
+        sp = normalize_extra_body_params(
+            OmniDiffusionSamplingParams(extra_args=extra_args), extra_body, declared_extra_body
+        )
+        raw = omni.generate(prompt, sampling_params_list=[sp])
         if not raw:
-            raise RuntimeError(f"No output for AR step {index}")
-        results.append(process_robot_actions(model_class_name, raw[0]))
+            raise RuntimeError(f"No output for step {index}")
+        results.append(process_robot_actions(model_class_name, raw[0], **metadata))
     return results
-
-
-def run_single_shot(engine, model_class_name, extra_args):
-    from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-    meta = extra_args.pop("_meta", {})
-    req = OmniDiffusionRequest(
-        prompts=[extra_args.get("prompt", "")],
-        sampling_params=OmniDiffusionSamplingParams(extra_args=extra_args),
-        request_id="robot-policy-0",
-    )
-    raw = engine.forward(req)
-    return process_robot_actions(model_class_name, raw, **meta)
 
 
 def main() -> None:
     args = parse_args()
     model_class_name = args.model_class_name
-    if model_class_name is None:
-        raise SystemExit(f"[robot_policy] Cannot auto-detect model class for '{args.model}'. Pass --model-class-name.")
 
     print(f"[robot_policy] model={args.model} class={model_class_name}")
 
@@ -314,10 +312,6 @@ def main() -> None:
         enable_layerwise_offload=args.enable_layerwise_offload,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
-        boundary_ratio=args.boundary_ratio,
-        diffusion_kv_cache_dtype=args.diffusion_kv_cache_dtype,
-        diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
-        diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
@@ -327,34 +321,48 @@ def main() -> None:
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    if args.quantization is not None:
+        omni_kwargs["quantization"] = args.quantization
+    declared_extra_body_params = get_extra_body_params(model_class_name)
+
     omni = Omni(**omni_kwargs)
+    model_class_name = get_model_class_name(omni) or model_class_name
+    print(f"[Robot Policy] Using model_class_name - {model_class_name}")
+
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
+        omni.start_profile()
 
     # NOTE: Reconsider the key parameters (interface def)
     source = {
         "model": args.model,
         "model_dir": args.model_dir,
         "task": args.task,
-        "video_dir": args.video_dir,
-        "dataset_dir": args.dataset_dir,
+        "data_dir": args.data_dir,
         "num_chunks": args.num_chunks,
-        "sample_index": args.sample_index,
         "session_id": args.session_id or str(uuid.uuid4()),
         "seed": args.seed,
         "device": args.device,
         "dtype": args.dtype,
     }
-    if profiler_enabled:
-        print("[Profiler] Starting profiling...")
-        omni.start_profile()
 
-    observations = build_robot_observations(model_class_name, source)
+    # print task specific configuration
+    # TODO: Undone
+    print(f"\n{'=' * 60}")
+    print("Robot policy configuration")
+    print("")
+    print(f"{'=' * 60}\n")
+
+    extra_body = dict(args.extra_body or {})
+    observation, metadata = build_robot_observations(model_class_name, source, **extra_body)
+    if extra_body.get("metadata"):
+        print("[Warning] CLI arguments have already provided metadata, please check if there is any confliction.")
+    extra_body["metadata"] = metadata
 
     # Return type drives the mode: a single dict → single-shot,
     # any other iterable → autoregressive.
-    if isinstance(observations, dict):
-        results = [run_single_shot(omni, model_class_name, observations)]
-    else:
-        results = run_autoregressive(omni, model_class_name, observations)
+    observations = [observation] if isinstance(observation, dict) else observation
+    results = run_inference(omni, model_class_name, observations, extra_body, declared_extra_body_params)
 
     if not results:
         print("[robot_policy] No actions produced.")
@@ -366,6 +374,35 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out, actions=stacked, num_steps=len(results))
     print(f"[robot_policy] saved {stacked.shape} → {out}")
+
+    if args.export_video:
+        if model_class_name not in DECODE_VIDEO_SUPPORTS:
+            print(f"[Warning] {model_class_name} doesn't support video export.")
+        else:
+            video_latents = [r["metadata"].get("video_latents") for r in results]
+            print(f"Decoding {len(video_latents)} steps...")
+            if video_latents[0] is None:
+                print("[Warning] Video latents not found in output. Please check the model output.")
+
+            # NOTE: only example done this way (dreamzero), need more examples to formalize
+            full_latents = torch.cat(video_latents, dim=2)
+            stage_client = omni.engine.stage_clients[0]
+            engine = getattr(stage_client, "_engine", None)
+            if engine is None:
+                raise RuntimeError("DreamZero export requires inline diffusion stage access.")
+
+            decoded = engine.executor.collective_rpc(
+                "decode_video_latents_to_uint8",
+                args=(full_latents,),
+                unique_reply_rank=0,
+                exec_all_ranks=True,
+            )
+
+        if isinstance(decoded, torch.Tensor):
+            frames = decoded.numpy()
+        if not isinstance(frames, np.ndarray):
+            raise TypeError(f"Unexpected decoded output type: {type(decoded)!r}")
+        _write_mp4(model_class_name, frames, fps=5)
 
 
 if __name__ == "__main__":
