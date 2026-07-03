@@ -2222,6 +2222,20 @@ class Cosmos3OmniDiffusersPipeline(
                         sound_latents = unpacked[idx]
                 else:
                     latents = next_latents
+
+                if condition_latents is not None and velocity_mask is not None:
+                    latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+                elif image_latent is not None:
+                    latents[:, :, 0:1, :, :] = image_latent
+                if (
+                    action_latents is not None
+                    and action_condition_latents is not None
+                    and action_velocity_mask is not None
+                ):
+                    action_latents = (
+                        action_velocity_mask * action_latents + (1.0 - action_velocity_mask) * action_condition_latents
+                    )
+
                 # action/sound latents unchanged on non-last ranks
                 outputs = [latents]
                 if action_latents is not None:
@@ -2260,15 +2274,6 @@ class Cosmos3OmniDiffusersPipeline(
                     idx += 1
                 if sound_latents is not None:
                     sound_latents = unpacked[idx]
-
-            # Condition re-injection：only rank 0 have latents updated
-            if not is_pipeline_first_stage():
-                outputs = [latents]
-                if action_latents is not None:
-                    outputs.append(action_latents)
-                if sound_latents is not None:
-                    outputs.append(sound_latents)
-                return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
             if condition_latents is not None and velocity_mask is not None:
                 latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
