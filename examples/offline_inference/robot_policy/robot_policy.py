@@ -320,6 +320,7 @@ def main() -> None:
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
+        deploy_config=args.deploy_config,
     )
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization

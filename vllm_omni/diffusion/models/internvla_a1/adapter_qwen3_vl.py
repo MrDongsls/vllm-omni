@@ -232,7 +232,7 @@ class Qwen3VLModel(HFQwen3VLModel):
 
 class Qwen3VLForConditionalGeneration(HFQwen3VLForConditionalGeneration):
     _checkpoint_conversion_mapping = {}
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
     accepts_loss_kwargs = False
     config: Qwen3VLConfig
 
@@ -241,6 +241,14 @@ class Qwen3VLForConditionalGeneration(HFQwen3VLForConditionalGeneration):
         self.model = Qwen3VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
+
+    @property
+    def language_model(self):
+        return self.model.language_model
+
+    @property
+    def visual(self):
+        return self.model.visual
 
 
 __all__ = [
