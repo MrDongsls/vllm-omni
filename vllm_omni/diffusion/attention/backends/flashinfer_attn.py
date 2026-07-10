@@ -35,9 +35,7 @@ if HAS_FLASHINFER and not hasattr(torch.ops.vllm_omni, "flashinfer_single_prefil
         softmax_scale: float,
         causal: bool,
     ) -> torch.Tensor:
-        kwargs: dict = {"sm_scale": softmax_scale, "causal": causal, "return_lse": False}
-        if custom_mask is not None:
-            kwargs["custom_mask"] = custom_mask
+        kwargs: dict = {"sm_scale": softmax_scale, "causal": causal, "return_lse": False, "custom_mask": custom_mask}
         return single_prefill_with_kv_cache(query, key, value, **kwargs)
 
     # `single_prefill_with_kv_cache` accepts `otype` and `kv_cache_sf` as kwargs; only
@@ -195,7 +193,11 @@ class FlashInferAttentionImpl(AttentionImpl):
 
         outputs = []
         for b in range(batch_size):
-            out = _flashinfer_prefill_op(query[b], key[b], value[b], custom_mask, self.softmax_scale, self.causal)
+            if custom_mask is not None:
+                sample_mask = custom_mask if custom_mask.dim() == 2 else custom_mask[b]
+            else:
+                sample_mask = None
+            out = _flashinfer_prefill_op(query[b], key[b], value[b], sample_mask, self.softmax_scale, self.causal)
             outputs.append(out)
 
         if batch_size == 1:
