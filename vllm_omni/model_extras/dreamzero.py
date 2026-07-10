@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
+from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.outputs import OmniRequestOutput
 
 DREAMZERO_EXTRA_BODY_PARAMS: frozenset[str] = frozenset(
@@ -28,6 +30,27 @@ CAMERA_FILES = {
     "observation/wrist_image_left": "wrist_image_left.mp4",
 }
 DEFAULT_NUM_CHUNKS = 2
+DEFAULT_EXPORT_FPS = 2
+WORKER_EXTENSION_CLS = "vllm_omni.diffusion.models.dreamzero.video_export_worker.DreamZeroVideoExportWorkerExtension"
+
+
+def _write_mp4(video_path: str, frames: np.ndarray, fps: int) -> None:
+    import cv2
+
+    height, width = frames.shape[1:3]
+    writer = cv2.VideoWriter(
+        video_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {video_path}")
+    try:
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
 
 
 def _load_video_frames(video_path: Path) -> np.ndarray:
@@ -78,19 +101,16 @@ def _make_obs(
     return obs
 
 
-def build_observations(source: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def build_observations(model_dir, task, data_dir, **extra_params) -> tuple[dict[str, Any], dict[str, Any]]:
     """Read 3 camera MP4s and yield DreamZero AR extra_args dicts.
 
-    Yields a sequence (→ autoregressive mode). The first item carries
+    Yields a sequence (autoregressive mode). The first item carries
     ``reset=True``; all share one ``session_id``.
     """
-    data_dir = source.get("data_dir")
     if data_dir is None:
         raise ValueError("DreamZero requires source['data_dir'] with 3 camera MP4 files.")
     data_dir = Path(data_dir)
-    task = source.get("task", "")
-    num_chunks = int(source.get("num_chunks", DEFAULT_NUM_CHUNKS))
-    session_id = source.get("session_id")
+    session_id = extra_params.get("session_id") or str(uuid.uuid4())
 
     camera_frames: dict[str, np.ndarray] = {}
     for camera_key, file_name in CAMERA_FILES.items():
@@ -100,13 +120,13 @@ def build_observations(source: dict[str, Any]) -> tuple[dict[str, Any], dict[str
         camera_frames[camera_key] = _load_video_frames(path)
 
     total = min(f.shape[0] for f in camera_frames.values())
-    schedule = [[0]] + _build_frame_schedule(total, num_chunks)
+    schedule = [[0]] + _build_frame_schedule(total, DEFAULT_NUM_CHUNKS)
 
-    extra_args = []
+    observations = []
     for index, frame_indices in enumerate(schedule):
         obs = _make_obs(camera_frames, frame_indices, prompt=task)
         obs["session_id"] = session_id
-        extra_args.append(
+        observations.append(
             {
                 "reset": index == 0,
                 "robot_obs": obs,
@@ -114,7 +134,7 @@ def build_observations(source: dict[str, Any]) -> tuple[dict[str, Any], dict[str
                 "prompt": task,
             }
         )
-    return extra_args, {}
+    return observations, {}
 
 
 def process_robot_actions(
@@ -123,14 +143,8 @@ def process_robot_actions(
 ) -> dict[str, Any]:
     """Extract actions from DreamZero's DiffusionOutput.
 
-    DreamZero returns ``DiffusionOutput(output={"actions": np.ndarray, "video": ...})``.
+    DreamZero returns ``DiffusionOutput(output={"actions": np.ndarray, ...})``.
     This processor extracts the actions array and passes through any extra metadata.
-
-    Args:
-        output: The raw DiffusionOutput from pipeline.forward().
-
-    Returns:
-        A dict with at least ``{"actions": np.ndarray, "metadata": {...}}``.
     """
     action_output = output.multimodal_output.get("actions")
     action_array = np.asarray(action_output)
@@ -150,3 +164,33 @@ def process_robot_actions(
     if latents.shape[1] < latents.shape[2]:
         latents = latents.transpose(1, 2).contiguous()
     return {"actions": action_array, "metadata": {"video_latents": latents}}
+
+
+def finalize(omni: Omni, results: list[dict], output_path) -> None:
+    """Decode accumulated video latents into an mp4. Calling `decode_video_latents_to_uint8`
+    provided by `vllm_omni/diffusion/models/dreamzero/video_export_worker.py`.
+    """
+    video_latents = [r["metadata"].get("video_latents") for r in results]
+    print(f"[Robot Policy - dreamzero] Decoding {len(video_latents)} steps...")
+
+    if video_latents[0] is None:
+        raise RuntimeError("[Robot Policy - dreamzero] Video latents not found in output.")
+
+    full_latents = torch.cat(video_latents, dim=2)
+    stage_client = omni.engine.stage_clients[0]
+    engine = getattr(stage_client, "_engine", None)
+    if engine is None:
+        raise RuntimeError("[Robot Policy - dreamzero] Video export requires inline diffusion stage access.")
+
+    decoded = engine.executor.collective_rpc(
+        "decode_video_latents_to_uint8",
+        args=(full_latents,),
+        unique_reply_rank=0,
+        exec_all_ranks=True,
+    )
+    if isinstance(decoded, torch.Tensor):
+        decoded = decoded.numpy()
+    if not isinstance(decoded, np.ndarray):
+        raise TypeError(f"Unexpected decoded output type: {type(decoded)!r}")
+
+    _write_mp4(output_path.with_suffix(".mp4"), decoded, fps=DEFAULT_EXPORT_FPS)

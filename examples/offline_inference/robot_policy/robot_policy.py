@@ -13,11 +13,11 @@ Examples:
     # DreamZero (autoregressive)
     python robot_policy.py --model GEAR-Dreams/DreamZero-DROID \\
         --deploy-config vllm_omni/deploy/dreamzero_tp1_cfg2.yaml \\
-        --video-dir outputs/dreamzero/assets --task "Move the pan forward"
+        --data-dir outputs/dreamzero/assets --task "Move the pan forward"
 
     # InternVLA-A1 (single_shot)
     python robot_policy.py --model /path/to/internvla_a1 \\
-        --dataset-dir /path/to/a2d --task "pick up the cube"
+        --data-dir /path/to/a2d --task "pick up the cube"
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import functools
 import json
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -38,15 +37,13 @@ from vllm_omni.engine.stage_init_utils import _resolve_model_to_local_path
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.model_extras import (
     build_robot_observations,
+    finalize_robot_run,
     get_extra_body_params,
     get_model_class_name,
+    get_worker_extension_class,
     process_robot_actions,
 )
 from vllm_omni.platforms import current_omni_platform
-
-DECODE_VIDEO_SUPPORTS = [
-    "dreamzero",
-]
 
 
 def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
@@ -74,10 +71,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model-class-name", default=None, help="Override model class name.")
     parser.add_argument("--deploy-config", default=None)
-    parser.add_argument("--data-dir", type=Path, help="Directory containing organized assets needed by examples.")
-    parser.add_argument("--task", default="", help="Task prompt string controls the robot trajectory planning.")
-    parser.add_argument("--num-chunks", type=int, default=2)
-    parser.add_argument("--session-id", default=None)
+    parser.add_argument(
+        "--data-dir", type=Path, required=True, help="Directory containing organized assets needed by examples."
+    )
+    parser.add_argument(
+        "--task",
+        default="",
+        help=(
+            "Task prompt string that controls the robot trajectory planning. "
+            "Warning: this overrides the dataset-provided prompt if set."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
     parser.add_argument("--device", default="cuda")
@@ -211,34 +215,12 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Model-specific generation params as a JSON object. Keys are filtered "
             "against the model's declared extra_body_params (see vllm_omni/model_extras), "
-            "so unknown keys for the chosen model are silently dropped. "
-            'Cosmos3 V2V example: \'{"condition_frame_indexes_vision": [0, 1], '
-            '"condition_video_keep": "first", "flow_shift": 10.0, '
-            '"max_sequence_length": 4096, "guardrails": false}\'.'
+            "unknown keys for the chosen model are silently dropped. "
+            "internvla_a1 example: --extra-body '{\"decode_image\": true}' "
+            'dreamzero example: --extra-body \'{"session_id": "dreamzero_1"}\''
         ),
     )
     return parser.parse_args()
-
-
-def _write_mp4(model_class_name: str, frames: np.ndarray, fps: int) -> None:
-    import cv2
-
-    omni_root = Path(__file__).expanduser().parents[3]
-    video_write_path = omni_root / f"example_video_{model_class_name}.mp4"
-    height, width = frames.shape[1:3]
-    writer = cv2.VideoWriter(
-        video_write_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        float(fps),
-        (width, height),
-    )
-    if not writer.isOpened():
-        raise RuntimeError(f"Failed to open video writer for {video_write_path}")
-    try:
-        for frame in frames:
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-    finally:
-        writer.release()
 
 
 def normalize_extra_body_params(
@@ -263,7 +245,10 @@ def run_inference(
     results = []
     for index, extra_args in enumerate(observations):
         prompt = extra_args.get("prompt", "")
-        sp = OmniDiffusionSamplingParams(extra_args=extra_args)
+        sp = OmniDiffusionSamplingParams(
+            extra_args=extra_args,
+            generator=generator,
+        )
         sp = normalize_extra_body_params(sp, extra_body, declared_extra_body)
         raw = omni.generate(prompt, sampling_params_list=[sp])
         if not raw:
@@ -277,8 +262,6 @@ def main() -> None:
     model_class_name = args.model_class_name
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     model_dir = _resolve_model_to_local_path(args.model)
-
-    print(f"[robot_policy] model={args.model} class={model_class_name}")
 
     # Configure cache based on backend type
     cache_config = None
@@ -313,13 +296,13 @@ def main() -> None:
     )
     omni_kwargs = dict(
         model=args.model,
+        model_class_name=model_class_name,
         enable_layerwise_offload=args.enable_layerwise_offload,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
-        model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
@@ -328,7 +311,7 @@ def main() -> None:
     )
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
-    declared_extra_body_params = get_extra_body_params(model_class_name)
+    omni_kwargs["worker_extension_cls"] = get_worker_extension_class(model_class_name)
 
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni) or model_class_name
@@ -338,29 +321,30 @@ def main() -> None:
         print("[Profiler] Starting profiling...")
         omni.start_profile()
 
-    # NOTE: Reconsider the key parameters (interface def)
-    source = {
-        "model_dir": model_dir,
-        "task": args.task,
-        "data_dir": args.data_dir,
-        "num_chunks": args.num_chunks,
-        "session_id": args.session_id or str(uuid.uuid4()),
-        "device": args.device,
-        "dtype": args.dtype,
-    }
-
-    # print task specific configuration
-    # TODO: Undone
+    # print task configuration
     print(f"\n{'=' * 60}")
     print("Robot policy configuration")
-    print("")
+    print(f"  Model: {args.model}")
+    print(f"  Task prompt: {args.task or '(using dataset-provided prompt)'}")
+    print(f"  Data directory: {args.data_dir}")
     print(f"{'=' * 60}\n")
 
     extra_body = dict(args.extra_body or {})
-    observation, metadata = build_robot_observations(model_class_name, source, **extra_body)
-    if extra_body.get("metadata"):
-        print("[Warning] CLI arguments have already provided metadata, please check if there is any confliction.")
-    extra_body["metadata"] = metadata
+    observation, metadata = build_robot_observations(
+        model_class_name,
+        model_dir=model_dir,
+        task=args.task,
+        data_dir=args.data_dir,
+        **{"seed": args.seed, "device": args.device, "dtype": args.dtype, **extra_body},
+    )
+    conflicts = extra_body.keys() & metadata.keys()
+    if conflicts:
+        print(
+            f"[Warning] --extra-body metadata keys {sorted(conflicts)} conflict with "
+            "builder-provided metadata; builder values take precedence."
+        )
+    extra_body = {**extra_body, **metadata}
+    declared_extra_body_params = get_extra_body_params(model_class_name)
 
     # Return type drives the mode: a single dict → single-shot,
     # any other iterable → autoregressive.
@@ -368,44 +352,35 @@ def main() -> None:
     results = run_inference(omni, generator, model_class_name, observations, extra_body, declared_extra_body_params)
 
     if not results:
-        print("[robot_policy] No actions produced.")
+        print("[Robot Policy] No actions produced.")
         return
 
     actions = [r["actions"] for r in results]
-    stacked = np.stack(actions, axis=0) if len(actions) > 1 else actions[0]
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, actions=stacked, num_steps=len(results))
-    print(f"[robot_policy] saved {stacked.shape} → {out}")
+    stacked = np.stack(actions, axis=0)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(output_path, actions=stacked, num_steps=len(results))
+    print(f"[Robot Policy] saved {stacked.shape} → {output_path}")
 
-    if args.export_video:
-        if model_class_name not in DECODE_VIDEO_SUPPORTS:
-            print(f"[Warning] {model_class_name} doesn't support video export.")
+    # model-specific post-process steps
+    finalize_robot_run(model_class_name, omni, results, output_path)
+
+    if profiler_enabled:
+        print("\n[Profiler] Stopping profiler and collecting results...")
+        profile_results = omni.stop_profile()
+        if profile_results and isinstance(profile_results, dict):
+            traces = profile_results.get("traces", [])
+            print("\n" + "=" * 60)
+            print("PROFILING RESULTS:")
+            for rank, trace in enumerate(traces):
+                print(f"\nRank {rank}:")
+                if trace:
+                    print(f"  • Trace: {trace}")
+            if not traces:
+                print("  No traces collected.")
+            print("=" * 60)
         else:
-            video_latents = [r["metadata"].get("video_latents") for r in results]
-            print(f"Decoding {len(video_latents)} steps...")
-            if video_latents[0] is None:
-                print("[Warning] Video latents not found in output. Please check the model output.")
-
-            # NOTE: only example done this way (dreamzero), need more examples to formalize
-            full_latents = torch.cat(video_latents, dim=2)
-            stage_client = omni.engine.stage_clients[0]
-            engine = getattr(stage_client, "_engine", None)
-            if engine is None:
-                raise RuntimeError("DreamZero export requires inline diffusion stage access.")
-
-            decoded = engine.executor.collective_rpc(
-                "decode_video_latents_to_uint8",
-                args=(full_latents,),
-                unique_reply_rank=0,
-                exec_all_ranks=True,
-            )
-
-        if isinstance(decoded, torch.Tensor):
-            frames = decoded.numpy()
-        if not isinstance(frames, np.ndarray):
-            raise TypeError(f"Unexpected decoded output type: {type(decoded)!r}")
-        _write_mp4(model_class_name, frames, fps=5)
+            print("[Profiler] No valid profiling data returned.")
 
 
 if __name__ == "__main__":

@@ -259,22 +259,21 @@ def collate_open_loop_samples(
     return batch_inputs, metadata
 
 
-def build_observations(source: dict[str, Any], **kwargs) -> dict[str, Any]:
+def build_observations(model_dir, task, data_dir, **kwargs) -> dict[str, Any]:
     """Build one InternVLA-A1 extra_args dict from the A2D dataset.
 
     Returns a single dict (→ single-shot mode). ``_meta`` carries the
     denorm stats the action processor needs and is stripped before the
     request is built.
     """
-    dataset_dir = source.get("dataset_dir")
+    dataset_dir = data_dir
     if dataset_dir is None or not Path(dataset_dir).exists():
         raise ValueError(f"InternVLA-A1 requires source['dataset_dir']. Got: {dataset_dir}.")
 
-    model_dir = Path(source.get("model_dir"))
-    device = source.get("device", "cuda")
-    dtype_name = source.get("dtype", "bfloat16")
-    seed = int(source.get("seed", 42))
-    sample_index = int(source.get("sample_index", DEFAULT_SAMPLE_INDEX))
+    seed = int(kwargs.get("seed", 42))
+    device = kwargs.get("device", "cuda")
+    dtype_name = kwargs.get("dtype", "bfloat16")
+    sample_index = int(kwargs.get("sample_index", DEFAULT_SAMPLE_INDEX))
 
     config = InternVLAA1Config.from_pretrained(model_dir)
     config.device, config.dtype = device, dtype_name
@@ -284,12 +283,13 @@ def build_observations(source: dict[str, Any], **kwargs) -> dict[str, Any]:
 
     dataset = A2DOpenLoopDataset(Path(dataset_dir), config=config, train_stats=train_stats)
     sample = dataset.get_sample(sample_index)
+    sample.task = task or sample.task
 
     dtype = torch.bfloat16 if dtype_name == "bfloat16" else torch.float32
     batch_inputs, meta = collate_open_loop_samples([sample], device=device, dtype=dtype)
     noise = torch.randn(
         (1, config.chunk_size, config.max_action_dim),
-        generator=torch.Generator(device="cpu").manual_seed(seed),
+        generator=torch.Generator(device="cpu").manual_seed(seed + sample_index),
         dtype=torch.float32,
     )
     observations = {"batch_inputs": batch_inputs, "noise": noise}
