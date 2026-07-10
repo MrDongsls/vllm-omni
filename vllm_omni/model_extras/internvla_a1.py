@@ -11,13 +11,14 @@ from typing import Any
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-import torchvision
+from torchcodec.decoders import VideoDecoder
 
 from vllm_omni.diffusion.models.internvla_a1 import (
     InternVLAA1Config,
     InternVLAA1TrainMetadata,
 )
 from vllm_omni.diffusion.models.internvla_a1.config import OBS_IMAGES, OBS_STATE, OBS_TASK
+from vllm_omni.outputs import OmniRequestOutput
 
 INTERNVLA_A1_EXTRA_BODY_PARAMS: frozenset[str] = frozenset(
     {
@@ -63,36 +64,33 @@ def _clamp_index(index: int, start: int, end: int) -> int:
     return max(start, min(end - 1, index))
 
 
-class TorchvisionVideoReaderCache:
-    def __init__(self, backend: str = "pyav") -> None:
-        self.backend = backend
+class TorchcodecVideoReaderCache:
+    def __init__(self, device: str = "cpu") -> None:
+        self.device = device
         self._readers: dict[str, Any] = {}
-        torchvision.set_video_backend(backend)
 
-    def get(self, path: str) -> Any:
+    def get(self, path: str):
         reader = self._readers.get(path)
         if reader is None:
-            reader = torchvision.io.VideoReader(path, "video")
+            reader = VideoDecoder(
+                path,
+                device=self.device,
+                seek_mode="approximate",
+            )
             self._readers[path] = reader
         return reader
 
     def decode_frames(self, path: str, timestamps: list[float], tolerance_s: float = 1e-4) -> torch.Tensor:
         reader = self.get(path)
-        first_ts = min(timestamps)
-        last_ts = max(timestamps)
-        reader.seek(first_ts, keyframes_only=self.backend == "pyav")
 
-        loaded_frames: list[torch.Tensor] = []
-        loaded_ts: list[float] = []
-        for frame in reader:
-            current_ts = float(frame["pts"])
-            loaded_frames.append(frame["data"])
-            loaded_ts.append(current_ts)
-            if current_ts >= last_ts:
-                break
+        frame_batch = reader.get_frames_played_at(seconds=timestamps)
+
+        loaded_frames = list(frame_batch.data)
+        loaded_ts = frame_batch.pts_seconds.tolist()
 
         query_ts = torch.tensor(timestamps, dtype=torch.float32)
         loaded_ts_tensor = torch.tensor(loaded_ts, dtype=torch.float32)
+
         distances = torch.cdist(query_ts[:, None], loaded_ts_tensor[:, None], p=1)
         min_dist, argmin = distances.min(dim=1)
         if not torch.all(min_dist < tolerance_s):
@@ -149,7 +147,7 @@ class A2DOpenLoopDataset:
         self.action_stats = _stack_stats(train_stats, self.action_keys)
         self.image_offsets = image_offsets
         self.tolerance_s = tolerance_s
-        self.video_reader = TorchvisionVideoReaderCache(backend="pyav")
+        self.video_reader = TorchcodecVideoReaderCache(config.device)
 
     @property
     def num_episodes(self) -> int:
@@ -272,7 +270,7 @@ def build_observations(source: dict[str, Any], **kwargs) -> dict[str, Any]:
     if dataset_dir is None or not Path(dataset_dir).exists():
         raise ValueError(f"InternVLA-A1 requires source['dataset_dir']. Got: {dataset_dir}.")
 
-    model_dir = Path(source.get("model_dir") or source.get("model", ""))
+    model_dir = Path(source.get("model_dir"))
     device = source.get("device", "cuda")
     dtype_name = source.get("dtype", "bfloat16")
     seed = int(source.get("seed", 42))
@@ -305,7 +303,7 @@ def build_observations(source: dict[str, Any], **kwargs) -> dict[str, Any]:
 
 
 def process_robot_actions(
-    output: Any,
+    output: OmniRequestOutput,
     *,
     physical_action_dim: int = 16,
     joint_dims: int = 14,

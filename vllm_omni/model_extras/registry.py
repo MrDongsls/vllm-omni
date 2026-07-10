@@ -325,7 +325,7 @@ def build_robot_observations(
 
 def process_robot_actions(
     model_class_name: str | None,
-    output: Any,
+    output,
     **kwargs,
 ) -> dict[str, Any]:
     spec = _get_spec(model_class_name)

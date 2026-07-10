@@ -34,6 +34,7 @@ import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
+from vllm_omni.engine.stage_init_utils import _resolve_model_to_local_path
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.model_extras import (
     build_robot_observations,
@@ -41,6 +42,7 @@ from vllm_omni.model_extras import (
     get_model_class_name,
     process_robot_actions,
 )
+from vllm_omni.platforms import current_omni_platform
 
 DECODE_VIDEO_SUPPORTS = [
     "dreamzero",
@@ -71,7 +73,6 @@ def parse_args() -> argparse.Namespace:
         help="Diffusers Robot policy model ID or local path (Dreamzero, Internvla-a1, ...)",
     )
     parser.add_argument("--model-class-name", default=None, help="Override model class name.")
-    parser.add_argument("--model-dir", default=None)
     parser.add_argument("--deploy-config", default=None)
     parser.add_argument("--data-dir", type=Path, help="Directory containing organized assets needed by examples.")
     parser.add_argument("--task", default="", help="Task prompt string controls the robot trajectory planning.")
@@ -252,7 +253,9 @@ def normalize_extra_body_params(
     return sampling_params
 
 
-def run_inference(omni: Omni, model_class_name, observations, extra_body, declared_extra_body) -> list[dict[str, Any]]:
+def run_inference(
+    omni: Omni, generator: torch.Generator, model_class_name, observations, extra_body, declared_extra_body
+) -> list[dict[str, Any]]:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     metadata = extra_body.get("metadata", {})
@@ -260,9 +263,8 @@ def run_inference(omni: Omni, model_class_name, observations, extra_body, declar
     results = []
     for index, extra_args in enumerate(observations):
         prompt = extra_args.get("prompt", "")
-        sp = normalize_extra_body_params(
-            OmniDiffusionSamplingParams(extra_args=extra_args), extra_body, declared_extra_body
-        )
+        sp = OmniDiffusionSamplingParams(extra_args=extra_args)
+        sp = normalize_extra_body_params(sp, extra_body, declared_extra_body)
         raw = omni.generate(prompt, sampling_params_list=[sp])
         if not raw:
             raise RuntimeError(f"No output for step {index}")
@@ -273,6 +275,8 @@ def run_inference(omni: Omni, model_class_name, observations, extra_body, declar
 def main() -> None:
     args = parse_args()
     model_class_name = args.model_class_name
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    model_dir = _resolve_model_to_local_path(args.model)
 
     print(f"[robot_policy] model={args.model} class={model_class_name}")
 
@@ -336,13 +340,11 @@ def main() -> None:
 
     # NOTE: Reconsider the key parameters (interface def)
     source = {
-        "model": args.model,
-        "model_dir": args.model_dir,
+        "model_dir": model_dir,
         "task": args.task,
         "data_dir": args.data_dir,
         "num_chunks": args.num_chunks,
         "session_id": args.session_id or str(uuid.uuid4()),
-        "seed": args.seed,
         "device": args.device,
         "dtype": args.dtype,
     }
@@ -363,7 +365,7 @@ def main() -> None:
     # Return type drives the mode: a single dict → single-shot,
     # any other iterable → autoregressive.
     observations = [observation] if isinstance(observation, dict) else observation
-    results = run_inference(omni, model_class_name, observations, extra_body, declared_extra_body_params)
+    results = run_inference(omni, generator, model_class_name, observations, extra_body, declared_extra_body_params)
 
     if not results:
         print("[robot_policy] No actions produced.")
