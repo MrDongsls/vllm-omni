@@ -11,7 +11,6 @@ from typing import Any
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-from torchcodec.decoders import VideoDecoder
 
 from vllm_omni.diffusion.models.internvla_a1 import (
     InternVLAA1Config,
@@ -70,6 +69,8 @@ class TorchcodecVideoReaderCache:
         self._readers: dict[str, Any] = {}
 
     def get(self, path: str):
+        from torchcodec.decoders import VideoDecoder
+
         reader = self._readers.get(path)
         if reader is None:
             reader = VideoDecoder(
