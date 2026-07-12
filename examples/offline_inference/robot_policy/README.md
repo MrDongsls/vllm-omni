@@ -14,7 +14,7 @@ This unified example script predicts robot actions from task prompt.
 
 ## Overview
 
-
+`robot_policy.py` loads a robot-policy DiT model, builds observations from a task prompt and a directory of organized assets, and outputs a predicted action sequence saved as a `.npz` file by default. Model-specific behavior is registered per model under `vllm_omni/model_extras/`.
 
 ### Supported Models
 
