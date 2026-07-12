@@ -23,11 +23,15 @@ INTERNVLA_A1_EXTRA_BODY_PARAMS: frozenset[str] = frozenset(
     {
         "batch_inputs",
         "noise",
+        "decode_image",
     }
 )
-INTERNVLA_A1_EXTRA_OUTPUT_PARAMS: frozenset[str] = frozenset()
+INTERNVLA_A1_EXTRA_OUTPUT_PARAMS: frozenset[str] = frozenset(
+    {
+        "decoded",
+    }
+)
 
-CAMERA_KEYS = ("image0", "image1", "image2")
 DEFAULT_SAMPLE_INDEX = 0
 
 

@@ -5,19 +5,16 @@
 
 The script is model-agnostic: it selects an *inference mode* and an
 *observation loader* declared in ``vllm_omni/model_extras/<model>.py``. To add a
-new robot-policy model, register ``observation_loader`` + ``robot_obs_builder``
-+ ``action_output_processor`` — no edits here. Inference mode can be automatically
-detected by checking the Iterable[dict] input type.
+new robot-policy model, register ``robot_obs_builder`` + ``action_output_processor``
++ ``robot_policy_finalizer`` — no edits here. Inference mode can be automatically
+detected by checking input type.
 
 Examples:
-    # DreamZero (autoregressive)
+    # DreamZero
     python robot_policy.py --model GEAR-Dreams/DreamZero-DROID \\
-        --deploy-config vllm_omni/deploy/dreamzero_tp1_cfg2.yaml \\
-        --data-dir outputs/dreamzero/assets --task "Move the pan forward"
-
-    # InternVLA-A1 (single_shot)
-    python robot_policy.py --model /path/to/internvla_a1 \\
-        --data-dir /path/to/a2d --task "pick up the cube"
+        --deploy-config vllm_omni/deploy/dreamzero.yaml \\
+        --data-dir outputs/dreamzero/assets \\
+        --task "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
 """
 
 from __future__ import annotations
@@ -70,10 +67,6 @@ def parse_args() -> argparse.Namespace:
         help="Diffusers Robot policy model ID or local path (Dreamzero, Internvla-a1, ...)",
     )
     parser.add_argument("--model-class-name", default=None, help="Override model class name.")
-    parser.add_argument("--deploy-config", default=None)
-    parser.add_argument(
-        "--data-dir", type=Path, required=True, help="Directory containing organized assets needed by examples."
-    )
     parser.add_argument(
         "--task",
         default="",
@@ -82,10 +75,20 @@ def parse_args() -> argparse.Namespace:
             "Warning: this overrides the dataset-provided prompt if set."
         ),
     )
+    parser.add_argument("--data-dir", required=True, help="Directory containing organized assets needed by examples.")
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="Deploy config YAML",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--output", type=Path, default=Path("robot_policy_output.npz"))
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="robot_policy_output.npz",
+    )
     parser.add_argument(
         "--vae-use-slicing",
         action="store_true",
@@ -110,12 +113,6 @@ def parse_args() -> argparse.Namespace:
         "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
-    )
-    parser.add_argument(
-        "--audio-sample-rate",
-        type=int,
-        default=24000,
-        help="Sample rate for audio output when saved (default: 24000).",
     )
     parser.add_argument(
         "--cache-backend",
@@ -307,7 +304,6 @@ def main() -> None:
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
-        deploy_config=args.deploy_config,
     )
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
