@@ -30,7 +30,7 @@ CAMERA_FILES = {
     "observation/wrist_image_left": "wrist_image_left.mp4",
 }
 DEFAULT_NUM_CHUNKS = 2
-DEFAULT_EXPORT_FPS = 2
+DEFAULT_EXPORT_FPS = 5
 DREAMZERO_WORKER_EXTENSION_CLS = (
     "vllm_omni.diffusion.models.dreamzero.video_export_worker.DreamZeroVideoExportWorkerExtension"
 )

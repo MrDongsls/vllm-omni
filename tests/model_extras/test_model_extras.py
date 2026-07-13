@@ -526,7 +526,7 @@ def test_mammothmoda2_text_to_image_prompt_builder() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_dreamzero_extra_registry_declares_request_and_response_params() -> None:
+def test_dreamzero_registry_declares() -> None:
     assert get_extra_body_params("DreamZeroPipeline") == frozenset(
         {
             "robot_obs",
@@ -535,6 +535,9 @@ def test_dreamzero_extra_registry_declares_request_and_response_params() -> None
         }
     )
     assert get_extra_output_params("DreamZeroPipeline") == frozenset()
+    assert get_worker_extension_class("DreamZeroPipeline") == (
+        "vllm_omni.diffusion.models.dreamzero.video_export_worker.DreamZeroVideoExportWorkerExtension"
+    )
 
 
 @pytest.mark.core_model

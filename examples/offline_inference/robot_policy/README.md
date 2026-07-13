@@ -20,10 +20,10 @@ This unified example script predicts robot actions from task prompt.
 
 | Model | Obs. Resolution | Peak VRAM (GiB) | Model Weights (GiB) | Notes |
 |-------|----------------|-----------------|---------------------|-------|
-| `GEAR-Dreams/DreamZero-DROID` | 180 × 320 |  |  | VLA robot policy; deploy config auto-resolved; AR-Diffusion engine required usage |
+| `GEAR-Dreams/DreamZero-DROID` | 180 × 320 | 71.29 | 64.8 | VLA robot policy; deploy config auto-resolved; AR-Diffusion engine required usage |
 
 !!! info
-    Peak VRAM: based on basic single-card usage, batch size = 1, without any acceleration/optimization features. Some model weights cannot fit into one card with 80 GiB VRAM, which may need to use CPU offloading.
+    Peak VRAM: based on basic single-card usage, batch size = 1, without any acceleration/optimization features. Some model weights may need one card with 80 GiB VRAM or more.
 
 Default model: `GEAR-Dreams/DreamZero-DROID`.
 
@@ -55,6 +55,7 @@ hf download YangshenDeng/vllm-omni-dreamzero-assets --repo-type dataset --local-
 ```bash
 python examples/offline_inference/robot_policy/robot_policy.py \
   --model GEAR-Dreams/DreamZero-DROID \
+  --model-class-name DreamZeroPipeline \
   --deploy-config vllm_omni/deploy/dreamzero.yaml \
   --data-dir outputs/dreamzero/assets \
   --task "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
