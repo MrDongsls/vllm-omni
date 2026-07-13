@@ -33,6 +33,7 @@ from vllm_omni.model_extras.cosmos3 import (
 from vllm_omni.model_extras.dreamzero import (
     DREAMZERO_EXTRA_BODY_PARAMS,
     DREAMZERO_EXTRA_OUTPUT_PARAMS,
+    DREAMZERO_WORKER_EXTENSION_CLS,
 )
 from vllm_omni.model_extras.dreamzero import (
     build_observations as build_dreamzero_observations,
@@ -182,6 +183,7 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "DreamZeroPipeline": {
         "extra_body_params": DREAMZERO_EXTRA_BODY_PARAMS,
         "extra_output_params": DREAMZERO_EXTRA_OUTPUT_PARAMS,
+        "worker_extension_cls": DREAMZERO_WORKER_EXTENSION_CLS,
         "robot_obs_builder": build_dreamzero_observations,
         "action_output_processor": process_dreamzero_robot_actions,
         "robot_policy_finalizer": finalize_dreamzero_robot_run,

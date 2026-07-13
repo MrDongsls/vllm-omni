@@ -31,7 +31,9 @@ CAMERA_FILES = {
 }
 DEFAULT_NUM_CHUNKS = 2
 DEFAULT_EXPORT_FPS = 2
-WORKER_EXTENSION_CLS = "vllm_omni.diffusion.models.dreamzero.video_export_worker.DreamZeroVideoExportWorkerExtension"
+DREAMZERO_WORKER_EXTENSION_CLS = (
+    "vllm_omni.diffusion.models.dreamzero.video_export_worker.DreamZeroVideoExportWorkerExtension"
+)
 
 
 def _write_mp4(video_path: str, frames: np.ndarray, fps: int) -> None:
