@@ -25,7 +25,10 @@ except Exception as e:
 
 
 if HAS_FLASHINFER and not hasattr(torch.ops.vllm_omni, "flashinfer_single_prefill_kv"):
-
+    # `single_prefill_with_kv_cache` accepts `otype` and `kv_cache_sf` as kwargs; only
+    # these two args control the output dtype and dimension. If `otype` or `kv_cache_sf`
+    # needs to be supported in the future, three things must change together: the op
+    # signature, the real implementation body, and the fake implementation.
     @torch.library.custom_op("vllm_omni::flashinfer_single_prefill_kv", mutates_args=())
     def _flashinfer_prefill_op(
         query: torch.Tensor,
@@ -38,9 +41,6 @@ if HAS_FLASHINFER and not hasattr(torch.ops.vllm_omni, "flashinfer_single_prefil
         kwargs: dict = {"sm_scale": softmax_scale, "causal": causal, "return_lse": False, "custom_mask": custom_mask}
         return single_prefill_with_kv_cache(query, key, value, **kwargs)
 
-    # `single_prefill_with_kv_cache` accepts `otype` and `kv_cache_sf` as kwargs; only
-    # these two args control the output dtype and dimension. If `otype` or `kv_cache_sf`
-    # needs to be provided in the future, this fake implementation must be adjusted.
     @_flashinfer_prefill_op.register_fake
     def _(query, key, value, custom_mask, softmax_scale, causal):
         return torch.empty_like(query)

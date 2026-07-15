@@ -62,7 +62,7 @@ def _install_fake_flashinfer(monkeypatch):
 
 @pytest.fixture
 def flashinfer_backend_cls(monkeypatch):
-    """Force-resolve the FlashInfer backend, bypassing platform detection."""
+    """Force-select FlashInfer backend by name, skipping availability checks."""
     _install_fake_flashinfer(monkeypatch)
 
     mod = importlib.import_module(FLASHINFER_MODULE)
@@ -70,17 +70,18 @@ def flashinfer_backend_cls(monkeypatch):
     assert mod.HAS_FLASHINFER, "fake flashinfer was not picked up"
 
     selector = importlib.import_module(SELECTOR_MODULE)
-    monkeypatch.setattr(
-        selector,
-        "_cached_get_backend_cls",
-        lambda backend_name, head_size: mod.FlashInferAttentionBackend,
-    )
+    backend_cls = selector._cached_get_backend_cls("FLASHINFER_ATTN", 64)
+    yield backend_cls
 
-    return mod.FlashInferAttentionBackend
+    # teardown
+    mod.HAS_FLASHINFER = False
+    if hasattr(mod, "single_prefill_with_kv_cache"):
+        del mod.single_prefill_with_kv_cache
+    if hasattr(mod, "_flashinfer_prefill_op"):
+        mod._flashinfer_prefill_op = None
 
 
 @pytest.mark.core_model
-@pytest.mark.cpu
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
 def test_flashinfer_backend_compiles_with_fullgraph(flashinfer_backend_cls):
     """Regression test for #4988: the FlashInfer backend, resolved through
