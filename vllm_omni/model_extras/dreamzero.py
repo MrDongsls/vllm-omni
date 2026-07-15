@@ -114,7 +114,7 @@ def build_observations(model_dir, task, data_dir, **extra_params) -> tuple[dict[
     data_dir = Path(data_dir)
     session_id = extra_params.get("session_id") or str(uuid.uuid4())
     num_chunks = extra_params.get("num_chunks", DEFAULT_NUM_CHUNKS)
-    print(f"[robot_policy - dreamzero] num_chunks: {num_chunks}")
+    repeat_chunk_observations = bool(extra_params.get("repeat_chunk_observations"))
 
     camera_frames: dict[str, np.ndarray] = {}
     for camera_key, file_name in CAMERA_FILES.items():
@@ -125,6 +125,11 @@ def build_observations(model_dir, task, data_dir, **extra_params) -> tuple[dict[
 
     total = min(f.shape[0] for f in camera_frames.values())
     schedule = [[0]] + _build_frame_schedule(total, num_chunks)
+
+    if repeat_chunk_observations and len(schedule) <= num_chunks:
+        # <= num_chunks because schedule already contains the initial frame at index 0
+        while len(schedule) < num_chunks:
+            schedule.append(schedule[-1])
 
     observations = []
     for index, frame_indices in enumerate(schedule):

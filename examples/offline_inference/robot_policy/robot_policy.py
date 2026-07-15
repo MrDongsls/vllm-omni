@@ -309,7 +309,7 @@ def main() -> None:
         omni_kwargs["quantization"] = args.quantization
     omni_kwargs["worker_extension_cls"] = get_worker_extension_class(model_class_name)
     print(f"\n{'=' * 60}")
-    print(f"[Robot policy] model_class_name{model_class_name}")
+    print(f"[Robot policy] model_class_name {model_class_name}")
 
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni) or model_class_name
