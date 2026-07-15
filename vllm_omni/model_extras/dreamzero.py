@@ -29,7 +29,7 @@ CAMERA_FILES = {
     "observation/exterior_image_1_left": "exterior_image_2_left.mp4",
     "observation/wrist_image_left": "wrist_image_left.mp4",
 }
-DEFAULT_NUM_CHUNKS = 2
+DEFAULT_NUM_CHUNKS = 15
 DEFAULT_EXPORT_FPS = 5
 DREAMZERO_WORKER_EXTENSION_CLS = (
     "vllm_omni.diffusion.models.dreamzero.video_export_worker.DreamZeroVideoExportWorkerExtension"
@@ -113,6 +113,8 @@ def build_observations(model_dir, task, data_dir, **extra_params) -> tuple[dict[
         raise ValueError("DreamZero requires source['data_dir'] with 3 camera MP4 files.")
     data_dir = Path(data_dir)
     session_id = extra_params.get("session_id") or str(uuid.uuid4())
+    num_chunks = extra_params.get("num_chunks", DEFAULT_NUM_CHUNKS)
+    print(f"[robot_policy - dreamzero] num_chunks: {num_chunks}")
 
     camera_frames: dict[str, np.ndarray] = {}
     for camera_key, file_name in CAMERA_FILES.items():
@@ -122,7 +124,7 @@ def build_observations(model_dir, task, data_dir, **extra_params) -> tuple[dict[
         camera_frames[camera_key] = _load_video_frames(path)
 
     total = min(f.shape[0] for f in camera_frames.values())
-    schedule = [[0]] + _build_frame_schedule(total, DEFAULT_NUM_CHUNKS)
+    schedule = [[0]] + _build_frame_schedule(total, num_chunks)
 
     observations = []
     for index, frame_indices in enumerate(schedule):

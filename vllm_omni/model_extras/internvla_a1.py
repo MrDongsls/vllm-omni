@@ -154,6 +154,11 @@ class A2DOpenLoopDataset:
         self.tolerance_s = tolerance_s
         self.video_reader = TorchcodecVideoReaderCache(config.device)
 
+        assert self.joint_dim + self.effector_dim == self.physical_action_dim, (
+            f"joint_dim({self.joint_dim}) + effector_dim({self.effector_dim}) "
+            f"!= physical_action_dim({self.physical_action_dim})"
+        )
+
     @property
     def num_episodes(self) -> int:
         return len(self.episode_rows)
@@ -161,6 +166,14 @@ class A2DOpenLoopDataset:
     @property
     def physical_action_dim(self) -> int:
         return 16
+
+    @property
+    def joint_dim(self) -> int:
+        return 14
+
+    @property
+    def effector_dim(self) -> int:
+        return 2
 
     def episode_start_indices(self, max_episodes: int | None = None) -> list[tuple[int, list[int]]]:
         rows = self.episode_rows if max_episodes is None else self.episode_rows[:max_episodes]
@@ -212,7 +225,7 @@ class A2DOpenLoopDataset:
         action_rows = self._query_rows(idx, list(range(self.config.chunk_size)))
         camera_images = [self._decode_camera_history(episode, camera_key, image_rows) for camera_key in self.image_keys]
         state_raw = self._state_vector(row)
-        state_norm = _normalize_vector(state_raw, self.state_stats)
+        state_norm = _normalize_vector(state_raw, self.state_stats["mean"], self.state_stats["std"])
         action_raw = torch.stack([self._action_vector(action_row) for action_row in action_rows], dim=0)
         task = self._task_text(int(row["task_index"]))
         inputs = {
@@ -300,9 +313,11 @@ def build_observations(model_dir, task, data_dir, **kwargs) -> dict[str, Any]:
     observations = {"batch_inputs": batch_inputs, "noise": noise}
     metadata = {
         "physical_action_dim": dataset.physical_action_dim,
-        "action_stats": dataset.action_stats,
-        "action_mode": train_meta.action_mode,
+        "joint_dim": dataset.joint_dim,
+        "unnormalize_mean": dataset.action_stats["mean"],
+        "unnormalize_std": dataset.action_stats["std"],
         "state_raw": meta["state_raw"],
+        "action_mode": train_meta.action_mode,
     }
     return observations, metadata
 
@@ -311,10 +326,10 @@ def process_robot_actions(
     output: OmniRequestOutput,
     *,
     physical_action_dim: int = 16,
-    joint_dims: int = 14,
+    joint_dim: int = 14,
     unnormalize_mean: np.ndarray | None = None,
     unnormalize_std: np.ndarray | None = None,
-    raw_state: np.ndarray | None = None,
+    state_raw: np.ndarray | None = None,
     action_mode: str | None = None,
 ) -> dict[str, Any]:
     """Extract actions from InternVLA-A1 pipeline output.
@@ -327,12 +342,12 @@ def process_robot_actions(
     Args:
         output: The raw ``DiffusionOutput`` from ``pipeline.forward()``.
         physical_action_dim: Number of action dimensions to keep (default 16).
-        joint_dims: Number of joint dimensions within the action (default 14).
+        joint_dim: Number of joint dimensions within the action (default 14).
         unnormalize_mean: Per-dimension mean for action unnormalization.
             Shape ``(physical_action_dim,)``.
         unnormalize_std: Per-dimension std for action unnormalization.
             Shape ``(physical_action_dim,)``.
-        raw_state: Raw (unnormalized) state for delta-mode correction.
+        state_raw: Raw (unnormalized) state for delta-mode correction.
             Shape ``(max_state_dim,)``. Required when ``action_mode="delta"``.
         action_mode: ``"delta"`` to apply delta correction, ``None`` otherwise.
 
@@ -351,10 +366,10 @@ def process_robot_actions(
         std_t = torch.tensor(unnormalize_std, dtype=torch.float32)
         actions = _unnormalize_vector(actions, mean_t, std_t)
 
-    if action_mode == "delta" and raw_state is not None:
-        raw = np.asarray(raw_state, dtype=np.float32).flatten()[:joint_dims]
-        raw_t = torch.from_numpy(raw).unsqueeze(0).unsqueeze(0)  # (1, 1, joint_dims)
-        actions[:, :, :joint_dims] += raw_t
+    if action_mode == "delta" and state_raw is not None:
+        raw = np.asarray(state_raw, dtype=np.float32).flatten()[:joint_dim]
+        raw_t = torch.from_numpy(raw).unsqueeze(0).unsqueeze(0)  # (1, 1, joint_dim)
+        actions[:, :, :joint_dim] += raw_t
 
     actions_np = actions.squeeze(0).cpu().numpy()  # (50, physical_action_dim)
     return {"actions": actions_np, "metadata": {}}

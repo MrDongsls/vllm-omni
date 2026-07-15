@@ -59,7 +59,7 @@ python examples/offline_inference/robot_policy/robot_policy.py \
   --deploy-config vllm_omni/deploy/dreamzero.yaml \
   --data-dir outputs/dreamzero/assets \
   --task "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
-  --extra-body '{"session_id": "dreamzero_example"}'
+  --extra-body '{"session_id": "dreamzero_example", "num_chunks": 15}'
 ```
 
 **NOTE:**

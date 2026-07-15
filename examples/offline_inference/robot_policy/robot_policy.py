@@ -336,13 +336,13 @@ def main() -> None:
         data_dir=args.data_dir,
         **{"seed": args.seed, "device": args.device, "dtype": args.dtype, **extra_body},
     )
-    conflicts = extra_body.keys() & metadata.keys()
-    if conflicts:
+
+    if extra_body.get("metadata", {}):
         print(
-            f"[Warning] --extra-body metadata keys {sorted(conflicts)} conflict with "
+            "[Warning] --extra-body key 'metadata' conflicts with "
             "builder-provided metadata; builder values take precedence."
         )
-    extra_body = {**extra_body, **metadata}
+    extra_body["metadata"] = metadata
     declared_extra_body_params = get_extra_body_params(model_class_name)
 
     # Return type drives the mode: a single dict → single-shot,
