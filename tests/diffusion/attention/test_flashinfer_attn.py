@@ -5,7 +5,8 @@ import types
 
 import pytest
 import torch
-from vllm.platforms import current_platform
+
+from tests.helpers.mark import hardware_test
 
 SELECTOR_MODULE = "vllm_omni.diffusion.attention.selector"
 FLASHINFER_MODULE = "vllm_omni.diffusion.attention.backends.flashinfer_attn"
@@ -82,7 +83,7 @@ def flashinfer_backend_cls(monkeypatch):
 
 
 @pytest.mark.core_model
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_flashinfer_backend_compiles_with_fullgraph(flashinfer_backend_cls):
     """Regression test for #4988: the FlashInfer backend, resolved through
     the selector, must compile under fullgraph=True. The real JIT loader is
