@@ -188,6 +188,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "action_output_processor": process_dreamzero_robot_actions,
         "robot_policy_finalizer": finalize_dreamzero_robot_run,
     },
+    "Cosmos3OmniPipeline": {
+        "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
+        "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
+        "text_to_image_prompt_builder": build_cosmos3_text_to_image_prompt,
+    },
     "MagiHumanPipeline": {
         "extra_body_params": MAGI_HUMAN_EXTRA_BODY_PARAMS,
         "extra_output_params": MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
