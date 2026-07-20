@@ -24,28 +24,28 @@ class TestLoadCallable:
         with pytest.raises(ValueError):
             load_callable("", context=_CTX)
 
-    def test_missing_module_raises_import_error(self):
-        with pytest.raises(ImportError, match="nonexistent_module_xyz_abc"):
+    def test_missing_module_raises_value_error(self):
+        with pytest.raises(ValueError, match="nonexistent_module_xyz_abc"):
             load_callable("nonexistent_module_xyz_abc.some_func", context=_CTX)
 
-    def test_missing_attr_raises_attribute_error(self):
-        with pytest.raises(AttributeError, match="nonexistent_func_xyz_abc"):
+    def test_missing_attr_raises_value_error(self):
+        with pytest.raises(ValueError, match="nonexistent_func_xyz_abc"):
             load_callable("math.nonexistent_func_xyz_abc", context=_CTX)
 
-    def test_not_callable_raises_type_error(self):
-        with pytest.raises(TypeError, match="float"):
+    def test_not_callable_raises_value_error(self):
+        with pytest.raises(ValueError, match="float"):
             load_callable("math.pi", context=_CTX)
 
     @pytest.mark.parametrize(
-        "bad_path,exc_type",
+        "bad_path",
         [
-            ("nodot", ValueError),
-            ("nonexistent_module_xyz_abc.func", ImportError),
-            ("math.nonexistent_func_xyz_abc", AttributeError),
-            ("math.pi", TypeError),
+            "nodot",
+            "nonexistent_module_xyz_abc.func",
+            "math.nonexistent_func_xyz_abc",
+            "math.pi",
         ],
     )
-    def test_context_appears_in_every_error_message(self, bad_path, exc_type):
+    def test_context_appears_in_every_error_message(self, bad_path):
         ctx = "stage 1 custom_process_input_func"
-        with pytest.raises(exc_type, match="stage 1"):
+        with pytest.raises(ValueError, match="stage 1"):
             load_callable(bad_path, context=ctx)

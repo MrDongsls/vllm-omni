@@ -379,7 +379,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     if _cpif_path:
         custom_process_input_func = load_callable(
             _cpif_path,
-            context=f"stage {stage_id} custom_process_input_func",
+            context=f"extract_stage_metadata stage {stage_id} custom_process_input_func",
         )
 
     prompt_expand_func: Callable | None = None
@@ -387,7 +387,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     if _pef_path:
         prompt_expand_func = load_callable(
             _pef_path,
-            context=f"stage {stage_id} prompt_expand_func",
+            context=f"extract_stage_metadata stage {stage_id} prompt_expand_func",
         )
 
     cfg_kv_collect_func: Callable | None = None
@@ -395,7 +395,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     if _ckf_path:
         cfg_kv_collect_func = load_callable(
             _ckf_path,
-            content=f"stage {stage_id} cfg_kv_collect_func",
+            content=f"extract_stage_metadata stage {stage_id} cfg_kv_collect_func",
         )
 
     model_stage = getattr(engine_args, "model_stage", None)

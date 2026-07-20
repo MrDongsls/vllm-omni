@@ -23,11 +23,8 @@ def load_callable(path: str, *, context: str) -> Callable:
         raise ValueError(f"[{context}] Invalid dotted path {path!r}: expected 'package.module.callable_name'")
     try:
         obj = resolve_obj_by_qualname(path)
-    except ImportError as e:
-        raise ImportError(f"[{context}] Cannot import module from path {path!r}: {e}") from e
-    except AttributeError as e:
-        raise AttributeError(f"[{context}] Attribute not found in path {path!r}: {e}") from e
-
+    except (ImportError, AttributeError, ValueError) as e:
+        raise ValueError(f"[{context}] Failed to load {path!r}: {e}") from e
     if not callable(obj):
-        raise TypeError(f"[{context}] {path!r} resolved to {type(obj).__name__}, expected a callable")
+        raise ValueError(f"[{context}] {path!r} resolved to {type(obj).__name__}, expected a callable")
     return obj
