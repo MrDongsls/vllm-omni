@@ -9,7 +9,6 @@ out of StageEngineCoreClient into reusable functions.
 from __future__ import annotations
 
 import fcntl
-import importlib
 import multiprocessing as mp
 import os
 import time
@@ -34,6 +33,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
+from vllm_omni.utils.dynamic_import import load_callable
 
 logger = init_logger(__name__)
 
@@ -377,20 +377,26 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     custom_process_input_func: Callable | None = None
     _cpif_path = getattr(stage_config, "custom_process_input_func", None)
     if _cpif_path:
-        mod_path, fn_name = _cpif_path.rsplit(".", 1)
-        custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
+        custom_process_input_func = load_callable(
+            _cpif_path,
+            context=f"stage {stage_id} custom_process_input_func",
+        )
 
     prompt_expand_func: Callable | None = None
     _pef_path = getattr(stage_config, "prompt_expand_func", None)
     if _pef_path:
-        _mod, _fn = _pef_path.rsplit(".", 1)
-        prompt_expand_func = getattr(importlib.import_module(_mod), _fn)
+        prompt_expand_func = load_callable(
+            _pef_path,
+            context=f"stage {stage_id} prompt_expand_func",
+        )
 
     cfg_kv_collect_func: Callable | None = None
     _ckf_path = getattr(stage_config, "cfg_kv_collect_func", None)
     if _ckf_path:
-        _mod, _fn = _ckf_path.rsplit(".", 1)
-        cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
+        cfg_kv_collect_func = load_callable(
+            _ckf_path,
+            content=f"stage {stage_id} cfg_kv_collect_func",
+        )
 
     model_stage = getattr(engine_args, "model_stage", None)
 
