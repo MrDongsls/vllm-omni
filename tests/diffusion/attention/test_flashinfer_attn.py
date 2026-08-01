@@ -7,20 +7,10 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.process import create_new_process_for_each_test
 
 SELECTOR_MODULE = "vllm_omni.diffusion.attention.selector"
 FLASHINFER_MODULE = "vllm_omni.diffusion.attention.backends.flashinfer_attn"
-FLASHINFER_CLS_PATH = f"{FLASHINFER_MODULE}.FlashInferAttentionBackend"
-
-
-@pytest.fixture(autouse=True)
-def _clear_selector_cache():
-    """Reset the global functools.cache on _cached_get_backend_cls so tests
-    don't leak resolved backends across (backend_name, head_size) keys."""
-    selector = importlib.import_module(SELECTOR_MODULE)
-    selector._cached_get_backend_cls.cache_clear()
-    yield
-    selector._cached_get_backend_cls.cache_clear()
 
 
 def _install_fake_flashinfer(monkeypatch):
@@ -61,8 +51,7 @@ def _install_fake_flashinfer(monkeypatch):
     return _fake_single_prefill_with_kv_cache
 
 
-@pytest.fixture
-def flashinfer_backend_cls(monkeypatch):
+def _get_flashinfer_backend_cls(monkeypatch):
     """Force-select FlashInfer backend by name, skipping availability checks."""
     _install_fake_flashinfer(monkeypatch)
 
@@ -71,33 +60,31 @@ def flashinfer_backend_cls(monkeypatch):
     assert mod.HAS_FLASHINFER, "fake flashinfer was not picked up"
 
     selector = importlib.import_module(SELECTOR_MODULE)
+    selector._cached_get_backend_cls.cache_clear()
     backend_cls = selector._cached_get_backend_cls("FLASHINFER_ATTN", 64)
-    yield backend_cls
-
-    # teardown
-    mod.HAS_FLASHINFER = False
-    if hasattr(mod, "single_prefill_with_kv_cache"):
-        del mod.single_prefill_with_kv_cache
-    if hasattr(mod, "_flashinfer_prefill_op"):
-        mod._flashinfer_prefill_op = None
+    return backend_cls
 
 
+@create_new_process_for_each_test(method="spawn")
 @pytest.mark.core_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_flashinfer_backend_compiles_with_fullgraph(flashinfer_backend_cls):
+def test_flashinfer_backend_compiles_with_fullgraph():
     """Regression test for #4988: the FlashInfer backend, resolved through
     the selector, must compile under fullgraph=True. The real JIT loader is
     wrapped in torch.library.custom_op, so Dynamo treats it as opaque and
     never inlines into the builtin open() call."""
-    impl_cls = flashinfer_backend_cls.get_impl_cls()
-    impl = impl_cls(num_heads=8, head_size=64, softmax_scale=1.0, causal=False)
+    with pytest.MonkeyPatch.context() as mp:
+        backend_cls = _get_flashinfer_backend_cls(mp)
 
-    batch, seq, heads, head_dim = 1, 16, 8, 64
-    query = torch.randn(batch, seq, heads, head_dim, device="cuda", dtype=torch.float16)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
+        impl_cls = backend_cls.get_impl_cls()
+        impl = impl_cls(num_heads=8, head_size=64, softmax_scale=1.0, causal=False)
 
-    compiled = torch.compile(lambda q, k, v: impl.forward_cuda(q, k, v, attn_metadata=None), fullgraph=True)
-    out = compiled(query, key, value)
+        batch, seq, heads, head_dim = 1, 16, 8, 64
+        query = torch.randn(batch, seq, heads, head_dim, device="cuda", dtype=torch.float16)
+        key = torch.randn_like(query)
+        value = torch.randn_like(query)
 
-    assert out.shape == query.shape
+        compiled = torch.compile(lambda q, k, v: impl.forward_cuda(q, k, v, attn_metadata=None), fullgraph=True)
+        out = compiled(query, key, value)
+
+        assert out.shape == query.shape
