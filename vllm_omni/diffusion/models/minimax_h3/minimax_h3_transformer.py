@@ -369,6 +369,41 @@ class MiniMaxH3Attention(nn.Module):
             prefix=prefix,
         )
 
+        # Freeze packed-attention capabilities for this module instance.
+        backend = self.attention.attn_backend
+
+        self._packed_use_ring = bool(getattr(self.attention, "use_ring", False))
+        self._packed_supports_prefix_kv_slicing = bool(backend.supports_prefix_kv_slicing)
+        self._packed_supports_mask_free = bool(backend.supports_packed_mask_free())
+
+        self._packed_requires_mask = not (
+            not self._packed_use_ring and (self._packed_supports_prefix_kv_slicing or self._packed_supports_mask_free)
+        )
+        self.validate_packed_attention_plan()
+
+    @property
+    def requires_packed_mask(self) -> bool:
+        return self._packed_requires_mask
+
+    def validate_packed_attention_plan(self) -> None:
+        """Run this validation only:
+
+        1. After initialization
+        2. Before warmup
+        3. Before CUDA graph capture"""
+        backend = self.attention.attn_backend
+
+        current_use_ring = bool(getattr(self.attention, "use_ring", False))
+        current_prefix = bool(backend.supports_prefix_kv_slicing)
+        current_mask_free = bool(backend.supports_packed_mask_free())
+        current_requires_mask = not (not current_use_ring and (current_prefix or current_mask_free))
+        if current_requires_mask != self._packed_requires_mask:
+            raise RuntimeError(
+                "Packed attention backend policy changed after initialization:"
+                f"initial_requires_mask={self._packed_requires_mask}, "
+                f"current_requires_mask={current_requires_mask}."
+            )
+
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Rotate the first rot_dim head dims; pass the rest through.
 
@@ -416,11 +451,7 @@ class MiniMaxH3Attention(nn.Module):
         # supports_packed_mask_free: backend consumes the packed metadata
         # without ever reading attn_mask (CUDA packed varlen, NPU
         # npu_attn_varlen opt-in with its own fallback rebuild).
-        no_mask = not getattr(self.attention, "use_ring", False) and (
-            self.attention.attn_backend.supports_prefix_kv_slicing
-            or self.attention.attn_backend.supports_packed_mask_free()
-        )
-        if used < packed_total and not no_mask:
+        if used < packed_total and self._packed_requires_mask:
             attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
@@ -434,7 +465,7 @@ class MiniMaxH3Attention(nn.Module):
                 # quadratic full_qk mask is never materialized. Ring attention
                 # is excluded: it keeps the aligned padding rows for its
                 # fixed-size P2P buffers and still needs the mask.
-                "npu_attn_varlen": not getattr(self.attention, "use_ring", False),
+                "npu_attn_varlen": not self._packed_use_ring,
                 # fp16-range protection for the ascend_laser_attention kernel
                 # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
                 # backend/path.
