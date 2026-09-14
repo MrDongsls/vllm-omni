@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Streaming Helium temporal transformer for PersonaPlex (moshi-free, plain torch).
 
 Frame-clocked duplex needs a stateful per-frame forward: one 80 ms step consumes
@@ -80,7 +80,7 @@ class _RingKV:
     def __init__(self, batch_size: int, num_heads: int, dim_per_head: int, capacity: int, device, dtype):
         self.capacity = capacity
         self.cache = torch.zeros((2, batch_size, num_heads, capacity, dim_per_head), device=device, dtype=dtype)
-        self.end_offset = torch.zeros(1, device=device, dtype=torch.long)
+        self.end_offset = torch.zeros(batch_size, device=device, dtype=torch.long)
         self.start_offset = torch.zeros(batch_size, device=device, dtype=torch.long)
 
     def reset(self) -> None:
@@ -90,23 +90,27 @@ class _RingKV:
     def reset_slot(self, b: int) -> None:
         # Mask everything written so far for row b; the row's next write is its
         # first visible entry. (LM sacrifice-tick +1 is applied by the caller.)
-        self.start_offset[b] = self.end_offset.clone()
+        self.start_offset[b] = self.end_offset[b]
 
     def bump_slot_start(self, b: int) -> None:
         self.start_offset[b] += 1
 
     def complete(self, k: torch.Tensor, v: torch.Tensor):
         B, H, T, D = k.shape
-        indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype) + self.end_offset
-        indexes = indexes % self.capacity
-        self.cache[0].index_copy_(2, indexes, k)
-        self.cache[1].index_copy_(2, indexes, v)
+        indexes = (
+            torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype).view(1, -1)
+            + self.end_offset.view(-1, 1)
+        ) % self.capacity
+        idx4 = indexes.view(B, 1, T, 1).expand(-1, H, -1, D)
+        self.cache[0].scatter_(2, idx4, k)
+        self.cache[1].scatter_(2, idx4, v)
         self.end_offset.add_(T)
 
         idx = torch.arange(self.capacity, device=self.end_offset.device, dtype=torch.long)
-        invalid = idx >= self.end_offset
-        end_index = self.end_offset % self.capacity
-        delta = idx - end_index
+        end_offset = self.end_offset.view(-1, 1)
+        invalid = idx.view(1, -1) >= end_offset
+        end_index = end_offset % self.capacity
+        delta = idx.view(1, -1) - end_index
         # `delta <= 0` (not `< 0`) is moshi's exact convention (transformer.py
         # RingKVCache.complete). It labels the just-past-newest slot as the future
         # write position, so once the ring has wrapped the single oldest in-window
@@ -114,9 +118,8 @@ class _RingKV:
         # verbatim from the reference and only shows after the window fills (Helium
         # ~3000 frames / 240 s); it costs one frame out of thousands. Do NOT change
         # this to `< 0`: it would diverge from moshi and break greedy bit-parity.
-        positions = torch.where(delta <= 0, self.end_offset + delta, self.end_offset + delta - self.capacity)
+        positions = torch.where(delta <= 0, end_offset + delta, end_offset + delta - self.capacity)
         positions = torch.where(invalid, torch.full_like(positions, -1), positions)
-        positions = positions.view(1, -1)  # [1, capacity]
         below = positions < self.start_offset.view(-1, 1)  # [B, capacity]
         positions = torch.where(below, torch.full_like(positions, -1), positions)
         return self.cache[0], self.cache[1], positions
