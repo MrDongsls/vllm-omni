@@ -192,7 +192,7 @@ class _MimiTransformerLayer(nn.Module):
         q, k = _apply_rope(q, k, offset)
         keys, values, pos_k = kv.complete(k, v)
         pos_k = pos_k.view(pos_k.shape[0], 1, pos_k.shape[1])
-        pos_q = offset + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
+        pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
         delta = pos_q - pos_k
         attn_bias = (pos_k >= 0) & (delta >= 0) & (delta < context)
         attn = F.scaled_dot_product_attention(q, keys, values, attn_bias.unsqueeze(1), dropout_p=0.0)
@@ -218,7 +218,7 @@ class _MimiStreamingTransformer(nn.Module):
         heads = self.layers[0].num_heads
         hd = self.layers[0].head_dim
         self._kv = [_RingKV(batch_size, heads, hd, self.context, p.device, p.dtype) for _ in self.layers]
-        self._offset = torch.zeros(1, device=p.device, dtype=torch.long)
+        self._offset = torch.zeros(batch_size, device=p.device, dtype=torch.long)
 
     def reset_streaming(self) -> None:
         for kv in self._kv:

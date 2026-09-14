@@ -49,8 +49,8 @@ def _apply_rope(q: torch.Tensor, k: torch.Tensor, offset: torch.Tensor, max_peri
     B, H, T, D = q.shape
     ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
     freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
-    ts = offset.float() + torch.arange(T, device=q.device, dtype=torch.float32)
-    ts = ts.view(1, -1, 1)
+    ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
+    ts = ts.view(-1, 1, T, 1)
 
     dims = q.shape[:-1]
     q = q.view(*dims, D // 2, 2)
@@ -95,16 +95,27 @@ class _RingKV:
     def bump_slot_start(self, b: int) -> None:
         self.start_offset[b] += 1
 
-    def complete(self, k: torch.Tensor, v: torch.Tensor):
+    def complete(self, k: torch.Tensor, v: torch.Tensor, active: torch.Tensor | None = None):
         B, H, T, D = k.shape
         indexes = (
             torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype).view(1, -1)
             + self.end_offset.view(-1, 1)
         ) % self.capacity
         idx4 = indexes.view(B, 1, T, 1).expand(-1, H, -1, D)
+        if active is not None:
+            # gather the old KV values for all rows
+            # Only write the new KV values for the active rows
+            old_k = self.cache[0].gather(2, idx4)
+            old_v = self.cache[1].gather(2, idx4)
+            act = active.view(B, 1, 1, 1)
+            k = torch.where(act, k, old_k)
+            v = torch.where(act, v, old_v)
+        else:
+            active = torch.ones(B, device=self.end_offset.device)
+
         self.cache[0].scatter_(2, idx4, k)
         self.cache[1].scatter_(2, idx4, v)
-        self.end_offset.add_(T)
+        self.end_offset.add_(T * active.to(self.end_offset.dtype))
 
         idx = torch.arange(self.capacity, device=self.end_offset.device, dtype=torch.long)
         end_offset = self.end_offset.view(-1, 1)
@@ -152,7 +163,7 @@ class _TemporalLayer(nn.Module):
 
         keys, values, pos_k = kv.complete(k, v)
         pos_k = pos_k.view(pos_k.shape[0], 1, pos_k.shape[1])  # [B, 1, cap]
-        pos_q = offset + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
+        pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
         delta = pos_q - pos_k
         attn_bias = (pos_k >= 0) & (delta >= 0) & (delta < context)
         attn_bias = attn_bias.unsqueeze(1)  # [B, 1, T, cap]
@@ -202,7 +213,7 @@ class PersonaPlexTemporalStreaming(nn.Module):
         head_dim = self.layers[0].head_dim
         # Capacity = context window (the mask truncates at `context` anyway).
         self._kv = [_RingKV(batch_size, heads, head_dim, self.context, p.device, p.dtype) for _ in self.layers]
-        self._offset = torch.zeros(1, device=p.device, dtype=torch.long)
+        self._offset = torch.zeros(batch_size, device=p.device, dtype=torch.long)
 
     def reset_streaming(self) -> None:
         assert self._kv is not None, "call streaming_init first"
