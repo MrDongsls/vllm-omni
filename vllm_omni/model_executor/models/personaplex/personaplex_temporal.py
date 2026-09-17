@@ -102,8 +102,15 @@ class _RingKV:
             + self.end_offset.view(-1, 1)
         ) % self.capacity
         idx4 = indexes.view(B, 1, T, 1).expand(-1, H, -1, D)
-        # Inactive rows rewrite uncommitted slots; their next active tick writes
-        # the same slots before advancing the visible end offset.
+        # Keep inactive rows completely inert. Once the ring is full, the
+        # physical future-write slot is also addressable by the position mask;
+        # writing it for an inactive row would therefore leak padded data into
+        # its next attention step.
+        active_view = active.view(B, 1, 1, 1)
+        old_k = self.cache[0].gather(2, idx4)
+        old_v = self.cache[1].gather(2, idx4)
+        k = torch.where(active_view, k, old_k)
+        v = torch.where(active_view, v, old_v)
         self.cache[0].scatter_(2, idx4, k)
         self.cache[1].scatter_(2, idx4, v)
         self.end_offset.add_(T * active.to(self.end_offset.dtype))
@@ -125,6 +132,12 @@ class _RingKV:
         below = positions < self.start_offset.view(-1, 1)  # [B, capacity]
         positions = torch.where(below, torch.full_like(positions, -1), positions)
         return self.cache[0], self.cache[1], positions
+
+
+def _normalize_temporal_active(active: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    if active.shape != reference.shape:
+        raise ValueError(f"active must have shape {tuple(reference.shape)}, got {tuple(active.shape)}")
+    return active.to(device=reference.device, dtype=torch.bool)
 
 
 class _TemporalLayer(nn.Module):
@@ -239,6 +252,7 @@ class PersonaPlexTemporalStreaming(nn.Module):
         active: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._kv is not None, "call streaming_init first"
+        active = _normalize_temporal_active(active, self._offset)
         x = frame_embedding
         for layer, kv in zip(self.layers, self._kv):
             x = layer(x, kv, self._offset, self.context, active)
