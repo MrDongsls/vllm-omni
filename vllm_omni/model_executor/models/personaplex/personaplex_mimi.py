@@ -43,13 +43,17 @@ FRAME_SIZE = 1920
 CODEBOOKS = 8
 
 
-def _active_rows(active: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor:
-    """Return a bool ``[B]`` mask, defaulting to an all-active streaming tick."""
+def _normalize_active(active: torch.Tensor | None, all_active: torch.Tensor) -> torch.Tensor:
+    # Stage 0 and Code2Wav currently use one B=1 codec per session and omit
+    # `active`, so preserve that API by treating None as all rows active. When
+    # they switch to shared B>1 codecs, their batch builders must pass bool[B]:
+    # True advances that row's streaming state; False keeps an absent or padded
+    # row's offsets and convolution carries unchanged.
     if active is None:
-        return torch.ones(batch_size, dtype=torch.bool, device=device)
-    if active.shape != (batch_size,):
-        raise ValueError(f"active must have shape ({batch_size},), got {tuple(active.shape)}")
-    return active.to(device=device, dtype=torch.bool)
+        return all_active
+    if active.shape != all_active.shape:
+        raise ValueError(f"active must have shape {tuple(all_active.shape)}, got {tuple(active.shape)}")
+    return active.to(device=all_active.device, dtype=torch.bool)
 
 
 def _map_moshi_codec_weights(
@@ -122,8 +126,7 @@ class _StreamConv1d:
         self.prev[b].zero_()
         self._fresh[b] = True
 
-    def __call__(self, x: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
-        active = _active_rows(active, x.shape[0], x.device)
+    def __call__(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         if self.pad_mode == "replicate":
             pad = self.prev.shape[-1]
             edge = x[..., 0:1].expand(-1, -1, pad)
@@ -160,8 +163,7 @@ class _StreamConvTr1d:
         self.partial[b].zero_()
         self._fresh[b] = True
 
-    def __call__(self, x: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
-        active = _active_rows(active, x.shape[0], x.device)
+    def __call__(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         out = self.conv(x)
         length = out.shape[-1]
         tail = self.kernel - self.stride
@@ -250,9 +252,8 @@ class _MimiStreamingTransformer(nn.Module):
         for kv in self._kv:
             kv.reset_slot(b)
 
-    def step(self, x: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
+    def step(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         """``x`` is ``[B, T, dim]`` (T = positions this frame, typically 2)."""
-        active = _active_rows(active, x.shape[0], x.device)
         for layer, kv in zip(self.layers, self._kv):
             x = layer(x, kv, self._offset, self.context, active)
         self._offset.add_(x.shape[1] * active.to(self._offset.dtype))
@@ -361,6 +362,7 @@ class PersonaPlexMimiCodec(nn.Module):
         self._upsample = _StreamConvTr1d(m.upsample.conv)
         self._dec_stages = _walk_seanet(m.decoder.layers)
         self._batch_size: int | None = None
+        self._all_active: torch.Tensor
 
     # -- streaming state ------------------------------------------------------
 
@@ -376,6 +378,7 @@ class PersonaPlexMimiCodec(nn.Module):
 
     def streaming_init(self, batch_size: int) -> None:
         self._batch_size = batch_size
+        self._all_active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
         for s in self._conv_states():
             s.reset(batch_size, self.device, self.dtype)
         self.encoder_transformer.streaming_init(batch_size)
@@ -398,7 +401,7 @@ class PersonaPlexMimiCodec(nn.Module):
     # -- per-frame codec -------------------------------------------------------
 
     @staticmethod
-    def _run_stages(x: torch.Tensor, stages, active: torch.Tensor | None = None) -> torch.Tensor:
+    def _run_stages(x: torch.Tensor, stages, active: torch.Tensor) -> torch.Tensor:
         for kind, stage in stages:
             if kind == "res":
                 act0, conv1, act2, conv3 = stage
@@ -411,7 +414,7 @@ class PersonaPlexMimiCodec(nn.Module):
     def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, frame_size]`` float PCM -> ``[B, 8]`` codes."""
         x = pcm.to(self.device, self.dtype).view(-1, 1, FRAME_SIZE)
-        active = _active_rows(active, x.shape[0], self.device)
+        active = _normalize_active(active, self._all_active)
         x = self._run_stages(x, self._enc_stages, active)
         x = self.encoder_transformer.step(x.transpose(1, 2), active).transpose(1, 2)
         x = self._downsample(x, active)
@@ -422,7 +425,7 @@ class PersonaPlexMimiCodec(nn.Module):
     def decode_frame(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, 8]`` codes -> ``[B, frame_size]`` float PCM."""
         emb = self.model.quantizer.decode(codes.to(self.device).view(-1, CODEBOOKS, 1))
-        active = _active_rows(active, emb.shape[0], self.device)
+        active = _normalize_active(active, self._all_active)
         emb = self._upsample(emb, active)
         emb = self.decoder_transformer.step(emb.transpose(1, 2), active).transpose(1, 2)
         x = self._run_stages(emb, self._dec_stages, active)
@@ -432,7 +435,7 @@ class PersonaPlexMimiCodec(nn.Module):
     def decode_frames(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, 8, F]`` codes -> ``[B, F * frame_size]`` float PCM."""
         emb = self.model.quantizer.decode(codes.to(self.device))
-        active = _active_rows(active, emb.shape[0], self.device)
+        active = _normalize_active(active, self._all_active)
         emb = self._upsample(emb, active)
         emb = self.decoder_transformer.step(emb.transpose(1, 2), active).transpose(1, 2)
         x = self._run_stages(emb, self._dec_stages, active)

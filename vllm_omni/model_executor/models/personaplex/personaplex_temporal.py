@@ -95,24 +95,15 @@ class _RingKV:
     def bump_slot_start(self, b: int) -> None:
         self.start_offset[b] += 1
 
-    def complete(self, k: torch.Tensor, v: torch.Tensor, active: torch.Tensor | None = None):
+    def complete(self, k: torch.Tensor, v: torch.Tensor, active: torch.Tensor):
         B, H, T, D = k.shape
         indexes = (
             torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype).view(1, -1)
             + self.end_offset.view(-1, 1)
         ) % self.capacity
         idx4 = indexes.view(B, 1, T, 1).expand(-1, H, -1, D)
-        if active is not None:
-            # gather the old KV values for all rows
-            # Only write the new KV values for the active rows
-            old_k = self.cache[0].gather(2, idx4)
-            old_v = self.cache[1].gather(2, idx4)
-            act = active.view(B, 1, 1, 1)
-            k = torch.where(act, k, old_k)
-            v = torch.where(act, v, old_v)
-        else:
-            active = torch.ones(B, device=self.end_offset.device)
-
+        # Inactive rows rewrite uncommitted slots; their next active tick writes
+        # the same slots before advancing the visible end offset.
         self.cache[0].scatter_(2, idx4, k)
         self.cache[1].scatter_(2, idx4, v)
         self.end_offset.add_(T * active.to(self.end_offset.dtype))
@@ -151,7 +142,14 @@ class _TemporalLayer(nn.Module):
         self.norm1_alpha = nn.Parameter(torch.ones(1, 1, dim))
         self.norm2_alpha = nn.Parameter(torch.ones(1, 1, dim))
 
-    def forward(self, x: torch.Tensor, kv: _RingKV, offset: torch.Tensor, context: int) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv: _RingKV,
+        offset: torch.Tensor,
+        context: int,
+        active: torch.Tensor,
+    ) -> torch.Tensor:
         B, T, _ = x.shape
         h = _rms_norm_f32(x, self.norm1_alpha, 1e-8)
         qkv = F.linear(h, self.in_proj_weight)
@@ -161,7 +159,7 @@ class _TemporalLayer(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = _apply_rope(q, k, offset)
 
-        keys, values, pos_k = kv.complete(k, v)
+        keys, values, pos_k = kv.complete(k, v, active)
         pos_k = pos_k.view(pos_k.shape[0], 1, pos_k.shape[1])  # [B, 1, cap]
         pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
         delta = pos_q - pos_k
@@ -235,12 +233,16 @@ class PersonaPlexTemporalStreaming(nn.Module):
     # -- per-frame step -------------------------------------------------------
 
     @torch.no_grad()
-    def step(self, frame_embedding: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def step(
+        self,
+        frame_embedding: torch.Tensor,
+        active: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._kv is not None, "call streaming_init first"
         x = frame_embedding
         for layer, kv in zip(self.layers, self._kv):
-            x = layer(x, kv, self._offset, self.context)
-        self._offset.add_(x.shape[1])
+            x = layer(x, kv, self._offset, self.context, active)
+        self._offset.add_(x.shape[1] * active.to(self._offset.dtype))
         out = _rms_norm_f32(x, self.out_norm_alpha, 1e-8)
         text_logits = F.linear(out, self.text_linear)
         return out, text_logits[:, None]
