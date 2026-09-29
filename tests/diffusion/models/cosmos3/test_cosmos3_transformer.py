@@ -217,6 +217,40 @@ def test_transformer_places_boundary_modules_on_owning_stage(
     assert any(name.startswith(last_prefixes) for name in state_names) is (rank == world_size - 1)
 
 
+def test_transformer_forwards_und_and_gen_state_between_pp_stages(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.distributed import parallel_state as vllm_parallel_state
+    from vllm.sequence import IntermediateTensors
+
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    pp_group = SimpleNamespace(rank_in_group=0, world_size=2)
+    monkeypatch.setattr(vllm_parallel_state, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(transformer_cosmos3, "is_pipeline_first_stage", lambda: pp_group.rank_in_group == 0)
+    monkeypatch.setattr(transformer_cosmos3, "is_pipeline_last_stage", lambda: pp_group.rank_in_group == 1)
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+
+    config = _tiny_cosmos3_config(num_hidden_layers=0)
+    first = Cosmos3VFMTransformer(SimpleNamespace(tf_model_config=config, dtype=torch.float32))
+    kwargs = {
+        "hidden_states": torch.zeros(1, 2, 1, 2, 2),
+        "timestep": torch.tensor([1.0]),
+        "text_ids": torch.tensor([[1, 2]], dtype=torch.long),
+        "text_mask": torch.ones(1, 2, dtype=torch.long),
+        "video_shape": (1, 2, 2),
+        "fps": 24.0,
+    }
+    intermediate = first(**kwargs)
+    assert isinstance(intermediate, IntermediateTensors)
+    assert set(intermediate.tensors) == {"hidden_states", "freqs_cos", "freqs_sin", "und_hidden_states"}
+
+    pp_group.rank_in_group = 1
+    last = Cosmos3VFMTransformer(SimpleNamespace(tf_model_config=config, dtype=torch.float32))
+    output = last(**kwargs, intermediate_tensors=intermediate)
+    assert isinstance(output, torch.Tensor)
+    assert output.shape == kwargs["hidden_states"].shape
+
+
 @pytest.mark.parametrize(
     ("config_kind", "expected_language", "expected_gen"),
     [

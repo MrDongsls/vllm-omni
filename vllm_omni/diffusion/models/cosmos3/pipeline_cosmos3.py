@@ -47,6 +47,7 @@ from torch import nn
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
@@ -54,7 +55,9 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_pp_group,
 )
+from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
@@ -880,6 +883,7 @@ def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
 # ---------------------------------------------------------------------------
 class Cosmos3OmniDiffusersPipeline(
     nn.Module,
+    PipelineParallelMixin,
     CFGParallelMixin,
     SupportImageInput,
     SupportsComponentDiscovery,
@@ -1326,7 +1330,7 @@ class Cosmos3OmniDiffusersPipeline(
                 )
         return loaded
 
-    def predict_noise(self, **kwargs) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    def predict_noise(self, **kwargs) -> torch.Tensor | tuple[torch.Tensor, ...] | IntermediateTensors:
         """Override CFGParallelMixin.predict_noise for Cosmos3.
 
         The transformer returns the raw prediction: video-only as a tensor,
@@ -2843,7 +2847,7 @@ class Cosmos3OmniDiffusersPipeline(
             sound_pred = noise_pred[idx] if has_sound else None
             return video_pred, action_pred, sound_pred
 
-        def _step(
+        def _local_step(
             noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
             t: torch.Tensor,
             latents: torch.Tensor,
@@ -2899,6 +2903,53 @@ class Cosmos3OmniDiffusersPipeline(
                 outputs.append(action_latents)
             if sound_latents is not None:
                 outputs.append(sound_latents)
+            return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+        pp_active = self._pp_world_size_or_one() > 1
+
+        def _step(
+            noise_pred: torch.Tensor | tuple[torch.Tensor, ...] | None,
+            t: torch.Tensor,
+            latents: torch.Tensor,
+            action_latents: torch.Tensor | None,
+            sound_latents: torch.Tensor | None,
+        ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+            if not pp_active:
+                if noise_pred is None:
+                    raise RuntimeError("Cosmos3 scheduler received no prediction outside PP.")
+                return _local_step(noise_pred, t, latents, action_latents, sound_latents)
+
+            pp_group = get_pp_group()
+            if pp_group.is_last_rank:
+                if noise_pred is None:
+                    raise RuntimeError("Cosmos3 last PP stage requires a noise prediction.")
+                step_out = _local_step(noise_pred, t, latents, action_latents, sound_latents)
+                if isinstance(step_out, tuple):
+                    payload = {"latents": step_out[0]}
+                    if action_latents is not None:
+                        payload["action_latents"] = step_out[1]
+                    if sound_latents is not None:
+                        payload["sound_latents"] = step_out[-1]
+                else:
+                    payload = {"latents": step_out}
+                self._pp_send_work.extend(pp_group.isend_tensor_dict(payload, dst=0))
+                return step_out
+
+            if not pp_group.is_first_rank:
+                if action_latents is None and sound_latents is None:
+                    return latents
+                return tuple(value for value in (latents, action_latents, sound_latents) if value is not None)
+
+            tensor_dict, handles, postproc = pp_group.irecv_tensor_dict(src=pp_group.world_size - 1)
+            for handle in handles:
+                handle.wait()
+            for fn in postproc:
+                fn()
+            outputs = [tensor_dict["latents"]]
+            if action_latents is not None:
+                outputs.append(tensor_dict["action_latents"])
+            if sound_latents is not None:
+                outputs.append(tensor_dict["sound_latents"])
             return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
         def _assign_step_out(step_out: torch.Tensor | tuple[torch.Tensor, ...]) -> None:
@@ -2971,6 +3022,44 @@ class Cosmos3OmniDiffusersPipeline(
                     timestep = t.unsqueeze(0)
                     cfg_active = _cfg_active_at(t)
 
+                    if pp_active:
+                        if getattr(self, "_cosmos3_branch_caches", None) is None:
+                            self._cosmos3_branch_caches = {}
+                        noise_pred = self.predict_noise_maybe_with_cfg(
+                            do_true_cfg=True,
+                            true_cfg_scale=guidance_scale if cfg_active else 1.0,
+                            positive_kwargs=dict(
+                                _cache_context="cond",
+                                _cosmos3_cache_key="cond",
+                                hidden_states=latents,
+                                timestep=timestep,
+                                text_ids=cond_ids,
+                                text_mask=cond_mask,
+                                action_latents=action_latents,
+                                sound_latents=sound_latents,
+                                **shared_kwargs,
+                            ),
+                            negative_kwargs=dict(
+                                _cache_context="uncond",
+                                _cosmos3_cache_key="uncond",
+                                hidden_states=latents,
+                                timestep=timestep,
+                                text_ids=uncond_ids,
+                                text_mask=uncond_mask,
+                                action_latents=action_latents,
+                                sound_latents=sound_latents,
+                                **shared_kwargs,
+                            ),
+                            cfg_normalize=False,
+                        )
+                        if kv_state is not None:
+                            branch_caches = self._cosmos3_branch_caches
+                            for is_negative, cache_key in ((False, "cond"), (True, "uncond")):
+                                self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches[cache_key]
+                                self._kv_capture_und(kv_state, is_negative=is_negative)
+                        _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+                        continue
+
                     if not self._kv_load_und(kv_state, is_negative=False):
                         self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
                     noise_cond = self.predict_noise(
@@ -3027,6 +3116,34 @@ class Cosmos3OmniDiffusersPipeline(
                     self._set_denoise_step_metadata(step_index, timesteps, step_scheduler)
                     self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
+                    if pp_active:
+                        if getattr(self, "_cosmos3_branch_caches", None) is None:
+                            self._cosmos3_branch_caches = {}
+                        noise_pred = self.predict_noise_maybe_with_cfg(
+                            do_true_cfg=False,
+                            true_cfg_scale=1.0,
+                            positive_kwargs=dict(
+                                _cache_context="cond",
+                                _cosmos3_cache_key="cond",
+                                hidden_states=latents,
+                                timestep=timestep,
+                                text_ids=cond_ids,
+                                text_mask=cond_mask,
+                                action_latents=action_latents,
+                                sound_latents=sound_latents,
+                                **shared_kwargs,
+                            ),
+                            negative_kwargs=None,
+                            cfg_normalize=False,
+                        )
+                        if kv_state is not None:
+                            self.transformer.cached_kv, self.transformer.cached_freqs_gen = self._cosmos3_branch_caches[
+                                "cond"
+                            ]
+                            self._kv_capture_und(kv_state, is_negative=False)
+                        _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
+                        continue
+
                     self._kv_load_und(kv_state, is_negative=False)
                     noise_pred = self.predict_noise(
                         _cache_context="cond",
@@ -3044,6 +3161,7 @@ class Cosmos3OmniDiffusersPipeline(
         finally:
             self._clear_denoise_step_metadata()
             self._reset_mixed_precision()
+            self._cosmos3_branch_caches = None
             # Cosmos3 currently receives a unique request_id rather than a
             # reusable rollout session id. Retaining its state would only pin
             # K/V buffers on device after this generation finishes.
@@ -3227,6 +3345,52 @@ class Cosmos3OmniDiffusersPipeline(
 
         self.transformer.reset_cache()
         self._cosmos3_branch_caches = {}
+        pp_active = self._pp_world_size_or_one() > 1
+
+        def _transfer_step(
+            noise_pred: torch.Tensor | None,
+            timestep: torch.Tensor,
+            current_latents: torch.Tensor,
+        ) -> torch.Tensor:
+            if not pp_active:
+                if noise_pred is None:
+                    raise RuntimeError("Cosmos3 transfer scheduler received no prediction outside PP.")
+                noise_pred = noise_pred * velocity_mask
+                next_latents = self.scheduler.step(
+                    noise_pred,
+                    timestep,
+                    current_latents,
+                    generator=generator,
+                    return_dict=False,
+                )[0]
+                return velocity_mask * next_latents + (1.0 - velocity_mask) * condition_latents
+
+            pp_group = get_pp_group()
+            if pp_group.is_last_rank:
+                if noise_pred is None:
+                    raise RuntimeError("Cosmos3 transfer last PP stage requires a noise prediction.")
+                noise_pred = noise_pred * velocity_mask
+                next_latents = self.scheduler.step(
+                    noise_pred,
+                    timestep,
+                    current_latents,
+                    generator=generator,
+                    return_dict=False,
+                )[0]
+                next_latents = velocity_mask * next_latents + (1.0 - velocity_mask) * condition_latents
+                self._pp_send_work.extend(pp_group.isend_tensor_dict({"latents": next_latents}, dst=0))
+                return next_latents
+
+            if not pp_group.is_first_rank:
+                return current_latents
+
+            tensor_dict, handles, postproc = pp_group.irecv_tensor_dict(src=pp_group.world_size - 1)
+            for handle in handles:
+                handle.wait()
+            for fn in postproc:
+                fn()
+            return tensor_dict["latents"]
+
         try:
             for step_index, t in enumerate(self.progress_bar(timesteps)):
                 self._set_denoise_step_metadata(step_index, timesteps, self.scheduler)
@@ -3337,18 +3501,12 @@ class Cosmos3OmniDiffusersPipeline(
                     noise_pred = self.predict_noise(**cond_full_kwargs)
                 if isinstance(noise_pred, tuple):
                     raise ValueError("Cosmos3 transfer diffusion expects video-only tensor predictions.")
-                noise_pred = noise_pred * velocity_mask
-                latents = self.scheduler.step(
-                    noise_pred,
-                    t,
-                    latents,
-                    generator=generator,
-                    return_dict=False,
-                )[0]
-                latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+                latents = _transfer_step(noise_pred, t, latents)
         finally:
             self._clear_denoise_step_metadata()
             self._reset_mixed_precision()
+            if pp_active:
+                self._sync_pp_send()
             self._cosmos3_branch_caches = None
             self.transformer.reset_cache()
         return latents

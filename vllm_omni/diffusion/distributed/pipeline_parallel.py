@@ -93,6 +93,31 @@ class PipelineParallelMixin:
 
     vae: Any
 
+    @staticmethod
+    def _slice_pp_prediction(
+        prediction: torch.Tensor | tuple[torch.Tensor, ...],
+        output_slice: int,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if isinstance(prediction, torch.Tensor):
+            return prediction[:, :output_slice]
+        if isinstance(prediction, tuple) and all(isinstance(item, torch.Tensor) for item in prediction):
+            return tuple(item[:, :output_slice] for item in prediction)
+        raise TypeError("PP predictions must be tensors or tuples of tensors")
+
+    @staticmethod
+    def _pp_world_size_or_one() -> int:
+        """Keep direct, non-distributed pipeline use on the PP=1 path."""
+        try:
+            return get_pipeline_parallel_world_size()
+        except AssertionError:
+            return 1
+
+    def _cfg_collect_on_this_rank(self) -> bool:
+        """Only the last PP stage has predictions to exchange or combine."""
+        if self._pp_world_size_or_one() == 1:
+            return True
+        return get_pp_group().is_last_rank
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
@@ -168,7 +193,7 @@ class PipelineParallelMixin:
         kwargs: dict[str, Any],
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """Run one branch through the PP stages for multi-branch CFG."""
-        if get_pipeline_parallel_world_size() == 1:
+        if self._pp_world_size_or_one() == 1:
             return cast(Any, self).predict_noise(**kwargs)
 
         self._sync_pp_send()
@@ -208,7 +233,7 @@ class PipelineParallelMixin:
             noise_pred on the last PP rank (all CFG ranks when CFG-parallel is active).
             None on all other ranks.
         """
-        if get_pipeline_parallel_world_size() == 1:
+        if self._pp_world_size_or_one() == 1:
             return cast(Any, super()).predict_noise_maybe_with_cfg(
                 do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs, cfg_normalize, output_slice
             )
@@ -254,20 +279,25 @@ class PipelineParallelMixin:
             # on all CFG ranks so every last PP rank has an identical noise_pred.
             local_pred = noise_preds[0]
             if output_slice is not None:
-                local_pred = local_pred[:, :output_slice]
-            gathered = get_cfg_group().all_gather(local_pred, separate_tensors=True)
-            return cast(Any, self).combine_cfg_noise(gathered[0], gathered[1], true_cfg_scale, cfg_normalize)
+                local_pred = self._slice_pp_prediction(local_pred, output_slice)
+            local_predictions = local_pred if isinstance(local_pred, tuple) else (local_pred,)
+            gathered = [get_cfg_group().all_gather(pred, separate_tensors=True) for pred in local_predictions]
+            positive = tuple(per_element[0] for per_element in gathered)
+            negative = tuple(per_element[1] for per_element in gathered)
+            if not isinstance(local_pred, tuple):
+                positive, negative = positive[0], negative[0]
+            return cast(Any, self).combine_cfg_noise(positive, negative, true_cfg_scale, cfg_normalize)
 
         # Sequential CFG or no-CFG path.
         if do_true_cfg:
             pos, neg = noise_preds[0], noise_preds[1]
             if output_slice is not None:
-                pos = pos[:, :output_slice]
-                neg = neg[:, :output_slice]
+                pos = self._slice_pp_prediction(pos, output_slice)
+                neg = self._slice_pp_prediction(neg, output_slice)
             return cast(Any, self).combine_cfg_noise(pos, neg, true_cfg_scale, cfg_normalize)
         pred = noise_preds[0]
         if output_slice is not None:
-            pred = pred[:, :output_slice]
+            pred = self._slice_pp_prediction(pred, output_slice)
         return pred
 
     def scheduler_step_maybe_with_cfg(
@@ -290,7 +320,7 @@ class PipelineParallelMixin:
         access or a torch operation), keeping the rank non-blocking after the
         ``irecv`` is posted.
         """
-        if get_pipeline_parallel_world_size() == 1:
+        if self._pp_world_size_or_one() == 1:
             return cast(Any, super()).scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
             )

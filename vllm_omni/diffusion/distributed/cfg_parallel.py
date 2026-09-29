@@ -94,6 +94,10 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """Run one multi-branch prediction using the existing model path."""
         return self.predict_noise(**kwargs)
 
+    def _cfg_collect_on_this_rank(self) -> bool:
+        """Whether this rank participates in CFG result collection."""
+        return True
+
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
@@ -252,7 +256,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         branches_kwargs: list[dict[str, Any]],
         cfg_normalize: bool = False,
         output_slice: int | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """
         Predict noise with N-branch CFG dispatch across M GPUs.
 
@@ -318,7 +322,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         true_cfg_scale: float | dict[str, float],
         cfg_normalize: bool,
         output_slice: int | None,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """Dispatch N branches across M ranks, all_gather, then combine."""
         cfg_group = get_cfg_group()
         cfg_rank = get_classifier_free_guidance_rank()
@@ -346,6 +350,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
             if output_slice is not None:
                 pred = _slice_pred(pred, output_slice)
             my_preds.append(pred)
+
+        if not self._cfg_collect_on_this_rank():
+            return None
 
         # Idle ranks (cfg_world_size > n_branches) run a forward pass to get the output shape for all_gather.
         # Output shape cannot be inferred from kwargs — may be tuple, sliced, etc.

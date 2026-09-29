@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from vllm.model_executor.models.utils import PPMissingLayer, make_layers
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
@@ -1114,9 +1115,12 @@ class Cosmos3LanguageModel(nn.Module):
 
     def forward(
         self,
-        text_ids: torch.Tensor,
+        text_ids: torch.Tensor | None,
         freqs: tuple[torch.Tensor, torch.Tensor],
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        *,
+        hidden_states: torch.Tensor | None = None,
+        return_hidden_states: bool = False,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]] | tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
         """
         Args:
             text_ids: [B, S] token IDs
@@ -1129,13 +1133,20 @@ class Cosmos3LanguageModel(nn.Module):
         real query positions only attend to real keys, and the caller trims pad
         K/V via ``max_real_len`` before the GEN cross-attention sees them.
         """
-        hidden = self.embed_tokens(text_ids)
+        if hidden_states is None:
+            if text_ids is None:
+                raise ValueError("Cosmos3 UND requires text_ids on the first PP stage.")
+            hidden = self.embed_tokens(text_ids)
+        else:
+            hidden = hidden_states
 
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer in self.layers[self.start_layer : self.end_layer]:
             hidden, k, v = layer(hidden, freqs)
             cached_kv.append((k, v))
 
+        if return_hidden_states:
+            return cached_kv, hidden
         return cached_kv
 
 
@@ -1165,6 +1176,7 @@ class _GenPrepared(NamedTuple):
     """GEN-pathway state shared by normal and cached execution."""
 
     hidden_gen: torch.Tensor
+    und_hidden_states: torch.Tensor | None
     time_embed: torch.Tensor
     t: int
     h: int
@@ -1816,17 +1828,22 @@ class Cosmos3VFMTransformer(nn.Module):
         use_multi_control_attention: bool,
         multi_control_token_sizes: tuple[int, ...] | None,
         multi_control_weights: tuple[float, ...] | None,
-    ) -> torch.Tensor:
+        freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the complete GEN decoder between full-layout boundaries."""
         if self.cached_kv is None or self.cached_freqs_gen is None:
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-        freqs_cos, freqs_sin = self.cached_freqs_gen
-        if not use_multi_control_attention:
-            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
+        if freqs_gen is None:
+            freqs_cos, freqs_sin = self.cached_freqs_gen
+            if not use_multi_control_attention and is_pipeline_first_stage():
+                hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
+        else:
+            freqs_cos, freqs_sin = freqs_gen
+        local_layers = self.gen_layers[self.start_layer : self.end_layer]
         freqs_gen = (freqs_cos, freqs_sin)
 
-        if len(self.gen_layers) == len(self.cached_kv):
-            for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
+        if len(local_layers) == len(self.cached_kv):
+            for layer, (k_und, v_und) in zip(local_layers, self.cached_kv, strict=True):
                 hidden_gen = layer(
                     hidden_gen,
                     k_und=k_und,
@@ -1840,8 +1857,8 @@ class Cosmos3VFMTransformer(nn.Module):
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
         else:
-            # Cache-dit patches gen_layers to a grouped wrapper.
-            for layer in self.gen_layers:
+            # Cache-dit may replace the local layer list with a grouped wrapper.
+            for layer in local_layers:
                 hidden_gen = layer(
                     hidden_gen,
                     cached_kv=self.cached_kv,
@@ -1852,9 +1869,9 @@ class Cosmos3VFMTransformer(nn.Module):
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
 
-        if not use_multi_control_attention:
+        if not use_multi_control_attention and is_pipeline_last_stage():
             hidden_gen = self.gen_sp_gather(hidden_gen)
-        return hidden_gen
+        return hidden_gen, freqs_cos, freqs_sin
 
     # -- Forward -------------------------------------------------------------
 
@@ -1876,8 +1893,9 @@ class Cosmos3VFMTransformer(nn.Module):
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
         control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         transfer_share_vision_temporal_positions: bool = True,
+        intermediate_tensors: IntermediateTensors | None = None,
         **kwargs,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | IntermediateTensors:
         """Run the shared Cosmos3 GEN preprocess, stack, and postprocess path."""
         if kwargs:
             raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
@@ -1898,8 +1916,12 @@ class Cosmos3VFMTransformer(nn.Module):
             control_latents=control_latents,
             control_weights=control_weights,
             transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+            intermediate_tensors=intermediate_tensors,
         )
-        return self._gen_postprocess(self._run_gen_stack(prep), prep)
+        gen_output = self._run_gen_stack(prep, intermediate_tensors)
+        if isinstance(gen_output, IntermediateTensors):
+            return gen_output
+        return self._gen_postprocess(gen_output, prep)
 
     def _gen_preprocess(
         self,
@@ -1919,6 +1941,7 @@ class Cosmos3VFMTransformer(nn.Module):
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
         control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         transfer_share_vision_temporal_positions: bool = True,
+        intermediate_tensors: IntermediateTensors | None = None,
     ) -> _GenPrepared:
         """
         Prepare the packed GEN sequence before its cacheable execution region.
@@ -2048,6 +2071,7 @@ class Cosmos3VFMTransformer(nn.Module):
         # freqs_gen (M-RoPE cos/sin) is derived purely from shape/fps and is
         # cached alongside UND K/V by both the bespoke and session-state paths.
         need_kv = self.cached_kv is None
+        und_hidden_states = None
         if need_kv or self.cached_freqs_gen is None:
             freqs_und, freqs_gen = self._compute_rope_freqs(
                 text_mask,
@@ -2068,10 +2092,55 @@ class Cosmos3VFMTransformer(nn.Module):
 
             if need_kv:
                 with self._offload_context("reasoner"):
-                    cached_kv_full = self.language_model(text_ids, freqs_und)
+                    if is_pipeline_first_stage():
+                        cached_kv_full, und_hidden_states = self.language_model(
+                            text_ids,
+                            freqs_und,
+                            return_hidden_states=True,
+                        )
+                    else:
+                        if intermediate_tensors is None or "und_hidden_states" not in intermediate_tensors.tensors:
+                            raise RuntimeError("Cosmos3 non-first PP stages require UND intermediate tensors.")
+                        cached_kv_full, und_hidden_states = self.language_model(
+                            None,
+                            freqs_und,
+                            hidden_states=intermediate_tensors["und_hidden_states"],
+                            return_hidden_states=True,
+                        )
                 # Trim to real text length (remove padding).  K/V stay replicated;
                 # the framework Attention layer head-slices them via joint_key/value.
                 self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+
+        if not is_pipeline_first_stage():
+            if intermediate_tensors is None:
+                raise RuntimeError("Cosmos3 non-first PP stages require intermediate tensors.")
+            hidden_gen = intermediate_tensors["hidden_states"]
+            s_video = t * hp * wp
+            s_control = s_video * len(control_latent_list)
+            control_token_sizes = tuple(s_video for _ in control_latent_list)
+            use_multi_control_attention = len(control_latent_list) > 1
+            multi_control_weights = tuple(normalized_control_weights) if use_multi_control_attention else None
+            multi_control_token_sizes = control_token_sizes if use_multi_control_attention else None
+            return _GenPrepared(
+                hidden_gen=hidden_gen,
+                und_hidden_states=und_hidden_states,
+                time_embed=hidden_states.new_empty(0),
+                t=t,
+                h=h,
+                w=w,
+                s_video=s_video,
+                s_control=s_control,
+                s_action=s_action,
+                s_sound=s_sound,
+                has_control=has_control,
+                has_action=has_action,
+                has_sound=has_sound,
+                action_domain_ids=action_domain_ids,
+                ulysses_size=ulysses_size,
+                use_multi_control_attention=use_multi_control_attention,
+                multi_control_token_sizes=multi_control_token_sizes,
+                multi_control_weights=multi_control_weights,
+            )
 
         with self._offload_context("generator"):
             # Patchify latents and project to hidden space after UND cache
@@ -2149,6 +2218,7 @@ class Cosmos3VFMTransformer(nn.Module):
 
             return _GenPrepared(
                 hidden_gen=hidden_gen,
+                und_hidden_states=und_hidden_states,
                 time_embed=time_embed,
                 t=t,
                 h=h,
@@ -2167,9 +2237,21 @@ class Cosmos3VFMTransformer(nn.Module):
                 multi_control_weights=multi_control_weights,
             )
 
-    def _run_gen_stack(self, prep: _GenPrepared) -> torch.Tensor:
-        """Execute the cacheable full-layout GEN stack, including final norm."""
-        hidden_gen = self._run_gen_layers(
+    def _run_gen_stack(
+        self,
+        prep: _GenPrepared,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        """Execute the local GEN stack and carry PP state to the next stage."""
+        incoming_freqs = None
+        if not is_pipeline_first_stage():
+            if intermediate_tensors is None:
+                raise RuntimeError("Cosmos3 non-first PP stages require GEN intermediate tensors.")
+            incoming_freqs = (
+                intermediate_tensors["freqs_cos"],
+                intermediate_tensors["freqs_sin"],
+            )
+        gen_result = self._run_gen_layers(
             prep.hidden_gen,
             s_video=prep.s_video,
             s_control=prep.s_control,
@@ -2182,7 +2264,24 @@ class Cosmos3VFMTransformer(nn.Module):
             use_multi_control_attention=prep.use_multi_control_attention,
             multi_control_token_sizes=prep.multi_control_token_sizes,
             multi_control_weights=prep.multi_control_weights,
+            freqs_gen=incoming_freqs,
         )
+        if isinstance(gen_result, tuple) and len(gen_result) == 3:
+            hidden_gen, freqs_cos, freqs_sin = gen_result
+        else:
+            # Keep the private helper easy to monkeypatch in existing tests and
+            # integrations that only return the transformed hidden state.
+            hidden_gen = gen_result
+            freqs_cos, freqs_sin = incoming_freqs or self.cached_freqs_gen
+        if not is_pipeline_last_stage():
+            tensors = {
+                "hidden_states": hidden_gen,
+                "freqs_cos": freqs_cos,
+                "freqs_sin": freqs_sin,
+            }
+            if prep.und_hidden_states is not None:
+                tensors["und_hidden_states"] = prep.und_hidden_states
+            return IntermediateTensors(tensors)
         return self.norm_moe_gen(hidden_gen)
 
     def _gen_postprocess(

@@ -288,16 +288,26 @@ class Cosmos3EdgeLanguageModel(nn.Module):
 
     def forward(
         self,
-        text_ids: torch.Tensor,
+        text_ids: torch.Tensor | None,
         freqs: tuple[torch.Tensor, torch.Tensor],
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        hidden = self.embed_tokens(text_ids)
+        *,
+        hidden_states: torch.Tensor | None = None,
+        return_hidden_states: bool = False,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]] | tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+        if hidden_states is None:
+            if text_ids is None:
+                raise ValueError("Cosmos3 UND requires text_ids on the first PP stage.")
+            hidden = self.embed_tokens(text_ids)
+        else:
+            hidden = hidden_states
 
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer in self.layers[self.start_layer : self.end_layer]:
             hidden, k, v = layer(hidden, freqs)
             cached_kv.append((k, v))
 
+        if return_hidden_states:
+            return cached_kv, hidden
         return cached_kv
 
 
