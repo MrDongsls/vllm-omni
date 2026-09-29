@@ -260,12 +260,6 @@ class TestSyncPPSend:
         pipeline._sync_pp_send()
         assert pipeline._pp_send_work == []
 
-    def test_pipeline_parallel_does_not_require_cfg_mixin(self):
-        class _PPOnly(PipelineParallelMixin):
-            pass
-
-        assert isinstance(_PPOnly(), PipelineParallelMixin)
-
 
 class TestDiffuseWrapper:
     """Verifies that PipelineParallelMixin flushes pending sends when diffuse() exits."""
@@ -377,21 +371,21 @@ class TestVaeDecodeGuard:
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cpu
-def test_pipeline_parallel_requires_cfg_mixin():
-    with pytest.raises(TypeError, match="inherits PipelineParallelMixin but not CFGParallelMixin"):
+def test_pipeline_parallel_does_not_require_cfg_mixin():
+    class _PPOnly(PipelineParallelMixin):
+        pass
 
-        class _MissingCFG(PipelineParallelMixin):
-            pass
+    assert isinstance(_PPOnly(), PipelineParallelMixin)
 
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cpu
-def test_pipeline_parallel_requires_mro_before_cfg_mixin():
-    with pytest.raises(TypeError, match="must inherit PipelineParallelMixin before CFGParallelMixin"):
+def test_pipeline_parallel_does_not_validate_mro_order():
+    class _WrongOrder(CFGParallelMixin, PipelineParallelMixin):
+        pass
 
-        class _WrongOrder(CFGParallelMixin, PipelineParallelMixin):
-            pass
+    assert _WrongOrder.mro().index(PipelineParallelMixin) > _WrongOrder.mro().index(CFGParallelMixin)
 
 
 # ---------------------------------------------------------------------------
