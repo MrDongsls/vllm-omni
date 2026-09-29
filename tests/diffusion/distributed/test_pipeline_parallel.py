@@ -260,6 +260,12 @@ class TestSyncPPSend:
         pipeline._sync_pp_send()
         assert pipeline._pp_send_work == []
 
+    def test_pipeline_parallel_does_not_require_cfg_mixin(self):
+        class _PPOnly(PipelineParallelMixin):
+            pass
+
+        assert isinstance(_PPOnly(), PipelineParallelMixin)
+
 
 class TestDiffuseWrapper:
     """Verifies that PipelineParallelMixin flushes pending sends when diffuse() exits."""

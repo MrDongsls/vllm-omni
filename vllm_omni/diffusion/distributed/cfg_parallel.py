@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Base pipeline class for Diffusion models with shared CFG functionality.
 """
 
 from abc import ABCMeta
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.logger import init_logger
@@ -88,6 +88,12 @@ class CFGParallelMixin(metaclass=ABCMeta):
         and set self.scheduler to a composite scheduler that handles tuples.
     """
 
+    transformer: Any
+
+    def _run_branch(self, kwargs: dict[str, Any]) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
+        """Run one multi-branch prediction using the existing model path."""
+        return self.predict_noise(**kwargs)
+
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
@@ -120,6 +126,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             logic and set self.scheduler to a composite scheduler.
         """
         if do_true_cfg:
+            negative_kwargs = cast(dict[str, Any], negative_kwargs)
             # Automatically detect CFG parallel configuration
             cfg_parallel_ready = _get_cfg_world_size_or_one() > 1
 
@@ -284,14 +291,21 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 # Sequential: run all N branches on single device
                 preds: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
                 for kw in branches_kwargs:
-                    pred = _wrap(self.predict_noise(**kw))
+                    pred = self._run_branch(kw)
+                    if pred is None:
+                        continue
+                    pred = _wrap(pred)
                     if output_slice is not None:
                         pred = _slice_pred(pred, output_slice)
                     preds.append(_unwrap(pred))
+                if len(preds) != len(branches_kwargs):
+                    return None
                 return self.combine_multi_branch_cfg_noise(preds, true_cfg_scale, cfg_normalize)
         else:
             # No CFG: only compute positive/conditional prediction
-            pred = self.predict_noise(**branches_kwargs[0])
+            pred = self._run_branch(branches_kwargs[0])
+            if pred is None:
+                return None
             if output_slice is not None:
                 pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
             return pred
@@ -325,7 +339,10 @@ class CFGParallelMixin(metaclass=ABCMeta):
         # Run assigned branches
         my_preds: list[tuple[torch.Tensor, ...]] = []
         for bid in my_branch_ids:
-            pred = _wrap(self.predict_noise(**branches_kwargs[bid]))
+            pred = self._run_branch(branches_kwargs[bid])
+            if pred is None:
+                continue
+            pred = _wrap(pred)
             if output_slice is not None:
                 pred = _slice_pred(pred, output_slice)
             my_preds.append(pred)
@@ -333,7 +350,10 @@ class CFGParallelMixin(metaclass=ABCMeta):
         # Idle ranks (cfg_world_size > n_branches) run a forward pass to get the output shape for all_gather.
         # Output shape cannot be inferred from kwargs — may be tuple, sliced, etc.
         if not my_preds:
-            pred = _wrap(self.predict_noise(**branches_kwargs[0]))
+            pred = self._run_branch(branches_kwargs[0])
+            if pred is None:
+                return None
+            pred = _wrap(pred)
             if output_slice is not None:
                 pred = _slice_pred(pred, output_slice)
             my_preds.append(pred)

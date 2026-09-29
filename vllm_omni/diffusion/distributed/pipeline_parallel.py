@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from functools import wraps
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
@@ -91,23 +91,10 @@ class PipelineParallelMixin:
     PP stage operates on the correct encoder_hidden_states.
     """
 
+    vae: Any
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-
-        if not issubclass(cls, CFGParallelMixin):
-            raise TypeError(
-                f"{cls.__name__} inherits PipelineParallelMixin but not CFGParallelMixin. "
-                "Pipeline Parallelism requires CFGParallelMixin for predict_noise(), "
-                "predict_noise_maybe_with_cfg(), scheduler_step_maybe_with_cfg(), and combine_cfg_noise(). "
-                "Add CFGParallelMixin to the base classes of your pipeline."
-            )
-        mro = cls.mro()
-        if mro.index(PipelineParallelMixin) > mro.index(CFGParallelMixin):
-            raise TypeError(
-                f"{cls.__name__} must inherit PipelineParallelMixin before CFGParallelMixin so MRO selects "
-                f"PP-aware predict/scheduler wrappers and their `super()` calls delegate to CFGParallelMixin."
-            )
 
         init = cls.__dict__.get("__init__")
         if callable(init):
@@ -119,7 +106,7 @@ class PipelineParallelMixin:
                 if vae is not None and hasattr(vae, "decode"):
                     self._wrapped_vae_decode()
 
-            cls.__init__ = wrapped_init
+            setattr(cls, "__init__", wrapped_init)
 
         diffuse = cls.__dict__.get("diffuse")
         if callable(diffuse):
@@ -134,7 +121,7 @@ class PipelineParallelMixin:
                 finally:
                     self._sync_pp_send()
 
-            cls.diffuse = wrapped_diffuse
+            setattr(cls, "diffuse", wrapped_diffuse)
 
     def _wrapped_vae_decode(self) -> None:
         vae, orig_decode = self.vae, self.vae.decode
@@ -176,6 +163,27 @@ class PipelineParallelMixin:
                 handle.wait()
             self._pp_send_work = []
 
+    def _run_branch(
+        self,
+        kwargs: dict[str, Any],
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
+        """Run one branch through the PP stages for multi-branch CFG."""
+        if get_pipeline_parallel_world_size() == 1:
+            return cast(Any, self).predict_noise(**kwargs)
+
+        self._sync_pp_send()
+        pp_group = get_pp_group()
+        intermediate = None
+        if not pp_group.is_first_rank:
+            intermediate = AsyncIntermediateTensors(*pp_group.irecv_tensor_dict())
+
+        if not pp_group.is_last_rank:
+            result = cast(Any, self).predict_noise(**kwargs, intermediate_tensors=intermediate)
+            self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
+            return None
+
+        return cast(Any, self).predict_noise(**kwargs, intermediate_tensors=intermediate)
+
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
@@ -201,7 +209,7 @@ class PipelineParallelMixin:
             None on all other ranks.
         """
         if get_pipeline_parallel_world_size() == 1:
-            return super().predict_noise_maybe_with_cfg(
+            return cast(Any, super()).predict_noise_maybe_with_cfg(
                 do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs, cfg_normalize, output_slice
             )
 
@@ -210,12 +218,17 @@ class PipelineParallelMixin:
         pp_group = get_pp_group()
 
         cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+        all_kwargs: list[dict[str, Any]]
         if cfg_parallel_ready:
             # Each PP pipeline carries exactly one CFG branch determined by cfg_rank.
-            all_kwargs = [positive_kwargs if get_classifier_free_guidance_rank() == 0 else negative_kwargs]
+            all_kwargs = [
+                positive_kwargs if get_classifier_free_guidance_rank() == 0 else cast(dict[str, Any], negative_kwargs)
+            ]
         else:
             # Sequential CFG (or no CFG): this PP pipeline handles all branches.
-            all_kwargs = [positive_kwargs] + ([negative_kwargs] if do_true_cfg else [])
+            all_kwargs = [positive_kwargs]
+            if do_true_cfg:
+                all_kwargs.append(cast(dict[str, Any], negative_kwargs))
 
         # Non-first ranks receive intermediate tensors asynchronously
         n = len(all_kwargs)
@@ -227,12 +240,14 @@ class PipelineParallelMixin:
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.
             for kwargs, it in zip(all_kwargs, its):
-                result = self.predict_noise(**kwargs, intermediate_tensors=it)
+                result = cast(Any, self).predict_noise(**kwargs, intermediate_tensors=it)
                 self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
             return None
 
         # Last rank: run full forward
-        noise_preds = [self.predict_noise(**kwargs, intermediate_tensors=it) for kwargs, it in zip(all_kwargs, its)]
+        noise_preds = [
+            cast(Any, self).predict_noise(**kwargs, intermediate_tensors=it) for kwargs, it in zip(all_kwargs, its)
+        ]
 
         if cfg_parallel_ready:
             # All-gather the single-branch prediction across the CFG group and combine
@@ -241,7 +256,7 @@ class PipelineParallelMixin:
             if output_slice is not None:
                 local_pred = local_pred[:, :output_slice]
             gathered = get_cfg_group().all_gather(local_pred, separate_tensors=True)
-            return self.combine_cfg_noise(gathered[0], gathered[1], true_cfg_scale, cfg_normalize)
+            return cast(Any, self).combine_cfg_noise(gathered[0], gathered[1], true_cfg_scale, cfg_normalize)
 
         # Sequential CFG or no-CFG path.
         if do_true_cfg:
@@ -249,7 +264,7 @@ class PipelineParallelMixin:
             if output_slice is not None:
                 pos = pos[:, :output_slice]
                 neg = neg[:, :output_slice]
-            return self.combine_cfg_noise(pos, neg, true_cfg_scale, cfg_normalize)
+            return cast(Any, self).combine_cfg_noise(pos, neg, true_cfg_scale, cfg_normalize)
         pred = noise_preds[0]
         if output_slice is not None:
             pred = pred[:, :output_slice]
@@ -276,13 +291,13 @@ class PipelineParallelMixin:
         ``irecv`` is posted.
         """
         if get_pipeline_parallel_world_size() == 1:
-            return super().scheduler_step_maybe_with_cfg(
+            return cast(Any, super()).scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
             )
 
         pp_group = get_pp_group()
         if pp_group.is_last_rank:
-            latents = super().scheduler_step_maybe_with_cfg(
+            latents = cast(Any, super()).scheduler_step_maybe_with_cfg(
                 noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
             )
             self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)

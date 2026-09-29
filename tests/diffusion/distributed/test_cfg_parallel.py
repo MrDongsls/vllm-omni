@@ -156,6 +156,25 @@ class MultiBranchTestPipeline(CFGParallelMixin):
         return combined
 
 
+def test_multi_branch_cfg_uses_branch_hook():
+    class HookPipeline(CFGParallelMixin):
+        def _run_branch(self, kwargs):
+            return kwargs["prediction"]
+
+        def predict_noise(self, **kwargs):
+            raise AssertionError("multi-branch CFG should use _run_branch")
+
+    positive = torch.full((1, 2), 2.0)
+    negative = torch.ones(1, 2)
+    actual = HookPipeline().predict_noise_with_multi_branch_cfg(
+        do_true_cfg=True,
+        true_cfg_scale=2.0,
+        branches_kwargs=[{"prediction": positive}, {"prediction": negative}],
+    )
+
+    torch.testing.assert_close(actual, negative + 2.0 * (positive - negative))
+
+
 class FakeCfgGroup:
     def __init__(self, *, world_size: int, rank_in_group: int, rank_tensors: list[torch.Tensor]):
         self.world_size = world_size
