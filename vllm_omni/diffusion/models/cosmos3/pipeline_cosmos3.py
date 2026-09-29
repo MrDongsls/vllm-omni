@@ -1307,7 +1307,7 @@ class Cosmos3OmniDiffusersPipeline(
         self.transformer.eval()
         self.transformer.validate_loaded_weights(loaded)
         if getattr(self.transformer, "sound_gen", False):
-            sound_markers = ("audio_proj_in.", "audio_proj_out.", "audio_modality_embed")
+            sound_markers = self.transformer.required_sound_weight_markers()
             missing = [marker.rstrip(".") for marker in sound_markers if not any(marker in name for name in loaded)]
             if missing:
                 raise ValueError(
@@ -1316,7 +1316,7 @@ class Cosmos3OmniDiffusersPipeline(
                     "Use a sound-capable transformer checkpoint."
                 )
         if getattr(self.transformer, "action_gen", False):
-            action_markers = ("action_proj_in.", "action_proj_out.", "action_modality_embed")
+            action_markers = self.transformer.required_action_weight_markers()
             missing = [marker.rstrip(".") for marker in action_markers if not any(marker in name for name in loaded)]
             if missing:
                 raise ValueError(

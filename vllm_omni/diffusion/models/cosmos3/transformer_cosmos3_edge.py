@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 Edge transformer variant with a Nemotron dense UND backbone."""
 
 from __future__ import annotations
@@ -12,8 +12,10 @@ import torch.nn.functional as F
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.models.utils import PPMissingLayer, make_layers
 
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
+from vllm_omni.diffusion.distributed.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
 
 from .transformer_cosmos3 import (
     Cosmos3VFMTransformer,
@@ -261,29 +263,28 @@ class Cosmos3EdgeLanguageModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size) if is_pipeline_first_stage() else PPMissingLayer()
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(
             head_dim=head_dim,
             rope_theta=rope_theta,
             mrope_section=mrope_section,
         )
-        self.layers = nn.ModuleList(
-            [
-                Cosmos3EdgeUndDecoderLayer(
-                    hidden_size=hidden_size,
-                    intermediate_size=intermediate_size,
-                    num_attention_heads=num_attention_heads,
-                    num_key_value_heads=num_key_value_heads,
-                    head_dim=head_dim,
-                    rms_norm_eps=rms_norm_eps,
-                    use_und_k_norm_for_gen=use_und_k_norm_for_gen,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.layers.{i}",
-                )
-                for i in range(num_hidden_layers)
-            ]
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            num_hidden_layers,
+            lambda prefix: Cosmos3EdgeUndDecoderLayer(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                use_und_k_norm_for_gen=use_und_k_norm_for_gen,
+                quant_config=quant_config,
+                prefix=prefix,
+            ),
+            prefix=f"{prefix}.layers",
         )
-        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps) if is_pipeline_last_stage() else PPMissingLayer()
 
     def forward(
         self,
@@ -293,7 +294,7 @@ class Cosmos3EdgeLanguageModel(nn.Module):
         hidden = self.embed_tokens(text_ids)
 
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for layer in self.layers:
+        for layer in self.layers[self.start_layer : self.end_layer]:
             hidden, k, v = layer(hidden, freqs)
             cached_kv.append((k, v))
 
@@ -372,7 +373,9 @@ class Cosmos3EdgeVFMTransformer(Cosmos3VFMTransformer):
 
     def validate_loaded_weights(self, loaded: set[str]) -> None:
         missing: list[str] = []
-        for layer_idx in range(self.num_hidden_layers):
+        start_layer = getattr(self, "start_layer", 0)
+        end_layer = getattr(self, "end_layer", self.num_hidden_layers)
+        for layer_idx in range(start_layer, end_layer):
             required_markers = (
                 f"language_model.layers.{layer_idx}.mlp.up_proj.",
                 f"language_model.layers.{layer_idx}.mlp.down_proj.",

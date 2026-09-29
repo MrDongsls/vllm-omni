@@ -17,7 +17,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 @pytest.fixture(autouse=True)
 def _single_rank_tensor_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Provide the TP metadata required by vLLM parallel linear layers."""
+    """Provide the TP/PP metadata required by vLLM layer construction."""
+    from vllm.distributed import parallel_state as vllm_parallel_state
     from vllm.model_executor import parameter
     from vllm.model_executor.layers import linear
 
@@ -32,6 +33,15 @@ def _single_rank_tensor_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(transformer_cosmos3, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(transformer_cosmos3_edge, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(transformer_cosmos3, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(transformer_cosmos3, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(transformer_cosmos3_edge, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(transformer_cosmos3_edge, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(
+        vllm_parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
 
 
 @pytest.fixture
@@ -73,6 +83,138 @@ def _tiny_cosmos3_edge_config(**overrides):
     )
     config.update(overrides)
     return config
+
+
+@pytest.mark.parametrize("world_size, rank", [(1, 0), (2, 0), (2, 1), (4, 0), (4, 1), (4, 2), (4, 3)])
+@pytest.mark.parametrize("edge", [False, True], ids=["standard", "edge"])
+def test_transformer_delegates_matching_und_gen_ranges_to_framework(
+    monkeypatch: pytest.MonkeyPatch,
+    world_size: int,
+    rank: int,
+    edge: bool,
+) -> None:
+    from vllm.distributed import parallel_state as vllm_parallel_state
+    from vllm.distributed.utils import get_pp_indices
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import Cosmos3EdgeVFMTransformer
+
+    pp_group = SimpleNamespace(rank_in_group=rank, world_size=world_size)
+    monkeypatch.setattr(vllm_parallel_state, "get_pp_group", lambda: pp_group)
+    num_layers = 5  # Deliberately not divisible by PP=2 or PP=4.
+    transformer_cls = Cosmos3EdgeVFMTransformer if edge else Cosmos3VFMTransformer
+    config = (
+        _tiny_cosmos3_edge_config(num_hidden_layers=num_layers)
+        if edge
+        else _tiny_cosmos3_config(num_hidden_layers=num_layers)
+    )
+
+    model = transformer_cls(SimpleNamespace(tf_model_config=config, dtype=torch.float32))
+
+    expected = get_pp_indices(num_layers, rank, world_size)
+    assert (model.start_layer, model.end_layer) == expected
+    assert (model.language_model.start_layer, model.language_model.end_layer) == expected
+    for layer_index in range(num_layers):
+        owns_layer = expected[0] <= layer_index < expected[1]
+        assert isinstance(model.language_model.layers[layer_index], PPMissingLayer) is not owns_layer
+        assert isinstance(model.gen_layers[layer_index], PPMissingLayer) is not owns_layer
+        layer_prefixes = (
+            f"language_model.layers.{layer_index}.",
+            f"gen_layers.{layer_index}.",
+        )
+        has_layer_state = any(name.startswith(layer_prefixes) for name in model.state_dict())
+        assert has_layer_state is owns_layer
+
+
+@pytest.mark.parametrize("world_size, rank", [(1, 0), (3, 0), (3, 1), (3, 2)])
+@pytest.mark.parametrize("edge", [False, True], ids=["standard", "edge"])
+def test_transformer_places_boundary_modules_on_owning_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    world_size: int,
+    rank: int,
+    edge: bool,
+) -> None:
+    from vllm.distributed import parallel_state as vllm_parallel_state
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3, transformer_cosmos3_edge
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import Cosmos3EdgeVFMTransformer
+
+    pp_group = SimpleNamespace(rank_in_group=rank, world_size=world_size)
+    monkeypatch.setattr(vllm_parallel_state, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(transformer_cosmos3, "is_pipeline_first_stage", lambda: rank == 0)
+    monkeypatch.setattr(transformer_cosmos3, "is_pipeline_last_stage", lambda: rank == world_size - 1)
+    monkeypatch.setattr(transformer_cosmos3_edge, "is_pipeline_first_stage", lambda: rank == 0)
+    monkeypatch.setattr(transformer_cosmos3_edge, "is_pipeline_last_stage", lambda: rank == world_size - 1)
+    transformer_cls = Cosmos3EdgeVFMTransformer if edge else Cosmos3VFMTransformer
+    config_factory = _tiny_cosmos3_edge_config if edge else _tiny_cosmos3_config
+    model = transformer_cls(
+        SimpleNamespace(
+            tf_model_config=config_factory(
+                num_hidden_layers=3,
+                action_gen=True,
+                max_action_dim=3,
+                num_embodiment_domains=4,
+            ),
+            dtype=torch.float32,
+        ),
+        sound_gen=True,
+        sound_dim=2,
+        sound_latent_fps=24.0,
+    )
+
+    first_owned = (
+        model.language_model.embed_tokens,
+        model.proj_in,
+        model.time_embedder,
+        model.action_proj_in,
+        model.audio_proj_in,
+        model.gen_sp_prepare,
+    )
+    last_owned = (
+        model.language_model.norm,
+        model.norm_moe_gen,
+        model.proj_out,
+        model.action_proj_out,
+        model.audio_proj_out,
+        model.gen_sp_gather,
+    )
+    assert all(not isinstance(module, PPMissingLayer) for module in first_owned) is (rank == 0)
+    assert all(not isinstance(module, PPMissingLayer) for module in last_owned) is (rank == world_size - 1)
+    assert (model.action_modality_embed is not None) is (rank == 0)
+    assert (model.audio_modality_embed is not None) is (rank == 0)
+    expected_sound_markers: tuple[str, ...] = ()
+    expected_action_markers: tuple[str, ...] = ()
+    if rank == 0:
+        expected_sound_markers += ("audio_proj_in.", "audio_modality_embed")
+        expected_action_markers += ("action_proj_in.", "action_modality_embed")
+    if rank == world_size - 1:
+        expected_sound_markers += ("audio_proj_out.",)
+        expected_action_markers += ("action_proj_out.",)
+    assert model.required_sound_weight_markers() == expected_sound_markers
+    assert model.required_action_weight_markers() == expected_action_markers
+
+    state_names = set(model.state_dict())
+    first_prefixes = (
+        "language_model.embed_tokens.",
+        "proj_in.",
+        "time_embedder.",
+        "action_proj_in.",
+        "audio_proj_in.",
+        "action_modality_embed",
+        "audio_modality_embed",
+    )
+    last_prefixes = (
+        "language_model.norm.",
+        "norm_moe_gen.",
+        "proj_out.",
+        "action_proj_out.",
+        "audio_proj_out.",
+    )
+    assert any(name.startswith(first_prefixes) for name in state_names) is (rank == 0)
+    assert any(name.startswith(last_prefixes) for name in state_names) is (rank == world_size - 1)
 
 
 @pytest.mark.parametrize(
@@ -532,6 +674,27 @@ def test_edge_validates_required_relu2_weights() -> None:
 
     model.use_und_k_norm_for_gen = False
     model.validate_loaded_weights(missing_k_norm)
+
+
+def test_edge_weight_validation_checks_only_local_global_layer_indices() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import Cosmos3EdgeVFMTransformer
+
+    model = object.__new__(Cosmos3EdgeVFMTransformer)
+    nn.Module.__init__(model)
+    model.num_hidden_layers = 4
+    model.start_layer = 2
+    model.end_layer = 3
+    model.use_und_k_norm_for_gen = False
+    local = {
+        "transformer.language_model.layers.2.mlp.up_proj.weight",
+        "transformer.language_model.layers.2.mlp.down_proj.weight",
+        "transformer.gen_layers.2.mlp.up_proj.weight",
+        "transformer.gen_layers.2.mlp.down_proj.weight",
+    }
+
+    model.validate_loaded_weights(local)
+    with pytest.raises(ValueError, match=r"gen_layers\.2\.mlp\.down_proj"):
+        model.validate_loaded_weights(local - {"transformer.gen_layers.2.mlp.down_proj.weight"})
 
 
 def test_edge_gen_cached_k_is_normalized_but_reasoner_uses_raw_k() -> None:

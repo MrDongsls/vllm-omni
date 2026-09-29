@@ -30,11 +30,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.model_executor.models.utils import PPMissingLayer, make_layers
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
@@ -1087,29 +1089,28 @@ class Cosmos3LanguageModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size) if is_pipeline_first_stage() else PPMissingLayer()
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(
             head_dim=head_dim,
             rope_theta=rope_theta,
             mrope_section=mrope_section,
         )
-        self.layers = nn.ModuleList(
-            [
-                Cosmos3UndDecoderLayer(
-                    hidden_size=hidden_size,
-                    intermediate_size=intermediate_size,
-                    num_attention_heads=num_attention_heads,
-                    num_key_value_heads=num_key_value_heads,
-                    head_dim=head_dim,
-                    rms_norm_eps=rms_norm_eps,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.layers.{i}",
-                )
-                for i in range(num_hidden_layers)
-            ]
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            num_hidden_layers,
+            lambda prefix: Cosmos3UndDecoderLayer(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                quant_config=quant_config,
+                prefix=prefix,
+            ),
+            prefix=f"{prefix}.layers",
         )
         # TODO: Not used right now, will be used in the future for prompt upsampler.
-        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps) if is_pipeline_last_stage() else PPMissingLayer()
 
     def forward(
         self,
@@ -1131,7 +1132,7 @@ class Cosmos3LanguageModel(nn.Module):
         hidden = self.embed_tokens(text_ids)
 
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for layer in self.layers:
+        for layer in self.layers[self.start_layer : self.end_layer]:
             hidden, k, v = layer(hidden, freqs)
             cached_kv.append((k, v))
 
@@ -1277,6 +1278,22 @@ class Cosmos3VFMTransformer(nn.Module):
     def validate_loaded_weights(self, loaded: set[str]) -> None:
         del loaded
 
+    def required_sound_weight_markers(self) -> tuple[str, ...]:
+        markers: list[str] = []
+        if self.sound_gen and not isinstance(self.audio_proj_in, PPMissingLayer):
+            markers.extend(("audio_proj_in.", "audio_modality_embed"))
+        if self.sound_gen and not isinstance(self.audio_proj_out, PPMissingLayer):
+            markers.append("audio_proj_out.")
+        return tuple(markers)
+
+    def required_action_weight_markers(self) -> tuple[str, ...]:
+        markers: list[str] = []
+        if self.action_gen and not isinstance(self.action_proj_in, PPMissingLayer):
+            markers.extend(("action_proj_in.", "action_modality_embed"))
+        if self.action_gen and not isinstance(self.action_proj_out, PPMissingLayer):
+            markers.append("action_proj_out.")
+        return tuple(markers)
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
@@ -1377,55 +1394,85 @@ class Cosmos3VFMTransformer(nn.Module):
         )
 
         # Video projection layers are small; not worth quantizing.
-        self.proj_in = nn.Linear(self.patch_latent_dim, self.hidden_size)
-        self.proj_out = nn.Linear(self.hidden_size, self.patch_latent_dim)
-        self.time_embedder = TimestepEmbedder(self.hidden_size)
-        if self.action_gen:
-            self.action_proj_in = DomainAwareLinear(
-                self.action_dim,
-                self.hidden_size,
-                self.num_embodiment_domains,
-                dtype=dtype,
-            )
-            self.action_proj_out = DomainAwareLinear(
-                self.hidden_size,
-                self.action_dim,
-                self.num_embodiment_domains,
-                dtype=dtype,
-            )
-            self.action_modality_embed = nn.Parameter(torch.zeros(self.hidden_size, dtype=dtype))
-        if self.sound_gen:
-            self.audio_proj_in = nn.Linear(self.sound_dim, self.hidden_size)
-            self.audio_proj_out = nn.Linear(self.hidden_size, self.sound_dim)
-            self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
-
-        self.gen_layers = nn.ModuleList(
-            [
-                Cosmos3GenDecoderLayer(
-                    layer_idx=i,
-                    hidden_size=self.hidden_size,
-                    intermediate_size=self.intermediate_size,
-                    num_attention_heads=self.num_attention_heads,
-                    num_key_value_heads=self.num_key_value_heads,
-                    head_dim=self.head_dim,
-                    rms_norm_eps=self.rms_norm_eps,
-                    quant_config=gen_layers_quant_config,
-                    mlp_cls=self._gen_mlp_cls,
-                    qk_norm=self.qk_norm_for_diffusion,
-                    prefix=f"gen_layers.{i}",
-                )
-                for i in range(self.num_hidden_layers)
-            ]
+        self.proj_in = (
+            nn.Linear(self.patch_latent_dim, self.hidden_size) if is_pipeline_first_stage() else PPMissingLayer()
         )
+        self.proj_out = (
+            nn.Linear(self.hidden_size, self.patch_latent_dim) if is_pipeline_last_stage() else PPMissingLayer()
+        )
+        self.time_embedder = TimestepEmbedder(self.hidden_size) if is_pipeline_first_stage() else PPMissingLayer()
+        if self.action_gen:
+            self.action_proj_in = (
+                DomainAwareLinear(
+                    self.action_dim,
+                    self.hidden_size,
+                    self.num_embodiment_domains,
+                    dtype=dtype,
+                )
+                if is_pipeline_first_stage()
+                else PPMissingLayer()
+            )
+            self.action_proj_out = (
+                DomainAwareLinear(
+                    self.hidden_size,
+                    self.action_dim,
+                    self.num_embodiment_domains,
+                    dtype=dtype,
+                )
+                if is_pipeline_last_stage()
+                else PPMissingLayer()
+            )
+            if is_pipeline_first_stage():
+                self.action_modality_embed = nn.Parameter(torch.zeros(self.hidden_size, dtype=dtype))
+            else:
+                self.register_parameter("action_modality_embed", None)
+        if self.sound_gen:
+            self.audio_proj_in = (
+                nn.Linear(self.sound_dim, self.hidden_size) if is_pipeline_first_stage() else PPMissingLayer()
+            )
+            self.audio_proj_out = (
+                nn.Linear(self.hidden_size, self.sound_dim) if is_pipeline_last_stage() else PPMissingLayer()
+            )
+            if is_pipeline_first_stage():
+                self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
+            else:
+                self.register_parameter("audio_modality_embed", None)
+
+        self.start_layer, self.end_layer, self.gen_layers = make_layers(
+            self.num_hidden_layers,
+            lambda prefix: Cosmos3GenDecoderLayer(
+                layer_idx=int(prefix.rsplit(".", 1)[-1]),
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                rms_norm_eps=self.rms_norm_eps,
+                quant_config=gen_layers_quant_config,
+                mlp_cls=self._gen_mlp_cls,
+                qk_norm=self.qk_norm_for_diffusion,
+                prefix=prefix,
+            ),
+            prefix="gen_layers",
+        )
+        language_start = getattr(self.language_model, "start_layer", self.start_layer)
+        language_end = getattr(self.language_model, "end_layer", self.end_layer)
+        if (language_start, language_end) != (self.start_layer, self.end_layer):
+            raise RuntimeError(
+                "Cosmos3 requires matching framework-assigned UND and GEN pipeline ranges: "
+                f"UND=[{language_start}, {language_end}), GEN=[{self.start_layer}, {self.end_layer})."
+            )
 
         self.mixed_precision_runtime: Cosmos3MixedPrecisionRuntime | None = None
         if mixed_precision_config is not None:
             self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(mixed_precision_config)
             self.mixed_precision_runtime.install(self)
 
-        self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
-        self.gen_sp_prepare = Cosmos3GenSPPrepare()
-        self.gen_sp_gather = nn.Identity()
+        self.norm_moe_gen = (
+            RMSNorm(self.hidden_size, eps=self.rms_norm_eps) if is_pipeline_last_stage() else PPMissingLayer()
+        )
+        self.gen_sp_prepare = Cosmos3GenSPPrepare() if is_pipeline_first_stage() else PPMissingLayer()
+        self.gen_sp_gather = nn.Identity() if is_pipeline_last_stage() else PPMissingLayer()
 
         # Cached state (populated on first forward, reused across denoising steps)
         self.cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None

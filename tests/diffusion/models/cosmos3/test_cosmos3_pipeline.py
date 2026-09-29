@@ -253,6 +253,19 @@ def passthrough_progress_bar(iterable):
 
 @pytest.fixture(autouse=True)
 def fake_cosmos3_guardrails(monkeypatch: pytest.MonkeyPatch):
+    from vllm.distributed import parallel_state as vllm_parallel_state
+
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3, transformer_cosmos3_edge
+
+    monkeypatch.setattr(
+        vllm_parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+    monkeypatch.setattr(transformer_cosmos3, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(transformer_cosmos3, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(transformer_cosmos3_edge, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(transformer_cosmos3_edge, "is_pipeline_last_stage", lambda: True)
     module: Any = types.ModuleType("vllm_omni.diffusion.models.cosmos3.guardrails")
     module.is_guardrails_enabled = lambda od_config, sampling_params=None: False
     module.ensure_initialized = lambda od_config: None
