@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
@@ -93,6 +96,11 @@ class GroupCoordinator:
     rank_in_group: int  # rank inside the group
     cpu_group: ProcessGroup  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
+    # Pipeline parallelism with two stages uses separate groups for each
+    # communication direction. These attributes are initialized by the
+    # pipeline coordinator only.
+    cpu_groups: list[ProcessGroup]
+    device_groups: list[ProcessGroup]
 
     def __init__(
         self,
@@ -332,10 +340,15 @@ class GroupCoordinator:
 
         # Send object size
 
-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        cpu_group = (
+            self.cpu_groups[self.rank_in_group % 2]
+            if self.world_size == 2 and getattr(self, "cpu_groups", None)
+            else self.cpu_group
+        )
+        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=cpu_group)
 
         # Send object
-        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=cpu_group)
 
         return None
 
@@ -350,7 +363,12 @@ class GroupCoordinator:
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
         # Receive object size
-        rank_size = torch.distributed.recv(size_tensor, src=self.ranks[src], group=self.cpu_group)
+        cpu_group = (
+            self.cpu_groups[(self.rank_in_group + 1) % 2]
+            if self.world_size == 2 and getattr(self, "cpu_groups", None)
+            else self.cpu_group
+        )
+        rank_size = torch.distributed.recv(size_tensor, src=self.ranks[src], group=cpu_group)
 
         # Tensor to receive serialized objects into.
         object_tensor = torch.empty(  # type: ignore[call-overload]
@@ -359,7 +377,7 @@ class GroupCoordinator:
             device="cpu",
         )
 
-        rank_object = torch.distributed.recv(object_tensor, src=self.ranks[src], group=self.cpu_group)
+        rank_object = torch.distributed.recv(object_tensor, src=self.ranks[src], group=cpu_group)
 
         assert rank_object == rank_size, "Received object sender rank does not match the size sender rank."
 
@@ -464,7 +482,12 @@ class GroupCoordinator:
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 continue
-            group = self.cpu_group if tensor.is_cpu else self.device_group
+            groups = getattr(self, "cpu_groups" if tensor.is_cpu else "device_groups", None)
+            group = (
+                groups[self.rank_in_group % 2]
+                if self.world_size == 2 and groups
+                else (self.cpu_group if tensor.is_cpu else self.device_group)
+            )
             handle = torch.distributed.isend(tensor, dst=self.ranks[dst], group=group)
             if tensor.is_cuda:
                 # Keep allocator from reusing this CUDA buffer before the async send finishes.
@@ -500,7 +523,12 @@ class GroupCoordinator:
             if isinstance(value, TensorMetadata):
                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
                 if tensor.numel() > 0:
-                    group = self.cpu_group if tensor.is_cpu else self.device_group
+                    groups = getattr(self, "cpu_groups" if tensor.is_cpu else "device_groups", None)
+                    group = (
+                        groups[(self.rank_in_group + 1) % 2]
+                        if self.world_size == 2 and groups
+                        else (self.cpu_group if tensor.is_cpu else self.device_group)
+                    )
                     handles.append(torch.distributed.irecv(tensor, src=self.ranks[src], group=group))
                 _update_nested_dict(tensor_dict, key, tensor)
             else:
@@ -696,12 +724,13 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         self.recv_shape: dict[str, dict[int, torch.Size]] = {}
         self.send_shape: dict[str, dict[int, torch.Size]] = {}
-        self.recv_buffer: dict[str, dict[int, torch.Size]] = {}
+        self.recv_buffer: dict[str, dict[int, torch.Tensor]] | list[torch.Tensor] = {}
+        self.extra_tensors_recv_buffer: dict[str, list[torch.Tensor]] = {}
 
         self.skip_tensor_recv_buffer_set: bool = False
-        self.recv_skip_tasks_queue: list[int | tuple[str, int]] = []
-        self.receiving_skip_tasks: list[tuple[torch.distributed.Work, str, int]] = []
-        self.skip_tensor_recv_buffer: list[torch.Tensor] | torch.Tensor | None = None
+        self.recv_skip_tasks_queue: list[int] = []
+        self.receiving_skip_tasks: list[tuple[torch.distributed.Work, str | None, int]] = []
+        self.skip_tensor_recv_buffer: list[torch.Tensor] | None = None
         self.skip_device_group = None
         for ranks in group_ranks:
             skip_device_group = torch.distributed.new_group(ranks, backend=torch_distributed_backend)
@@ -734,7 +763,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         self.recv_skip_tasks_queue = []
         self.receiving_skip_tasks = []
-        self.skip_tensor_recv_buffer = {}
+        self.skip_tensor_recv_buffer = []
 
     def set_config(self, dtype: torch.dtype):
         self.dtype = dtype
@@ -752,8 +781,9 @@ class PipelineGroupCoordinator(GroupCoordinator):
         )
         self.dtype = dtype
         self.num_pipefusion_patches = num_pipefusion_patches
-        self.recv_buffer = [torch.zeros(*shape, dtype=self.dtype, device=self.device) for shape in patches_shape_list]
-        self.recv_buffer.append(torch.zeros(*feature_map_shape, dtype=self.dtype, device=self.device))
+        recv_buffer = [torch.zeros(*shape, dtype=self.dtype, device=self.device) for shape in patches_shape_list]
+        recv_buffer.append(torch.zeros(*feature_map_shape, dtype=self.dtype, device=self.device))
+        self.recv_buffer = recv_buffer
         self.recv_buffer_set = True
 
     def set_extra_tensors_recv_buffer(
@@ -774,6 +804,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         name: str | None = None,
         segment_idx: int = 0,
     ):
+        assert isinstance(self.recv_buffer, dict)
         send_flag = False
         name = name or "latent"
         if tensor_send_to_next is not None:
@@ -903,6 +934,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
     def pipeline_recv(self, idx: int = -1, name: str = "latent") -> torch.Tensor:
         name = name or "latent"
         self._check_shape_and_buffer(recv_prev=True, name=name, segment_idx=idx)
+        assert isinstance(self.recv_buffer, dict)
         self._pipeline_irecv(self.recv_buffer[name][idx]).wait()
         return self.recv_buffer[name][idx]
 
@@ -916,6 +948,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         elif len(self.recv_tasks_queue) > 0:
             name, idx = self.recv_tasks_queue.pop(0)
             self._check_shape_and_buffer(recv_prev=True, name=name, segment_idx=idx)
+            assert isinstance(self.recv_buffer, dict)
             self.receiving_tasks.append((self._pipeline_irecv(self.recv_buffer[name][idx]), name, idx))
 
     def get_pipeline_recv_data(self, idx: int = -1, name: str = "latent") -> torch.Tensor:
@@ -923,6 +956,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         receiving_task = self.receiving_tasks.pop(0)
         receiving_task[0].wait()
         assert receiving_task[1] == name and receiving_task[2] == idx, "Received tensor does not match the requested"
+        assert isinstance(self.recv_buffer, dict)
         return self.recv_buffer[name][idx]
 
     def _pipeline_irecv(self, tensor: torch.tensor):
@@ -959,6 +993,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self._pipeline_isend_skip(tensor)
 
     def pipeline_recv_skip(self, idx: int = -1) -> torch.Tensor:
+        assert self.skip_tensor_recv_buffer is not None
         self._pipeline_irecv_skip(self.skip_tensor_recv_buffer[idx]).wait()
         return self.skip_tensor_recv_buffer[idx]
 
@@ -970,6 +1005,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         receiving_skip_task = self.receiving_skip_tasks.pop(0)
         receiving_skip_task[0].wait()
         assert receiving_skip_task[2] == idx, "Received tensor does not match the requested"
+        assert self.skip_tensor_recv_buffer is not None
         return self.skip_tensor_recv_buffer[idx]
 
     def recv_skip_next(self):
@@ -978,6 +1014,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         elif len(self.recv_skip_tasks_queue) > 0:
             task = self.recv_skip_tasks_queue.pop(0)
             idx = task
+            assert self.skip_tensor_recv_buffer is not None
             self.receiving_skip_tasks.append(
                 (
                     self._pipeline_irecv_skip(self.skip_tensor_recv_buffer[idx]),
