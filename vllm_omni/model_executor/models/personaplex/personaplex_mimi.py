@@ -53,7 +53,13 @@ def _normalize_active(active: torch.Tensor | None, all_active: torch.Tensor) -> 
         return all_active
     if active.shape != all_active.shape:
         raise ValueError(f"active must have shape {tuple(all_active.shape)}, got {tuple(active.shape)}")
-    return active.to(device=all_active.device, dtype=torch.bool)
+    if active.dtype != torch.bool:
+        raise TypeError(f"active must have dtype torch.bool, got {active.dtype}")
+    if active.device != all_active.device:
+        raise ValueError(f"active must be on {all_active.device}, got {active.device}")
+    if not active.is_contiguous():
+        raise ValueError("active must be contiguous")
+    return active
 
 
 def _map_moshi_codec_weights(
@@ -122,22 +128,28 @@ class _StreamConv1d:
         self.prev = torch.zeros(batch_size, self.conv.in_channels, pad, device=device, dtype=dtype)
         self._fresh = torch.ones(batch_size, dtype=torch.bool, device=device)
 
+    def reset_all(self) -> None:
+        """Reset every row without reallocating the streaming state."""
+        self.prev.zero_()
+        self._fresh.fill_(True)
+
     def reset_slot(self, b: int) -> None:
         self.prev[b].zero_()
         self._fresh[b] = True
 
     def __call__(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        active_view = active.view(-1, 1, 1)
         if self.pad_mode == "replicate":
             pad = self.prev.shape[-1]
             edge = x[..., 0:1].expand(-1, -1, pad)
             fresh = (self._fresh & active).view(-1, 1, 1)
-            self.prev = torch.where(fresh, edge.to(self.prev.dtype), self.prev)
-        self._fresh[active] = False
+            self.prev.copy_(torch.where(fresh, edge.to(self.prev.dtype), self.prev))
+        self._fresh.logical_and_(~active)
         x = torch.cat([self.prev, x], dim=-1)
         t = x.shape[-1]
         num_frames = max(0, (t - self.kernel) // self.stride + 1)
         prev = x[..., num_frames * self.stride :]
-        self.prev = torch.where(active.view(-1, 1, 1), prev, self.prev)
+        self.prev.copy_(torch.where(active_view, prev, self.prev))
         if num_frames == 0:
             return x.new_zeros(x.shape[0], self.conv.out_channels, 0)
         return self.conv(x[..., : (num_frames - 1) * self.stride + self.kernel])
@@ -159,6 +171,11 @@ class _StreamConvTr1d:
         )
         self._fresh = torch.ones(batch_size, dtype=torch.bool, device=device)
 
+    def reset_all(self) -> None:
+        """Reset every row without reallocating the streaming state."""
+        self.partial.zero_()
+        self._fresh.fill_(True)
+
     def reset_slot(self, b: int) -> None:
         self.partial[b].zero_()
         self._fresh[b] = True
@@ -168,17 +185,18 @@ class _StreamConvTr1d:
         length = out.shape[-1]
         tail = self.kernel - self.stride
         pt = self.partial.shape[-1]
-        merge = self.partial.clone()
+        merge = self.partial
         if self.conv.bias is not None:
             # The carried tail already includes the bias; the fresh output adds
             # it again, so subtract one copy -- except on a row's very first
             # frame, where the carry is zeros by construction.
             merge = merge - self.conv.bias[:, None]
-            merge[self._fresh & active] = 0.0
-            self._fresh[active] = False
+            first = (self._fresh & active).view(-1, 1, 1)
+            merge = torch.where(first, torch.zeros_like(merge), merge)
+            self._fresh.logical_and_(~active)
         out[..., :pt] += merge
         partial = out[..., length - tail :].clone()
-        self.partial = torch.where(active.view(-1, 1, 1), partial, self.partial)
+        self.partial.copy_(torch.where(active.view(-1, 1, 1), partial, self.partial))
         return out[..., : length - tail]
 
 
@@ -237,6 +255,9 @@ class _MimiStreamingTransformer(nn.Module):
         self._offset: torch.Tensor | None = None
 
     def streaming_init(self, batch_size: int) -> None:
+        if self._offset is not None and self._offset.shape == (batch_size,):
+            self.reset_streaming()
+            return
         p = next(self.parameters())
         heads = self.layers[0].num_heads
         hd = self.layers[0].head_dim
@@ -380,6 +401,9 @@ class PersonaPlexMimiCodec(nn.Module):
         yield self._upsample
 
     def streaming_init(self, batch_size: int) -> None:
+        if self._batch_size == batch_size:
+            self.reset_streaming()
+            return
         self._batch_size = batch_size
         self._all_active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
         for s in self._conv_states():
@@ -390,8 +414,7 @@ class PersonaPlexMimiCodec(nn.Module):
     def reset_streaming(self) -> None:
         assert self._batch_size is not None
         for state in self._conv_states():
-            for b in range(self._batch_size):
-                state.reset_slot(b)
+            state.reset_all()
         self.encoder_transformer.reset_streaming()
         self.decoder_transformer.reset_streaming()
 
