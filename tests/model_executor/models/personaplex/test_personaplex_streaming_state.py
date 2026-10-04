@@ -9,6 +9,7 @@ import torch.nn as nn
 from pytest_mock import MockerFixture
 
 from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
+    FRAME_SIZE,
     PersonaPlexMimiCodec,
     _MimiStreamingTransformer,
     _StreamConv1d,
@@ -155,6 +156,48 @@ def test_mimi_codec_entrypoints_forward_active_mask(mocker: MockerFixture) -> No
     )
 
 
+def test_mimi_streaming_tensor_decode_pads_lengths_and_masks_invalid_rows(mocker: MockerFixture) -> None:
+    codec = _make_codec_stub(mocker)
+    codec.streaming_init(batch_size=3)
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def decode_frame(
+        codes: torch.Tensor,
+        active: torch.Tensor,
+        state_slot_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        del codes
+        calls.append((active.clone(), state_slot_ids.clone()))
+        values = (state_slot_ids + 1).to(torch.float32).view(-1, 1)
+        return values.expand(-1, FRAME_SIZE)
+
+    mocker.patch.object(codec, "decode_frame", side_effect=decode_frame)
+    codes = torch.zeros(8, 3, 3, dtype=torch.long)
+    codes_lengths = torch.tensor([1, 3, 2], dtype=torch.long)
+    state_slot_ids = torch.tensor([2, 0, 1], dtype=torch.long)
+    valid_rows = torch.tensor([True, False, True], dtype=torch.bool)
+
+    audio, audio_lengths = codec.decode_streaming_tensors(
+        codes,
+        codes_lengths,
+        state_slot_ids,
+        valid_rows,
+    )
+
+    assert audio.shape == (3, 3 * FRAME_SIZE)
+    expected = torch.zeros_like(audio)
+    expected[0, :FRAME_SIZE] = 3
+    expected[2, : 2 * FRAME_SIZE] = 2
+    torch.testing.assert_close(audio, expected)
+    assert torch.equal(audio_lengths, torch.tensor([1920, 0, 3840]))
+    assert [active.tolist() for active, _ in calls] == [
+        [True, False, True],
+        [False, False, True],
+        [False, False, False],
+    ]
+    assert all(torch.equal(slots, state_slot_ids) for _, slots in calls)
+
+
 @pytest.mark.cpu
 def test_mimi_codec_same_batch_streaming_init_reuses_state(mocker: MockerFixture) -> None:
     codec = _make_codec_stub(mocker)
@@ -227,6 +270,72 @@ def test_mimi_transformer_same_batch_streaming_init_reuses_ring_state() -> None:
     for kv in transformer._kv:
         assert torch.count_nonzero(kv.end_offset) == 0
         assert torch.count_nonzero(kv.start_offset) == 0
+
+
+def test_mimi_transformer_state_slots_match_singleton_streams() -> None:
+    device = torch.device("cpu")
+    pooled = _make_mimi_transformer(3, device)
+    references = [_make_mimi_transformer(1, device) for _ in range(3)]
+
+    schedules = [
+        (torch.tensor([2, 0]), _inputs((2, 1, 32), 10, device), _mask(True, True)),
+        (torch.tensor([1, 2]), _inputs((2, 1, 32), 11, device), _mask(True, False)),
+    ]
+    for slots, inputs, active in schedules:
+        output = pooled.step(inputs, active, state_slot_ids=slots)
+        for row, (slot, is_active) in enumerate(zip(slots.tolist(), active.tolist())):
+            if is_active:
+                expected = references[slot].step(inputs[row : row + 1], _mask(True))
+                torch.testing.assert_close(output[row : row + 1], expected, rtol=1e-5, atol=1e-6)
+            else:
+                expected_offset = references[slot]._offset.clone()
+                torch.testing.assert_close(pooled._offset[slot], expected_offset[0], rtol=1e-5, atol=1e-6)
+
+    for slot, reference in enumerate(references):
+        assert torch.equal(pooled._offset[slot], reference._offset[0])
+        for pooled_kv, reference_kv in zip(pooled._kv, reference._kv):
+            torch.testing.assert_close(
+                pooled_kv.cache[:, slot],
+                reference_kv.cache[:, 0],
+                rtol=1e-5,
+                atol=1e-6,
+            )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mimi_transformer_state_slots_match_singletons_cuda() -> None:
+    pooled = _make_mimi_transformer(3, CUDA_DEVICE)
+    references = [_make_mimi_transformer(2, CUDA_DEVICE) for _ in range(3)]
+    reference_active = _mask(True, False, device=CUDA_DEVICE)
+    schedules = [
+        (
+            torch.tensor([2, 0], device=CUDA_DEVICE),
+            _inputs((2, 1, 32), 10, CUDA_DEVICE),
+            _mask(True, True, device=CUDA_DEVICE),
+        ),
+        (
+            torch.tensor([1, 2], device=CUDA_DEVICE),
+            _inputs((2, 1, 32), 11, CUDA_DEVICE),
+            _mask(True, False, device=CUDA_DEVICE),
+        ),
+    ]
+
+    for slots, inputs, active in schedules:
+        output = pooled.step(inputs, active, state_slot_ids=slots)
+        for row, (slot, is_active) in enumerate(zip(slots.tolist(), active.tolist())):
+            if is_active:
+                reference_inputs = torch.zeros_like(inputs)
+                reference_inputs[0].copy_(inputs[row])
+                expected = references[slot].step(reference_inputs, reference_active)
+                torch.testing.assert_close(output[row : row + 1], expected[:1], rtol=0.0, atol=0.0)
+            else:
+                assert torch.equal(pooled._offset[slot], references[slot]._offset[0])
+
+    for slot, reference in enumerate(references):
+        assert torch.equal(pooled._offset[slot], reference._offset[0])
+        for pooled_kv, reference_kv in zip(pooled._kv, reference._kv):
+            assert torch.equal(pooled_kv.cache[:, slot], reference_kv.cache[:, 0])
 
 
 @pytest.mark.cpu

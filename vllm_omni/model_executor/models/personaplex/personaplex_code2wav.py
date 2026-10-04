@@ -197,6 +197,19 @@ class PersonaPlexCode2Wav(nn.Module):
 
         k = int(self._num_codebooks)
         device = self._mimi_device or ids.device
+        delta_audios = self._decode_delta_batch(
+            request_ids_list,
+            state_ids,
+            runtime_additional_information,
+            k=k,
+            device=device,
+        )
+        if delta_audios is not None:
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={"model_outputs": delta_audios, "sr": [sr_tensor] * num_req},
+            )
+
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
 
@@ -263,6 +276,80 @@ class PersonaPlexCode2Wav(nn.Module):
             resolved.append(str(request_id) if request_id is not None else None)
         return resolved
 
+    @staticmethod
+    def _is_delta_runtime_info(runtime_info: Mapping[str, Any] | None) -> bool:
+        if not isinstance(runtime_info, Mapping):
+            return False
+        meta = runtime_info.get("meta")
+        return isinstance(meta, Mapping) and meta.get("personaplex_codes_delta") is True
+
+    def _decode_delta_batch(
+        self,
+        request_ids_list: list[torch.Tensor],
+        state_ids: list[str | None],
+        runtime_additional_information: list[dict[str, Any]] | None,
+        *,
+        k: int,
+        device: torch.device,
+    ) -> list[torch.Tensor] | None:
+        """Decode explicit delta payloads through one leased codec state pool."""
+        codecs = self._mimi_codecs()
+        if len(codecs) != 1 or not callable(getattr(codecs[0], "decode_streaming_tensors", None)):
+            return None
+        if runtime_additional_information is None or len(runtime_additional_information) < len(request_ids_list):
+            return None
+        if any(
+            state_id is None or not self._is_delta_runtime_info(runtime_additional_information[index])
+            for index, state_id in enumerate(state_ids)
+        ):
+            return None
+
+        flats: list[torch.Tensor] = []
+        frame_counts: list[int] = []
+        for index, request_ids in enumerate(request_ids_list):
+            flat = _codec_ids_from_payload_or_input(request_ids, runtime_additional_information[index])
+            count = int(flat.numel())
+            if count == 0 or count % k != 0:
+                return None
+            flats.append(flat)
+            frame_counts.append(count // k)
+
+        request_keys = [state_id for state_id in state_ids if state_id is not None]
+        if len(set(request_keys)) != len(request_keys):
+            raise ValueError("PersonaPlex Code2Wav request ids must be unique within one decode batch")
+        new_requests = {state_id for state_id in request_keys if state_id not in self._request_codec_slots}
+        free_slots = self._max_codec_sessions - len(self._request_codec_slots)
+        if len(new_requests) > free_slots:
+            raise RuntimeError(f"decoder capacity {self._max_codec_sessions} is exhausted")
+
+        slots: list[int] = []
+        for state_id in request_keys:
+            codec, ephemeral = self._codec_for_request(state_id)
+            if ephemeral or codec is not codecs[0]:
+                raise RuntimeError("PersonaPlex delta batch requires a persistent pooled codec")
+            slots.append(self._request_codec_slots[state_id])
+
+        batch_size = len(flats)
+        max_frames = max(frame_counts)
+        codes = torch.zeros((k, batch_size, max_frames), dtype=torch.long, device=device)
+        for row, (flat, frames) in enumerate(zip(flats, frame_counts)):
+            codes[:, row, :frames].copy_(flat.to(device=device, dtype=torch.long).view(k, frames))
+        codes_lengths = torch.tensor(frame_counts, dtype=torch.long, device=device)
+        state_slot_ids = torch.tensor(slots, dtype=torch.long, device=device)
+        valid_rows = torch.ones(batch_size, dtype=torch.bool, device=device)
+        audio, _ = codecs[0].decode_streaming_tensors(
+            codes,
+            codes_lengths,
+            state_slot_ids,
+            valid_rows,
+        )
+        if audio.ndim != 2 or audio.shape[0] != batch_size:
+            raise ValueError(f"PersonaPlex pooled Mimi returned invalid audio shape {tuple(audio.shape)}")
+        audio_cpu = audio.to(device="cpu", dtype=torch.float32)
+        return [
+            audio_cpu[row, : frames * self._samples_per_frame].contiguous() for row, frames in enumerate(frame_counts)
+        ]
+
     def _new_code_suffix(self, request_id: str | None, codes_kf: torch.Tensor) -> torch.Tensor:
         if request_id is None:
             return codes_kf
@@ -286,20 +373,58 @@ class PersonaPlexCode2Wav(nn.Module):
         if not hasattr(codec, "decode_frame"):
             raise RuntimeError("PersonaPlex Code2Wav requires a streaming Mimi decoder")
 
+        state_slot_ids = None
+        active = None
+        temporary_slot = None
+        pooled = len(self._mimi_codecs()) == 1 and callable(getattr(codec, "decode_streaming_tensors", None))
+        if pooled:
+            if request_id is None:
+                occupied = set(self._request_codec_slots.values())
+                temporary_slot = next(
+                    (index for index in range(self._max_codec_sessions) if index not in occupied),
+                    None,
+                )
+                if temporary_slot is None:
+                    raise RuntimeError(f"PersonaPlex Code2Wav decoder capacity {self._max_codec_sessions} is exhausted")
+                codec.reset_slot(temporary_slot)
+                slot = temporary_slot
+            else:
+                slot = self._request_codec_slots.get(request_id)
+                if slot is None:
+                    raise RuntimeError("PersonaPlex Code2Wav pooled request was not leased a state slot")
+            state_slot_ids = torch.tensor([slot], dtype=torch.long, device=codes_kf.device)
+            active = torch.ones(1, dtype=torch.bool, device=codes_kf.device)
+        decode_kwargs = (
+            {}
+            if state_slot_ids is None
+            else {
+                "active": active,
+                "state_slot_ids": state_slot_ids,
+            }
+        )
+
         decode_frames = getattr(codec, "decode_frames", None)
         chunks: list[torch.Tensor] = []
         for start in range(0, codes_kf.shape[1], _MIMI_DECODE_BATCH_FRAMES):
             frame_batch = codes_kf[:, start : start + _MIMI_DECODE_BATCH_FRAMES]
             if frame_batch.shape[1] > 1 and callable(decode_frames):
-                chunks.append(self._flatten_wav(decode_frames(frame_batch.unsqueeze(0))))
+                chunks.append(self._flatten_wav(decode_frames(frame_batch.unsqueeze(0), **decode_kwargs)))
             else:
                 chunks.extend(
-                    self._flatten_wav(codec.decode_frame(frame_batch[:, frame].unsqueeze(0)))
+                    self._flatten_wav(
+                        codec.decode_frame(
+                            frame_batch[:, frame].unsqueeze(0),
+                            **decode_kwargs,
+                        )
+                    )
                     for frame in range(frame_batch.shape[1])
                 )
         wav = torch.cat(chunks, dim=0) if chunks else codes_kf.new_empty(0, dtype=torch.float32)
         if ephemeral:
-            codec.reset_streaming()
+            if temporary_slot is not None:
+                codec.reset_slot(temporary_slot)
+            else:
+                codec.reset_streaming()
         return wav
 
     def _set_mimi_codecs(self, codecs: list[nn.Module]) -> None:
@@ -308,6 +433,8 @@ class PersonaPlexCode2Wav(nn.Module):
         self.mimi = codecs[0]
         self._additional_mimi = nn.ModuleList(codecs[1:])
         self._request_codec_slots.clear()
+        if len(codecs) == 1 and callable(getattr(codecs[0], "decode_streaming_tensors", None)):
+            codecs[0].streaming_init(self._max_codec_sessions)
 
     def _mimi_codecs(self) -> list[nn.Module]:
         if self.mimi is None:
@@ -319,6 +446,19 @@ class PersonaPlexCode2Wav(nn.Module):
         if not codecs:
             raise RuntimeError("PersonaPlexCode2Wav.forward called before Mimi was loaded in load_weights().")
         occupied = set(self._request_codec_slots.values())
+        if len(codecs) == 1 and callable(getattr(codecs[0], "decode_streaming_tensors", None)):
+            if request_id is None:
+                return codecs[0], True
+            slot = self._request_codec_slots.get(request_id)
+            if slot is None:
+                slot = next((index for index in range(self._max_codec_sessions) if index not in occupied), None)
+                if slot is None:
+                    raise RuntimeError(f"PersonaPlex Code2Wav decoder capacity {self._max_codec_sessions} is exhausted")
+                reset_slot = getattr(codecs[0], "reset_slot", None)
+                if callable(reset_slot):
+                    reset_slot(slot)
+                self._request_codec_slots[request_id] = slot
+            return codecs[0], False
         if request_id is not None:
             slot = self._request_codec_slots.get(request_id)
             if slot is None:
@@ -341,8 +481,11 @@ class PersonaPlexCode2Wav(nn.Module):
             self._request_codes.pop(state_id, None)
             slot = self._request_codec_slots.pop(state_id, None)
             codecs = self._mimi_codecs()
-            if slot is not None and slot < len(codecs):
-                codecs[slot].reset_streaming()
+            if slot is not None:
+                if len(codecs) == 1 and callable(getattr(codecs[0], "reset_slot", None)):
+                    codecs[0].reset_slot(slot)
+                elif slot < len(codecs):
+                    codecs[slot].reset_streaming()
 
     @staticmethod
     def _flatten_wav(wav: torch.Tensor) -> torch.Tensor:
@@ -404,7 +547,6 @@ class PersonaPlexCode2Wav(nn.Module):
                 checkpoint=str(checkpoint) if checkpoint.is_file() else None,
                 device=str(device),
             ).eval()
-            for _ in range(self._max_codec_sessions)
         ]
         self._set_mimi_codecs(codecs)
         self._mimi_device = torch.device(str(device))
