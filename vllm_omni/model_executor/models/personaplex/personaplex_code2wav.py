@@ -38,6 +38,9 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.moss_tts.cuda_graph_streaming_decoder_wrapper import (
+    CUDAGraphStreamingDecoderWrapper,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -103,6 +106,9 @@ class PersonaPlexCode2Wav(nn.Module):
         self._mimi_device: torch.device | None = None
         self._request_codes: dict[str, torch.Tensor] = {}
         self._request_codec_slots: dict[str, int] = {}
+        self._cudagraph_wrapper: CUDAGraphStreamingDecoderWrapper | None = None
+        self._decode_graph_batch_sizes = self._resolve_decode_graph_batch_sizes()
+        self._decode_graph_frame_sizes = self._resolve_decode_graph_frame_sizes()
 
     # ------------------------------------------------------------------
     # Runner-facing no-op / placeholder hooks (mirror Qwen3TTSCode2Wav).
@@ -337,12 +343,29 @@ class PersonaPlexCode2Wav(nn.Module):
         codes_lengths = torch.tensor(frame_counts, dtype=torch.long, device=device)
         state_slot_ids = torch.tensor(slots, dtype=torch.long, device=device)
         valid_rows = torch.ones(batch_size, dtype=torch.bool, device=device)
-        audio, _ = codecs[0].decode_streaming_tensors(
-            codes,
-            codes_lengths,
-            state_slot_ids,
-            valid_rows,
-        )
+        graph_decode = None
+        if self._cudagraph_wrapper is not None:
+            graph_decode = self._cudagraph_wrapper.decode(
+                codes,
+                state_slot_ids,
+                codes_lengths=codes_lengths,
+                valid_rows=valid_rows,
+                allow_frame_padding=True,
+            )
+        if graph_decode is None:
+            audio, _ = codecs[0].decode_streaming_tensors(
+                codes,
+                codes_lengths,
+                state_slot_ids,
+                valid_rows,
+            )
+        else:
+            audio, _, graph_batch_size = graph_decode
+            audio = audio[:batch_size]
+            if graph_batch_size < batch_size:
+                raise RuntimeError(
+                    f"PersonaPlex CUDA graph returned batch {graph_batch_size} for input batch {batch_size}"
+                )
         if audio.ndim != 2 or audio.shape[0] != batch_size:
             raise ValueError(f"PersonaPlex pooled Mimi returned invalid audio shape {tuple(audio.shape)}")
         audio_cpu = audio.to(device="cpu", dtype=torch.float32)
@@ -427,14 +450,94 @@ class PersonaPlexCode2Wav(nn.Module):
                 codec.reset_streaming()
         return wav
 
+    def _connector_extra_cfg(self) -> dict[str, Any]:
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            extra_cfg = connector_cfg.get("extra", connector_cfg)
+        else:
+            extra_cfg = getattr(connector_cfg, "extra", None)
+        return extra_cfg if isinstance(extra_cfg, dict) else {}
+
+    def _resolve_decode_graph_batch_sizes(self) -> list[int]:
+        if getattr(self.vllm_config.model_config, "enforce_eager", True):
+            return []
+        compilation_config = getattr(self.vllm_config, "compilation_config", None)
+        capture_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
+        if not capture_sizes:
+            return []
+        return sorted({int(size) for size in capture_sizes if 0 < int(size) <= self._max_codec_sessions})
+
+    def _resolve_decode_graph_frame_sizes(self) -> list[int]:
+        extra_cfg = self._connector_extra_cfg()
+        initial = int(extra_cfg.get("initial_codec_chunk_frames", 1))
+        steady = int(extra_cfg.get("codec_chunk_frames", _MIMI_DECODE_BATCH_FRAMES))
+        return sorted({size for size in (initial, steady) if size > 0})
+
+    def _codec_device(self, codec: nn.Module) -> torch.device:
+        codec_device = getattr(codec, "device", None)
+        if codec_device is not None:
+            return torch.device(codec_device)
+        try:
+            return next(codec.parameters()).device
+        except StopIteration:
+            return self._mimi_device or torch.device("cpu")
+
     def _set_mimi_codecs(self, codecs: list[nn.Module]) -> None:
         if not codecs:
             raise ValueError("PersonaPlex Code2Wav requires at least one Mimi decoder")
         self.mimi = codecs[0]
         self._additional_mimi = nn.ModuleList(codecs[1:])
         self._request_codec_slots.clear()
+        self._cudagraph_wrapper = None
         if len(codecs) == 1 and callable(getattr(codecs[0], "decode_streaming_tensors", None)):
-            codecs[0].streaming_init(self._max_codec_sessions)
+            codec = codecs[0]
+            codec_device = self._codec_device(codec)
+            graph_batch_sizes = self._decode_graph_batch_sizes
+            graph_frame_sizes = self._decode_graph_frame_sizes
+            scratch_capacity = (
+                max(graph_batch_sizes, default=0)
+                if codec_device.type == "cuda" and graph_batch_sizes and graph_frame_sizes
+                else 0
+            )
+            physical_capacity = self._max_codec_sessions + scratch_capacity
+            if scratch_capacity:
+                codec.streaming_init(
+                    physical_capacity,
+                    state_capacity=self._max_codec_sessions,
+                )
+            else:
+                codec.streaming_init(self._max_codec_sessions)
+
+            if scratch_capacity:
+                reset_slots = getattr(codec, "reset_decoder_state_slots", None)
+                if not callable(reset_slots):
+                    logger.warning("PersonaPlex codec has no reset_decoder_state_slots; using eager streaming decode")
+                else:
+                    try:
+                        wrapper = CUDAGraphStreamingDecoderWrapper(
+                            codec,
+                            state_capacity=self._max_codec_sessions,
+                            batch_sizes=graph_batch_sizes,
+                            frame_sizes=graph_frame_sizes,
+                            num_quantizers=self._num_codebooks,
+                            vllm_config=self.vllm_config,
+                        )
+                        wrapper.warmup(codec_device)
+                        reset_slots(
+                            torch.arange(
+                                physical_capacity,
+                                device=codec_device,
+                                dtype=torch.long,
+                            )
+                        )
+                        if wrapper.is_ready:
+                            self._cudagraph_wrapper = wrapper
+                    except Exception:
+                        logger.warning(
+                            "PersonaPlex CUDA graph decode setup failed; using eager streaming decode",
+                            exc_info=True,
+                        )
 
     def _mimi_codecs(self) -> list[nn.Module]:
         if self.mimi is None:

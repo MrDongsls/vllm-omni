@@ -8,6 +8,9 @@ import torch
 import torch.nn as nn
 from pytest_mock import MockerFixture
 
+from vllm_omni.model_executor.models.moss_tts.cuda_graph_streaming_decoder_wrapper import (
+    CUDAGraphStreamingDecoderWrapper,
+)
 from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
     FRAME_SIZE,
     PersonaPlexMimiCodec,
@@ -99,13 +102,13 @@ def _stream_carry(stream: _StreamConv1d | _StreamConvTr1d) -> torch.Tensor:
 
 
 def _make_passthrough_stage(mocker: MockerFixture):
-    stage = mocker.Mock(spec=["reset", "reset_all", "reset_slot"])
+    stage = mocker.Mock(spec=["reset", "reset_all", "reset_slot", "reset_slots"])
     stage.side_effect = lambda x, active: x
     return stage
 
 
 def _make_passthrough_transformer(mocker: MockerFixture):
-    transformer = mocker.Mock(spec=["streaming_init", "reset_streaming", "reset_slot", "step"])
+    transformer = mocker.Mock(spec=["streaming_init", "reset_streaming", "reset_slot", "reset_slots", "step"])
     transformer.step.side_effect = lambda x, active: x
     return transformer
 
@@ -134,6 +137,26 @@ def _make_codec_stub(mocker: MockerFixture) -> PersonaPlexMimiCodec:
     codec.decoder_transformer = _make_passthrough_transformer(mocker)
     codec.streaming_init(batch_size=2)
     return codec
+
+
+class _SyntheticStreamingGraphCodec(nn.Module):
+    def __init__(self, state_capacity: int, device: torch.device) -> None:
+        super().__init__()
+        self.register_buffer("state", torch.zeros(state_capacity, device=device))
+
+    def reset_decoder_state_slots(self, state_slot_ids: torch.Tensor) -> None:
+        self.state.index_fill_(0, state_slot_ids, 0)
+
+    def decode_streaming_tensors(
+        self,
+        codes: torch.Tensor,
+        codes_lengths: torch.Tensor,
+        state_slot_ids: torch.Tensor,
+        valid_rows: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.state.index_add_(0, state_slot_ids, valid_rows.to(self.state.dtype))
+        audio = codes[0].to(torch.float32).repeat_interleave(4, dim=1)
+        return audio, codes_lengths * 4
 
 
 @pytest.mark.cpu
@@ -196,6 +219,69 @@ def test_mimi_streaming_tensor_decode_pads_lengths_and_masks_invalid_rows(mocker
         [False, False, False],
     ]
     assert all(torch.equal(slots, state_slot_ids) for _, slots in calls)
+
+
+@pytest.mark.cpu
+def test_mimi_codec_separates_physical_and_logical_state_capacity(mocker: MockerFixture) -> None:
+    codec = _make_codec_stub(mocker)
+
+    codec.streaming_init(batch_size=4, state_capacity=2)
+
+    assert codec._batch_size == 4
+    assert codec._state_capacity == 2
+    assert codec._all_active.shape == (4,)
+    scratch_slots = torch.tensor([2, 3], dtype=torch.long)
+    codec.reset_decoder_state_slots(scratch_slots)
+    codec.encoder_transformer.reset_slots.assert_called_once_with(scratch_slots)
+    codec.decoder_transformer.reset_slots.assert_called_once_with(scratch_slots)
+
+    with pytest.raises(ValueError, match=r"state_slot_ids must be in \[0, 4\)"):
+        codec.reset_decoder_state_slots(torch.tensor([4], dtype=torch.long))
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_streaming_graph_variable_lengths_and_scratch_rows_cuda() -> None:
+    device = CUDA_DEVICE
+    codec = _SyntheticStreamingGraphCodec(state_capacity=4, device=device)
+    wrapper = CUDAGraphStreamingDecoderWrapper.__new__(CUDAGraphStreamingDecoderWrapper)
+    wrapper.codec = codec
+    wrapper.state_capacity = 2
+    wrapper.batch_sizes = [2]
+    wrapper.frame_sizes = [5]
+    wrapper.num_quantizers = 2
+    wrapper.graphs = {}
+    wrapper._pool = torch.cuda.graph_pool_handle()
+    wrapper._warmed_up = False
+
+    wrapper._capture_with_decode(2, 5, device, codec.decode_streaming_tensors)
+
+    codes = torch.arange(6, device=device, dtype=torch.long).view(2, 1, 3)
+    lengths = torch.tensor([2], device=device, dtype=torch.long)
+    state_slots = torch.tensor([0], device=device, dtype=torch.long)
+    valid_rows = torch.ones(1, device=device, dtype=torch.bool)
+    graph_decode = wrapper.decode(
+        codes,
+        state_slots,
+        codes_lengths=lengths,
+        valid_rows=valid_rows,
+        allow_frame_padding=True,
+    )
+    assert graph_decode is not None
+    graph_audio, graph_lengths, actual_batch = graph_decode
+    assert actual_batch == 1
+    assert torch.equal(graph_lengths[:1], lengths * 4)
+
+    codec.reset_decoder_state_slots(torch.arange(4, device=device, dtype=torch.long))
+    eager_audio, eager_lengths = codec.decode_streaming_tensors(
+        codes,
+        lengths,
+        state_slots,
+        valid_rows,
+    )
+    torch.testing.assert_close(graph_audio[:1, : eager_audio.shape[1]], eager_audio, rtol=0.0, atol=0.0)
+    assert torch.equal(graph_lengths[:1], eager_lengths)
+    assert torch.equal(codec.state, torch.tensor([1.0, 0.0, 0.0, 0.0], device=device))
 
 
 @pytest.mark.cpu

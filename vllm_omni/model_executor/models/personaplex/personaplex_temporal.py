@@ -98,6 +98,10 @@ class _RingKV:
         self.end_offset[b] = 0
         self.start_offset[b] = 0
 
+    def reset_rows(self, rows: torch.Tensor) -> None:
+        self.end_offset.index_fill_(0, rows, 0)
+        self.start_offset.index_fill_(0, rows, 0)
+
     def bump_slot_start(self, b: int) -> None:
         self.start_offset[b] += 1
 

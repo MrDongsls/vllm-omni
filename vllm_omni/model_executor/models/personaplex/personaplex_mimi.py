@@ -139,6 +139,10 @@ class _StreamConv1d:
         self.prev[b].zero_()
         self._fresh[b] = True
 
+    def reset_slots(self, rows: torch.Tensor) -> None:
+        self.prev.index_fill_(0, rows, 0)
+        self._fresh.index_fill_(0, rows, True)
+
     def __call__(
         self,
         x: torch.Tensor,
@@ -191,6 +195,10 @@ class _StreamConvTr1d:
     def reset_slot(self, b: int) -> None:
         self.partial[b].zero_()
         self._fresh[b] = True
+
+    def reset_slots(self, rows: torch.Tensor) -> None:
+        self.partial.index_fill_(0, rows, 0)
+        self._fresh.index_fill_(0, rows, True)
 
     def __call__(
         self,
@@ -298,6 +306,11 @@ class _MimiStreamingTransformer(nn.Module):
         for kv in self._kv:
             kv.reset_row(b)
         self._offset[b] = 0
+
+    def reset_slots(self, rows: torch.Tensor) -> None:
+        for kv in self._kv:
+            kv.reset_rows(rows)
+        self._offset.index_fill_(0, rows, 0)
 
     def step(
         self,
@@ -428,6 +441,7 @@ class PersonaPlexMimiCodec(nn.Module):
         self._upsample = _StreamConvTr1d(m.upsample.conv)
         self._dec_stages = _walk_seanet(m.decoder.layers)
         self._batch_size: int | None = None
+        self._state_capacity: int | None = None
         self._all_active: torch.Tensor
 
     # -- streaming state ------------------------------------------------------
@@ -442,11 +456,18 @@ class PersonaPlexMimiCodec(nn.Module):
         yield self._downsample
         yield self._upsample
 
-    def streaming_init(self, batch_size: int) -> None:
-        if getattr(self, "_batch_size", None) == batch_size:
+    def streaming_init(self, batch_size: int, *, state_capacity: int | None = None) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if state_capacity is None:
+            state_capacity = batch_size
+        if not 0 < state_capacity <= batch_size:
+            raise ValueError(f"state_capacity must be in [1, {batch_size}], got {state_capacity}")
+        if getattr(self, "_batch_size", None) == batch_size and self._state_capacity == state_capacity:
             self.reset_streaming()
             return
         self._batch_size = batch_size
+        self._state_capacity = state_capacity
         self._all_active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
         for s in self._conv_states():
             s.reset(batch_size, self.device, self.dtype)
@@ -465,6 +486,23 @@ class PersonaPlexMimiCodec(nn.Module):
             s.reset_slot(b)
         self.encoder_transformer.reset_slot(b)
         self.decoder_transformer.reset_slot(b)
+
+    @torch.no_grad()
+    def reset_decoder_state_slots(self, state_slot_ids: torch.Tensor) -> None:
+        """Reset selected physical rows without reallocating the state pool."""
+        if self._batch_size is None:
+            raise RuntimeError("call streaming_init before resetting decoder state slots")
+        if state_slot_ids.ndim != 1 or state_slot_ids.dtype != torch.long:
+            raise TypeError("state_slot_ids must be a one-dimensional torch.int64 tensor")
+        if state_slot_ids.numel() == 0:
+            return
+        rows = state_slot_ids.to(device=self.device, dtype=torch.long)
+        if int(rows.min()) < 0 or int(rows.max()) >= self._batch_size:
+            raise ValueError(f"state_slot_ids must be in [0, {self._batch_size})")
+        for state in self._conv_states():
+            state.reset_slots(rows)
+        self.encoder_transformer.reset_slots(rows)
+        self.decoder_transformer.reset_slots(rows)
 
     # -- per-frame codec -------------------------------------------------------
 
