@@ -476,7 +476,7 @@ class PersonaPlexStage0DuplexRuntime:
 
         codec = self._shared_codec()
         pcm = torch.zeros((self.max_sessions, _FRAME_SAMPLES), dtype=torch.float32)
-        active = torch.zeros((self.max_sessions,), dtype=torch.bool)
+        active = torch.zeros((self.max_sessions,), dtype=torch.bool, device=self.device)
         for state, _, samples in rows:
             assert state.slot is not None
             pcm[state.slot] = torch.from_numpy(samples)
