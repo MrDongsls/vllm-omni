@@ -179,6 +179,7 @@ def executable_cute_dsl_kernel(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
     monkeypatch.setattr(
         flashinfer_attn,
         "trtllm_ragged_attention_deepseek",
