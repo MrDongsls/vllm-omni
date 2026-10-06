@@ -24,7 +24,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def _impl(*, causal: bool = False, backend_explicit: bool = False):
-    # Avoid CUDA/wrapper init; these tests only cover mask validation.
+    # Avoid CUDA/wrapper init; exercise the capability contract with initialized-state doubles.
     obj = FlashInferAttentionImpl.__new__(FlashInferAttentionImpl)
     obj.causal = causal
     obj.softmax_scale = 0.5
@@ -57,6 +57,7 @@ def test_flashinfer_preconstruction_capability_is_conservative():
     result = FlashInferAttentionBackend.resolve_capabilities(ExecutionContext(platform="cuda", require_fullgraph=True))
 
     assert result.path == "unverified"
+    assert result.kernel_variant is None
     assert result.support.status is SupportStatus.UNMIGRATED
     assert result.compilation_mode is CompilationMode.EAGER_ONLY
     assert (
@@ -127,6 +128,16 @@ def test_flashinfer_unverified_near_miss_stays_unmigrated(attribute, value, dtyp
         {"piecewise": True},
         {"paged_kv": True},
         {"kv_cache_dtype": "fp8"},
+        {"parallel_strategy": __import__(
+            "vllm_omni.diffusion.attention.capabilities",
+            fromlist=["ParallelStrategy"],
+        ).ParallelStrategy.ULYSSES},
+        {"outer_boundaries": frozenset({
+            __import__(
+                "vllm_omni.diffusion.attention.capabilities",
+                fromlist=["OuterBoundary"],
+            ).OuterBoundary.HSDP
+        })},
     ],
 )
 def test_flashinfer_outer_paths_stay_unmigrated(context_change):
