@@ -137,7 +137,6 @@ def _candidate_impl():
     impl.dtype_qk = None
     impl.dtype_vo = None
     impl.flashinfer_backend = "cute-dsl"
-    impl.device_capability = (12, 0)
     impl.backend_explicit = True
     impl._workspace = torch.empty(0, dtype=torch.uint8)
     impl._wrapper = _UnexpectedWrapper()
@@ -238,10 +237,10 @@ def test_neighboring_unverified_path_keeps_stateful_wrapper(monkeypatch):
     monkeypatch.setattr(
         flashinfer_attn,
         "trtllm_ragged_attention_deepseek",
-        lambda **_kwargs: pytest.fail("non-SM120 path unexpectedly used the custom op"),
+        lambda **_kwargs: pytest.fail("non-cute-dsl path unexpectedly used the custom op"),
     )
     impl = _candidate_impl()
-    impl.device_capability = (10, 0)
+    impl.flashinfer_backend = "fa2"
     impl._wrapper = _RecordingWrapper()
     query = torch.randn(1, 4, 2, 128, dtype=torch.bfloat16)
 
@@ -256,7 +255,6 @@ def test_neighboring_unverified_path_keeps_stateful_wrapper(monkeypatch):
     ("attribute", "value", "tensor_dtype", "head_dim", "metadata"),
     [
         ("flashinfer_backend", "fa2", torch.bfloat16, 128, None),
-        ("device_capability", (10, 0), torch.bfloat16, 128, None),
         ("causal", True, torch.bfloat16, 128, None),
         ("dtype_qk", torch.float8_e4m3fn, torch.bfloat16, 128, None),
         ("flashinfer_backend", "cute-dsl", torch.float16, 128, None),
@@ -291,7 +289,7 @@ def test_neighboring_unverified_path_keeps_stateful_wrapper(monkeypatch):
         ),
     ],
 )
-def test_only_exact_dense_sm120_path_is_custom_op_candidate(
+def test_only_exact_dense_cute_dsl_path_is_custom_op_candidate(
     attribute,
     value,
     tensor_dtype,
