@@ -639,7 +639,7 @@ class PersonaPlexCode2Wav(nn.Module):
         for _ in weights:
             pass
 
-        device = self.vllm_config.device_config.device
+        device = torch.device(self.vllm_config.device_config.device)
         from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
             PersonaPlexMimiCodec,
         )
@@ -648,11 +648,11 @@ class PersonaPlexCode2Wav(nn.Module):
         codecs = [
             PersonaPlexMimiCodec(
                 checkpoint=str(checkpoint) if checkpoint.is_file() else None,
-                device=str(device),
+                device=device,
             ).eval()
         ]
         self._set_mimi_codecs(codecs)
-        self._mimi_device = torch.device(str(device))
+        self._mimi_device = codecs[0].device
         reported_sr = getattr(codecs[0].model.config, "sampling_rate", None)
         if reported_sr is not None:
             self._output_sample_rate = int(reported_sr)

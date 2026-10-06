@@ -388,7 +388,12 @@ def _walk_seanet(layers) -> list[tuple[str, object]]:
 class PersonaPlexMimiCodec(nn.Module):
     """Streaming Mimi encode/decode at one 80 ms frame per call (moshi-free)."""
 
-    def __init__(self, hf_repo: str = DEFAULT_HF_REPO, checkpoint: str | None = None, device: str = "cuda") -> None:
+    def __init__(
+        self,
+        hf_repo: str = DEFAULT_HF_REPO,
+        checkpoint: str | None = None,
+        device: str | torch.device = "cuda",
+    ) -> None:
         super().__init__()
         from safetensors.torch import load_file
         from transformers import MimiConfig, MimiModel
@@ -427,6 +432,7 @@ class PersonaPlexMimiCodec(nn.Module):
         # the target device.
         del self.model.encoder_transformer, self.model.decoder_transformer
         self.model = self.model.to(self.device).eval()
+        self.device = next(self.model.parameters()).device
         self.dtype = next(self.model.parameters()).dtype
         self.encoder_transformer = _MimiStreamingTransformer().to(self.device, self.dtype)
         self.decoder_transformer = _MimiStreamingTransformer().to(self.device, self.dtype)

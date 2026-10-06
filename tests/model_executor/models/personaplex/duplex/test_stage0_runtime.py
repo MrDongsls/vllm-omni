@@ -28,7 +28,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class _FakeCodec:
     """Shared streaming encoder whose code for a row is that row's frame count."""
 
-    def __init__(self) -> None:
+    def __init__(self, device: torch.device = torch.device("cpu")) -> None:
+        self.device = device
         self.encode_calls = 0
         self.reset_slots: list[int] = []
         self.frames: list[int] = []
@@ -118,7 +119,7 @@ def _runtime(codec: _FakeCodec, max_sessions: int = 1) -> PersonaPlexStage0Duple
     return PersonaPlexStage0DuplexRuntime(
         _FakeTalker(),
         model_path="/unused",
-        device="cpu",
+        device=torch.device("cpu"),
         codec=codec,
         max_sessions=max_sessions,
         tokenizer=lambda _text: [7, 8, 9],
@@ -250,6 +251,22 @@ def test_decoded_pcm_is_writable_for_torch_zero_copy() -> None:
     pcm = PersonaPlexStage0DuplexRuntime._decode_pcm(_duplex_info(seq=1)["payload"])
 
     assert pcm.flags.writeable
+
+
+@pytest.mark.cpu
+def test_stage0_requires_indexed_cuda_device() -> None:
+    with pytest.raises(ValueError, match="must be indexed"):
+        PersonaPlexStage0DuplexRuntime(
+            _FakeTalker(),
+            model_path="/unused",
+            device=torch.device("cuda"),
+        )
+
+
+@pytest.mark.cpu
+def test_stage0_rejects_runtime_codec_device_mismatch() -> None:
+    with pytest.raises(RuntimeError, match="runtime/codec device mismatch"):
+        _runtime(_FakeCodec(torch.device("meta")))
 
 
 def _prepare_two_sessions(
@@ -460,7 +477,7 @@ def test_codec_init_failure_propagates_after_one_attempt() -> None:
     runtime = PersonaPlexStage0DuplexRuntime(
         _FakeTalker(),
         model_path="/unused",
-        device="cpu",
+        device=torch.device("cpu"),
         codec_factory=failing_codec,
         max_sessions=16,
         tokenizer=lambda _text: [7, 8, 9],

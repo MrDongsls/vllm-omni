@@ -434,7 +434,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         )
 
         model_path = str(getattr(self.vllm_config.model_config, "model", ""))
-        device = str(next(self.parameters()).device)
+        device = next(self.parameters()).device
         runtime = PersonaPlexStage0DuplexRuntime(
             self,
             model_path=model_path,

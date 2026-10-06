@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 from vllm_omni.model_executor.common.audio.pcm import pcm_f32le_samples
 from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payload
@@ -147,7 +148,7 @@ class PersonaPlexStage0DuplexRuntime:
         stage_model: Any,
         *,
         model_path: str,
-        device: str,
+        device: torch.device,
         codec: Any | None = None,
         codec_factory: Callable[[], Any] | None = None,
         max_sessions: int = 1,
@@ -156,6 +157,10 @@ class PersonaPlexStage0DuplexRuntime:
     ) -> None:
         if max_sessions <= 0:
             raise ValueError("PersonaPlex Stage 0 max_sessions must be positive")
+        if not isinstance(device, torch.device):
+            raise TypeError(f"PersonaPlex Stage 0 device must be torch.device, got {type(device).__name__}")
+        if device.type == "cuda" and device.index is None:
+            raise ValueError(f"PersonaPlex Stage 0 device must be indexed, got {device}")
         self.stage_model = stage_model
         self.model_path = model_path
         self.device = device
@@ -171,6 +176,11 @@ class PersonaPlexStage0DuplexRuntime:
         # finished by the engine and must not lease a row or record a sample.
         self._stale_requests: set[str] = set()
         if codec is not None:
+            codec_device = getattr(codec, "device", None)
+            if codec_device != self.device:
+                raise RuntimeError(
+                    f"PersonaPlex Stage 0 runtime/codec device mismatch: {self.device} vs {codec_device}"
+                )
             codec.streaming_init(max_sessions)
             self._codec = codec
 
@@ -476,7 +486,7 @@ class PersonaPlexStage0DuplexRuntime:
 
         codec = self._shared_codec()
         pcm = torch.zeros((self.max_sessions, _FRAME_SAMPLES), dtype=torch.float32)
-        active = torch.zeros((self.max_sessions,), dtype=torch.bool, device=self.device)
+        active = torch.zeros((self.max_sessions,), dtype=torch.bool, device=codec.device)
         for state, _, samples in rows:
             assert state.slot is not None
             pcm[state.slot] = torch.from_numpy(samples)
@@ -492,6 +502,11 @@ class PersonaPlexStage0DuplexRuntime:
 
     def _shared_codec(self):
         if self._codec is not None:
+            codec_device = getattr(self._codec, "device", None)
+            if codec_device != self.device:
+                raise RuntimeError(
+                    f"PersonaPlex Stage 0 runtime/codec device mismatch: {self.device} vs {codec_device}"
+                )
             return self._codec
         if self._codec_factory is not None:
             codec = self._codec_factory()
@@ -505,6 +520,9 @@ class PersonaPlexStage0DuplexRuntime:
                 checkpoint=str(checkpoint) if checkpoint.is_file() else None,
                 device=self.device,
             )
+        codec_device = getattr(codec, "device", None)
+        if codec_device != self.device:
+            raise RuntimeError(f"PersonaPlex Stage 0 runtime/codec device mismatch: {self.device} vs {codec_device}")
         codec.streaming_init(self.max_sessions)
         self._codec = codec
         return codec
