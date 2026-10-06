@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -27,7 +29,6 @@ def _impl(*, causal: bool = False, backend_explicit: bool = False):
     obj.causal = causal
     obj.softmax_scale = 0.5
     obj.flashinfer_backend = "fa2"
-    obj.device_capability = None
     obj.dtype_qk = None
     obj.dtype_vo = None
     obj.backend_explicit = backend_explicit
@@ -81,37 +82,60 @@ def test_flashinfer_dense_path_uses_initialized_backend_and_stays_unmigrated():
 def _candidate_impl():
     impl = _impl()
     impl.flashinfer_backend = "cute-dsl"
-    impl.device_capability = (12, 0)
     return impl
 
 
-def test_flashinfer_exact_sm120_cute_dsl_path_is_supported_custom_op():
+def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op():
     impl = _candidate_impl()
     query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
     context = ExecutionContext(platform="cuda", require_fullgraph=True)
 
     result = impl.resolve_execution_path(context, query, query, query, None)
 
-    assert result.path == "flashinfer_cute_dsl_dense"
+    assert result.path == "flashinfer_cute-dsl_dense"
     assert result.support.status is SupportStatus.SUPPORTED
     assert result.compilation_mode is CompilationMode.CUSTOM_OP
     assert result.requested_support(context).status is SupportStatus.SUPPORTED
 
 
 @pytest.mark.parametrize(
-    ("device_capability", "dtype", "causal"),
+    ("attribute", "value", "dtype", "causal"),
     [
-        ((10, 0), torch.bfloat16, False),
-        ((12, 0), torch.float16, False),
-        ((12, 0), torch.bfloat16, True),
+        ("flashinfer_backend", "fa2", torch.bfloat16, False),
+        ("flashinfer_backend", "cute-dsl", torch.float16, False),
+        ("flashinfer_backend", "cute-dsl", torch.bfloat16, True),
     ],
 )
-def test_flashinfer_unverified_near_miss_stays_unmigrated(device_capability, dtype, causal):
+def test_flashinfer_unverified_near_miss_stays_unmigrated(attribute, value, dtype, causal):
     impl = _candidate_impl()
-    impl.device_capability = device_capability
+    setattr(impl, attribute, value)
     impl.causal = causal
     query = torch.empty((1, 4, 2, 128), dtype=dtype)
     context = ExecutionContext(platform="cuda", require_fullgraph=True)
+
+    result = impl.resolve_execution_path(context, query, query, query, None)
+
+    assert result.support.status is SupportStatus.UNMIGRATED
+    assert result.compilation_mode is CompilationMode.EAGER_ONLY
+    assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
+
+
+@pytest.mark.parametrize(
+    "context_change",
+    [
+        {"platform": "rocm"},
+        {"piecewise": True},
+        {"paged_kv": True},
+        {"kv_cache_dtype": "fp8"},
+    ],
+)
+def test_flashinfer_outer_paths_stay_unmigrated(context_change):
+    impl = _candidate_impl()
+    context = replace(
+        ExecutionContext(platform="cuda", require_fullgraph=True),
+        **context_change,
+    )
+    query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
 
     result = impl.resolve_execution_path(context, query, query, query, None)
 
