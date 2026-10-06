@@ -319,6 +319,9 @@ class FlashInferAttentionImpl(AttentionImpl):
             piecewise=(attn_metadata is not None and attn_metadata.full_attn_spans is not None) or context.piecewise,
             kv_cache_dtype=extra.get("kv_cache_dtype", context.kv_cache_dtype),
         )
+        # Do not select or widen hardware variants here. The initialized
+        # FlashInfer backend already owns that selection; this contract only
+        # describes the concrete cute-dsl dense path being made opaque.
         result = ExecutionPathResult.unmigrated(
             "FLASHINFER_ATTN",
             resolved_context,
