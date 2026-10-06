@@ -24,8 +24,6 @@ from vllm_omni.diffusion.attention.capabilities import (
     PackingMode,
     ParallelStrategy,
 )
-from vllm_omni.platforms import current_omni_platform
-
 if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
@@ -199,7 +197,7 @@ class FlashInferAttentionBackend(AttentionBackend):
         # so no concrete backend path is verified at this stage.
         return ExecutionPathResult.unmigrated(
             cls.get_name(),
-            context,
+            replace(context, kernel_variant=None),
             path="unverified",
         )
 
@@ -240,11 +238,6 @@ class FlashInferAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.device = torch.device("cuda", torch.accelerator.current_device_index())
-        try:
-            capability = current_omni_platform.get_device_capability(self.device.index or 0)
-        except Exception:
-            capability = None
-        self.device_capability = None if capability is None else (capability.major, capability.minor)
         backend_kwargs = backend_kwargs or {}
         quant = backend_kwargs.get("quant") or {}
         self.dtype_qk = self._check_dtype(quant.get("dtype_qk"), "dtype_qk", self._QK_DTYPES)
@@ -329,11 +322,11 @@ class FlashInferAttentionImpl(AttentionImpl):
         )
         if (
             resolved_context.platform == "cuda"
+            and result.path == "flashinfer_cute-dsl_dense"
             and self._is_cute_dsl_custom_op_candidate(query, key, value, attn_metadata)
         ):
             return replace(
                 result,
-                path="flashinfer_cute_dsl_dense",
                 support=CapabilityResult.supported(),
                 compilation_mode=CompilationMode.CUSTOM_OP,
             )
@@ -504,11 +497,11 @@ class FlashInferAttentionImpl(AttentionImpl):
             return False
         return (
             self.flashinfer_backend == "cute-dsl"
-            and self.device_capability == (12, 0)
             and not self.causal
             and self.dtype_qk in (None, torch.bfloat16)
             and self.dtype_vo in (None, torch.bfloat16)
             and query.dtype == key.dtype == value.dtype == torch.bfloat16
+            and query.device == key.device == value.device
             and query.shape[0] == key.shape[0] == value.shape[0]
             and key.shape[1] == value.shape[1]
             and query.shape[2] == key.shape[2] == value.shape[2]
