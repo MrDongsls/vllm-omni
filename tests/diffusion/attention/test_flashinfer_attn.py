@@ -97,6 +97,7 @@ def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op(monkeypatch):
     result = impl.resolve_execution_path(context, query, query, query, None)
 
     assert result.path == "flashinfer_cute-dsl_dense"
+    assert result.kernel_variant == "cute-dsl"
     assert result.support.status is SupportStatus.SUPPORTED
     assert result.compilation_mode is CompilationMode.CUSTOM_OP
     assert result.requested_support(context).status is SupportStatus.SUPPORTED
