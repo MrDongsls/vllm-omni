@@ -16,6 +16,8 @@ from vllm_omni.diffusion.attention.capabilities import (
     CompilationMode,
     ExecutionContext,
     MaskMode,
+    OuterBoundary,
+    ParallelStrategy,
     SupportStatus,
 )
 from vllm_omni.diffusion.data import AttentionSpec, AttnQuantSpec
@@ -128,16 +130,8 @@ def test_flashinfer_unverified_near_miss_stays_unmigrated(attribute, value, dtyp
         {"piecewise": True},
         {"paged_kv": True},
         {"kv_cache_dtype": "fp8"},
-        {"parallel_strategy": __import__(
-            "vllm_omni.diffusion.attention.capabilities",
-            fromlist=["ParallelStrategy"],
-        ).ParallelStrategy.ULYSSES},
-        {"outer_boundaries": frozenset({
-            __import__(
-                "vllm_omni.diffusion.attention.capabilities",
-                fromlist=["OuterBoundary"],
-            ).OuterBoundary.HSDP
-        })},
+        {"parallel_strategy": ParallelStrategy.ULYSSES},
+        {"outer_boundaries": frozenset({OuterBoundary.HSDP})},
     ],
 )
 def test_flashinfer_outer_paths_stay_unmigrated(context_change):
