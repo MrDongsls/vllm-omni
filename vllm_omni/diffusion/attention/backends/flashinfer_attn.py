@@ -142,6 +142,10 @@ def _resolve_packing_mode(attn_metadata: AttentionMetadata | None) -> PackingMod
     return PackingMode.MULTI_DOCUMENT if cu_seqlens_q.shape[0] > 3 else PackingMode.PACKED_PADDING
 
 
+def _is_cuda_execution_path(*tensors: torch.Tensor) -> bool:
+    return all(tensor.device.type == "cuda" for tensor in tensors)
+
+
 def _flashinfer_execution_path(context: ExecutionContext) -> str:
     if context.mask_mode is MaskMode.UNKNOWN:
         return "runtime_mask_dependent"
@@ -501,6 +505,7 @@ class FlashInferAttentionImpl(AttentionImpl):
             and self.dtype_qk in (None, torch.bfloat16)
             and self.dtype_vo in (None, torch.bfloat16)
             and query.dtype == key.dtype == value.dtype == torch.bfloat16
+            and _is_cuda_execution_path(query, key, value)
             and query.device == key.device == value.device
             and query.shape[0] == key.shape[0] == value.shape[0]
             and key.shape[1] == value.shape[1]
