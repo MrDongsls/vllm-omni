@@ -88,7 +88,8 @@ def _candidate_impl():
     return impl
 
 
-def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op():
+def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op(monkeypatch):
+    monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
     impl = _candidate_impl()
     query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
     context = ExecutionContext(platform="cuda", require_fullgraph=True)
