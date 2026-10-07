@@ -386,8 +386,12 @@ def test_flashinfer_real_backend_eager_fullgraph_agreement():
     capability = torch.cuda.get_device_capability()
     if capability == (8, 0):
         expected_backend = "fa2"
+        if flashinfer_attn.single_prefill_with_kv_cache is None:
+            pytest.skip("FlashInfer single-prefill API is unavailable")
     elif capability[0] >= 10 and capability != (12, 0):
         expected_backend = "cute-dsl"
+        if flashinfer_attn.trtllm_ragged_attention_deepseek is None:
+            pytest.skip("FlashInfer cute-dsl API is unavailable")
     else:
         pytest.skip("This test covers the original A100 FA2 path and the real cute-dsl path")
 
