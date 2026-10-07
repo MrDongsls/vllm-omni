@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import functools
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,6 +10,7 @@ import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends import flashinfer_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.forward_context import set_forward_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -34,6 +36,60 @@ def _inputs(*, value_head_dim: int = 128):
         128**-0.5,
         2,
     )
+
+
+def _fa2_inputs():
+    query = torch.randn(2, 3, 2, 128, dtype=torch.bfloat16)
+    key = torch.randn(2, 5, 2, 128, dtype=torch.bfloat16)
+    value = torch.randn(2, 5, 2, 128, dtype=torch.bfloat16)
+    return query, key, value, None, 128**-0.5
+
+
+@pytest.fixture
+def fake_fa2_single_prefill_kernel(monkeypatch):
+    calls = []
+
+    def kernel(query, key, value, **kwargs):
+        calls.append((query, key, value, kwargs))
+        return query.clone()
+
+    monkeypatch.setattr(
+        flashinfer_attn,
+        "single_prefill_with_kv_cache",
+        kernel,
+    )
+    return calls
+
+
+def test_flashinfer_fa2_custom_op_schema_and_fake(fake_fa2_single_prefill_kernel):
+    op = torch.ops.vllm_omni.flashinfer_fa2_attention.default
+
+    result = torch.library.opcheck(
+        op,
+        _fa2_inputs(),
+        test_utils=("test_schema", "test_faketensor"),
+    )
+
+    assert result == {
+        "test_schema": "SUCCESS",
+        "test_faketensor": "SUCCESS",
+    }
+
+
+def test_flashinfer_fa2_custom_op_preserves_inputs(fake_fa2_single_prefill_kernel):
+    args = _fa2_inputs()
+    snapshots = [tensor.clone() for tensor in args[:3]]
+
+    first = flashinfer_attn._flashinfer_fa2_attention_op(*args)
+    second = flashinfer_attn._flashinfer_fa2_attention_op(*args)
+
+    assert len(fake_fa2_single_prefill_kernel) == 4
+    assert first.shape == (2, 3, 2, 128)
+    assert first.dtype == torch.bfloat16
+    assert first.is_contiguous()
+    for tensor, snapshot in zip(args[:3], snapshots, strict=True):
+        torch.testing.assert_close(tensor, snapshot)
+    assert all(call[3]["backend"] == "fa2" for call in fake_fa2_single_prefill_kernel)
 
 
 @pytest.fixture
