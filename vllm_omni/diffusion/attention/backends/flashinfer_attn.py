@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from packaging.version import InvalidVersion, Version
@@ -130,7 +130,7 @@ if not hasattr(torch.ops.vllm_omni, "flashinfer_fa2_attention"):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        custom_mask: torch.Tensor | None,
+        custom_mask: Optional[torch.Tensor],
         softmax_scale: float,
     ) -> torch.Tensor:
         kernel = single_prefill_with_kv_cache
