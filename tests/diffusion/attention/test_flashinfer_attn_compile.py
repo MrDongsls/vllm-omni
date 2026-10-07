@@ -356,6 +356,7 @@ def test_active_parallel_context_keeps_stateful_wrapper(
 ):
     monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
     monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
+    monkeypatch.setattr(flashinfer_attn, "trtllm_ragged_attention_deepseek", lambda **_kwargs: object())
     impl = _candidate_impl()
     wrapper = _RecordingWrapper()
     impl._wrapper = wrapper
