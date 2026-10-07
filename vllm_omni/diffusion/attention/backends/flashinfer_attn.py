@@ -434,7 +434,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         )
         # Do not select or widen hardware variants here. The initialized
         # FlashInfer backend already owns that selection; this contract only
-        # describes the concrete cute-dsl dense path being made opaque.
+        # describes the concrete dense paths made opaque below.
         result = ExecutionPathResult.unmigrated(
             "FLASHINFER_ATTN",
             resolved_context,
