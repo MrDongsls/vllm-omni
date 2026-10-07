@@ -626,6 +626,11 @@ class FlashInferAttentionImpl(AttentionImpl):
             and query.shape[0] == key.shape[0] == value.shape[0]
             and key.shape[1] == value.shape[1]
             and query.shape[2] == key.shape[2] == value.shape[2]
+            and query.shape[1] <= key.shape[1]
+            and query.shape[0] > 0
+            and query.shape[1] > 0
+            and key.shape[1] > 0
+            and query.shape[2] > 0
             and query.shape[3] == key.shape[3] == value.shape[3] == 128
         )
 
@@ -654,6 +659,11 @@ class FlashInferAttentionImpl(AttentionImpl):
             and query.shape[0] == key.shape[0] == value.shape[0]
             and key.shape[1] == value.shape[1]
             and query.shape[2] == key.shape[2] == value.shape[2]
+            and query.shape[1] <= key.shape[1]
+            and query.shape[0] > 0
+            and query.shape[1] > 0
+            and key.shape[1] > 0
+            and query.shape[2] > 0
             and query.shape[3] == key.shape[3] == value.shape[3] == 128
         )
 
