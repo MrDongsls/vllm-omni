@@ -616,6 +616,7 @@ class FlashInferAttentionImpl(AttentionImpl):
             return False
         return (
             self.flashinfer_backend == "cute-dsl"
+            and trtllm_ragged_attention_deepseek is not None
             and not self.causal
             and self.dtype_qk in (None, torch.bfloat16)
             and self.dtype_vo in (None, torch.bfloat16)
@@ -649,6 +650,7 @@ class FlashInferAttentionImpl(AttentionImpl):
             return False
         return (
             self.flashinfer_backend == "fa2"
+            and single_prefill_with_kv_cache is not None
             and not self.causal
             and self.dtype_qk in (None, torch.bfloat16)
             and self.dtype_vo in (None, torch.bfloat16)
