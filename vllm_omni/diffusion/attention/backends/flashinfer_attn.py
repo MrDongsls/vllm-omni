@@ -33,14 +33,22 @@ _PACKED_KEYS = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
 
 try:
     import flashinfer
-    from flashinfer.prefill import (
-        BatchPrefillWithRaggedKVCacheWrapper,
-        trtllm_ragged_attention_deepseek,
-    )
+    from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper
+
+    try:
+        from flashinfer.prefill import single_prefill_with_kv_cache
+    except ImportError:
+        single_prefill_with_kv_cache = None
+
+    try:
+        from flashinfer.prefill import trtllm_ragged_attention_deepseek
+    except ImportError:
+        trtllm_ragged_attention_deepseek = None
 
     HAS_FLASHINFER = True
 except Exception as e:
     HAS_FLASHINFER = False
+    single_prefill_with_kv_cache = None
     trtllm_ragged_attention_deepseek = None
     logger.warning(
         "FlashInfer is unavailable; FLASHINFER_ATTN backend will not work. Reason: %s",
@@ -113,6 +121,55 @@ if not hasattr(torch.ops.vllm_omni, "flashinfer_cute_dsl_attention"):
 _flashinfer_cute_dsl_attention_op = torch.ops.vllm_omni.flashinfer_cute_dsl_attention
 
 
+if not hasattr(torch.ops.vllm_omni, "flashinfer_fa2_attention"):
+    @torch.library.custom_op(
+        "vllm_omni::flashinfer_fa2_attention",
+        mutates_args=(),
+    )
+    def _flashinfer_fa2_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        custom_mask: torch.Tensor | None,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        kernel = single_prefill_with_kv_cache
+        if kernel is None:
+            raise RuntimeError("FlashInfer single-prefill kernel is unavailable")
+
+        outputs = []
+        for batch_idx in range(query.shape[0]):
+            mask = None
+            if custom_mask is not None:
+                mask = custom_mask if custom_mask.ndim == 2 else custom_mask[batch_idx]
+            output = kernel(
+                query[batch_idx].contiguous(),
+                key[batch_idx].contiguous(),
+                value[batch_idx].contiguous(),
+                custom_mask=mask,
+                causal=False,
+                sm_scale=softmax_scale,
+                backend="fa2",
+            )
+            if isinstance(output, tuple):
+                output = output[0]
+            outputs.append(output)
+        return torch.stack(outputs, dim=0).contiguous()
+
+    @_flashinfer_fa2_attention_op.register_fake
+    def _flashinfer_fa2_attention_fake(
+        query,
+        key,
+        value,
+        custom_mask,
+        softmax_scale,
+    ):
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
+_flashinfer_fa2_attention_op = torch.ops.vllm_omni.flashinfer_fa2_attention
+
+
 def _resolve_mask_mode(attn_metadata: AttentionMetadata | None) -> MaskMode:
     if attn_metadata is None or attn_metadata.attn_mask is None:
         return MaskMode.NONE
@@ -144,6 +201,62 @@ def _resolve_packing_mode(attn_metadata: AttentionMetadata | None) -> PackingMod
 
 def _is_cuda_execution_path(*tensors: torch.Tensor) -> bool:
     return all(tensor.device.type == "cuda" for tensor in tensors)
+
+
+def _metadata_is_plain_dense(attn_metadata: AttentionMetadata | None) -> bool:
+    return attn_metadata is None or (
+        attn_metadata.attn_mask is None
+        and attn_metadata.joint_attn_mask is None
+        and attn_metadata.joint_query is None
+        and attn_metadata.joint_key is None
+        and attn_metadata.joint_value is None
+        and not attn_metadata.extra
+        and attn_metadata.full_attn_spans is None
+        and attn_metadata.query_ranges is None
+        and attn_metadata.video_layout is None
+        and attn_metadata.packed_padding is None
+    )
+
+
+def _runtime_context_allows_custom_op(
+    attn_metadata: AttentionMetadata | None,
+    execution_context: ExecutionContext | None,
+) -> bool:
+    runtime_context = execution_context
+    if runtime_context is None and attn_metadata is not None:
+        runtime_context = getattr(attn_metadata, "runtime_context", None)
+    if runtime_context is not None and (
+        runtime_context.parallel_strategy is not ParallelStrategy.NONE
+        or runtime_context.outer_boundaries
+        or runtime_context.paged_kv
+        or runtime_context.piecewise
+        or runtime_context.kv_cache_dtype is not None
+    ):
+        return False
+
+    # The layer's active strategy is derived from ForwardContext. Check it
+    # again at the runtime call boundary so a stale or absent capability
+    # result cannot select the opaque path in an SP/HSDP region.
+    try:
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if not is_forward_context_available():
+            return True
+        forward_context = get_forward_context()
+        config = forward_context.omni_diffusion_config
+        if config is None:
+            return True
+        if forward_context.sp_active:
+            return False
+        parallel_config = getattr(config, "parallel_config", None)
+        return not bool(getattr(parallel_config, "use_hsdp", False))
+    except (AssertionError, ValueError):
+        # Standalone backend calls and capability unit tests may not install a
+        # ForwardContext. The tensor/context checks above remain authoritative.
+        return True
 
 
 def _flashinfer_execution_path(context: ExecutionContext) -> str:
@@ -329,8 +442,15 @@ class FlashInferAttentionImpl(AttentionImpl):
         )
         if (
             resolved_context.platform == "cuda"
-            and result.path == "flashinfer_cute-dsl_dense"
-            and self._is_cute_dsl_custom_op_candidate(query, key, value, attn_metadata)
+            and result.path in {"flashinfer_fa2_dense", "flashinfer_cute-dsl_dense"}
+            and (
+                self._is_fa2_custom_op_candidate(
+                    query, key, value, attn_metadata, execution_context=resolved_context
+                )
+                or self._is_cute_dsl_custom_op_candidate(
+                    query, key, value, attn_metadata, execution_context=resolved_context
+                )
+            )
         ):
             return replace(
                 result,
@@ -487,20 +607,13 @@ class FlashInferAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
+        execution_context: ExecutionContext | None = None,
     ) -> bool:
-        metadata_is_plain_dense = attn_metadata is None or (
-            attn_metadata.attn_mask is None
-            and attn_metadata.joint_attn_mask is None
-            and attn_metadata.joint_query is None
-            and attn_metadata.joint_key is None
-            and attn_metadata.joint_value is None
-            and not attn_metadata.extra
-            and attn_metadata.full_attn_spans is None
-            and attn_metadata.query_ranges is None
-            and attn_metadata.video_layout is None
-            and attn_metadata.packed_padding is None
-        )
-        if not metadata_is_plain_dense or any(tensor.ndim != 4 for tensor in (query, key, value)):
+        if not _metadata_is_plain_dense(attn_metadata) or not _runtime_context_allows_custom_op(
+            attn_metadata, execution_context
+        ):
+            return False
+        if any(tensor.ndim != 4 for tensor in (query, key, value)):
             return False
         return (
             self.flashinfer_backend == "cute-dsl"
@@ -514,6 +627,48 @@ class FlashInferAttentionImpl(AttentionImpl):
             and key.shape[1] == value.shape[1]
             and query.shape[2] == key.shape[2] == value.shape[2]
             and query.shape[3] == key.shape[3] == value.shape[3] == 128
+        )
+
+    def _is_fa2_custom_op_candidate(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        execution_context: ExecutionContext | None = None,
+    ) -> bool:
+        if not _metadata_is_plain_dense(attn_metadata) or not _runtime_context_allows_custom_op(
+            attn_metadata, execution_context
+        ):
+            return False
+        if any(tensor.ndim != 4 for tensor in (query, key, value)):
+            return False
+        return (
+            self.flashinfer_backend == "fa2"
+            and not self.causal
+            and self.dtype_qk in (None, torch.bfloat16)
+            and self.dtype_vo in (None, torch.bfloat16)
+            and query.dtype == key.dtype == value.dtype == torch.bfloat16
+            and _is_cuda_execution_path(query, key, value)
+            and query.device == key.device == value.device
+            and query.shape[0] == key.shape[0] == value.shape[0]
+            and key.shape[1] == value.shape[1]
+            and query.shape[2] == key.shape[2] == value.shape[2]
+            and query.shape[3] == key.shape[3] == value.shape[3] == 128
+        )
+
+    def _run_fa2_custom_op(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        return _flashinfer_fa2_attention_op(
+            query,
+            key,
+            value,
+            None,
+            self.softmax_scale,
         )
 
     def _run_cute_dsl_custom_op(
@@ -566,6 +721,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         custom_mask: torch.Tensor | None,
         use_cute_dsl_custom_op: bool = False,
+        use_fa2_custom_op: bool = False,
     ) -> torch.Tensor:
         if query.device != self.device or key.device != self.device or value.device != self.device:
             raise ValueError(
@@ -580,6 +736,8 @@ class FlashInferAttentionImpl(AttentionImpl):
         head_dim_k = key.shape[3]
         head_dim_vo = value.shape[3]
 
+        if use_fa2_custom_op:
+            return self._run_fa2_custom_op(query, key, value)
         if use_cute_dsl_custom_op:
             return self._run_cute_dsl_custom_op(query, key, value)
 
@@ -737,6 +895,12 @@ class FlashInferAttentionImpl(AttentionImpl):
                 "cute-dsl does not support custom masks",
             )
 
+        use_fa2_custom_op = self._is_fa2_custom_op_candidate(
+            query,
+            key,
+            value,
+            attn_metadata,
+        )
         use_cute_dsl_custom_op = self._is_cute_dsl_custom_op_candidate(
             query,
             key,
@@ -749,4 +913,5 @@ class FlashInferAttentionImpl(AttentionImpl):
             value,
             custom_mask,
             use_cute_dsl_custom_op=use_cute_dsl_custom_op,
+            use_fa2_custom_op=use_fa2_custom_op,
         )
