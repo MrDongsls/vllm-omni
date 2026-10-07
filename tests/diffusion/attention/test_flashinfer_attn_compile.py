@@ -164,6 +164,32 @@ def test_flashinfer_cute_dsl_custom_op_reports_missing_kernel(monkeypatch):
         flashinfer_attn._flashinfer_cute_dsl_attention_op(*_inputs())
 
 
+@pytest.fixture
+def executable_fa2_single_prefill_kernel(monkeypatch, tmp_path):
+    marker = tmp_path / "flashinfer-fa2-kernel"
+    marker.write_text("loaded", encoding="utf-8")
+    calls = []
+
+    @functools.cache
+    def load_kernel():
+        with open(marker, encoding="utf-8") as handle:
+            return handle.read()
+
+    def kernel(query, key, value, **kwargs):
+        calls.append((query, key, value))
+        assert load_kernel() == "loaded"
+        return query.clone()
+
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
+    monkeypatch.setattr(
+        flashinfer_attn,
+        "single_prefill_with_kv_cache",
+        kernel,
+    )
+    return calls
+
+
 class _UnexpectedWrapper:
     def plan(self, *args, **kwargs):
         pytest.fail("candidate path unexpectedly planned the stateful wrapper")
@@ -200,6 +226,12 @@ def _candidate_impl():
     impl._kv_indptr = None
     impl._plan_key = None
     impl._sdpa_fallback = None
+    return impl
+
+
+def _fa2_candidate_impl():
+    impl = _candidate_impl()
+    impl.flashinfer_backend = "fa2"
     return impl
 
 
@@ -287,6 +319,100 @@ def test_dense_cute_dsl_candidate_is_opaque_to_dynamic_fullgraph(
     # case may produce a second full graph even with dynamic=True.
     assert 1 <= compile_count <= 2
     assert len(executable_cute_dsl_kernel) == 4
+
+
+def test_dense_fa2_candidate_is_opaque_to_dynamic_fullgraph(
+    executable_fa2_single_prefill_kernel,
+):
+    impl = _fa2_candidate_impl()
+    compiled = torch.compile(
+        impl.forward_cuda,
+        backend="eager",
+        fullgraph=True,
+        dynamic=True,
+    )
+
+    for batch_size, query_length, kv_length in ((1, 3, 5), (2, 4, 7)):
+        query = torch.randn(batch_size, query_length, 2, 128, dtype=torch.bfloat16)
+        key = torch.randn(batch_size, kv_length, 2, 128, dtype=torch.bfloat16)
+        value = torch.randn(batch_size, kv_length, 2, 128, dtype=torch.bfloat16)
+
+        expected = impl.forward_cuda(query, key, value)
+        actual = compiled(query, key, value)
+
+        torch.testing.assert_close(actual, expected)
+
+    assert len(executable_fa2_single_prefill_kernel) == 6
+
+
+@pytest.mark.parametrize(
+    ("sequence_parallel_size", "use_hsdp"),
+    [(2, False), (1, True)],
+)
+def test_active_parallel_context_keeps_stateful_wrapper(
+    monkeypatch,
+    sequence_parallel_size,
+    use_hsdp,
+):
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
+    impl = _candidate_impl()
+    wrapper = _RecordingWrapper()
+    impl._wrapper = wrapper
+    query = torch.randn(1, 4, 2, 128, dtype=torch.bfloat16)
+    runtime_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            sequence_parallel_size=sequence_parallel_size,
+            use_hsdp=use_hsdp,
+        ),
+    )
+
+    with set_forward_context(omni_diffusion_config=runtime_config):
+        output = impl.forward_cuda(query, query, query)
+
+    torch.testing.assert_close(output, query)
+    assert wrapper.plan_calls == 1
+    assert wrapper.run_calls == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.cuda
+def test_flashinfer_real_backend_eager_fullgraph_agreement():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for real FlashInfer execution")
+    if not flashinfer_attn.HAS_FLASHINFER:
+        pytest.skip("FlashInfer is not installed")
+
+    capability = torch.cuda.get_device_capability()
+    if capability == (8, 0):
+        expected_backend = "fa2"
+    elif capability[0] >= 10 and capability != (12, 0):
+        expected_backend = "cute-dsl"
+    else:
+        pytest.skip("This test covers the original A100 FA2 path and the real cute-dsl path")
+
+    impl = FlashInferAttentionImpl(
+        num_heads=2,
+        head_size=128,
+        softmax_scale=128**-0.5,
+        backend_kwargs={"quant": {"flashinfer_backend": "auto"}},
+    )
+    assert impl.flashinfer_backend == expected_backend
+    query = torch.randn(1, 4, 2, 128, device=impl.device, dtype=torch.bfloat16)
+    key = torch.randn(1, 5, 2, 128, device=impl.device, dtype=torch.bfloat16)
+    value = torch.randn(1, 5, 2, 128, device=impl.device, dtype=torch.bfloat16)
+
+    from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
+
+    context = ExecutionContext(platform="cuda", require_fullgraph=True)
+    path = impl.resolve_execution_path(context, query, key, value, None)
+    expected = impl.forward_cuda(query, key, value)
+    compiled = torch.compile(impl.forward_cuda, backend="eager", fullgraph=True)
+    actual = compiled(query, key, value)
+
+    assert path.support.status is SupportStatus.SUPPORTED
+    assert path.compilation_mode.value == "custom_op"
+    torch.testing.assert_close(actual, expected)
 
 
 def test_neighboring_unverified_path_keeps_stateful_wrapper(monkeypatch):
