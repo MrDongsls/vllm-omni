@@ -103,6 +103,21 @@ def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op(monkeypatch):
     assert result.requested_support(context).status is SupportStatus.SUPPORTED
 
 
+def test_flashinfer_exact_fa2_path_is_supported_custom_op(monkeypatch):
+    monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
+    impl = _impl()
+    query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
+    context = ExecutionContext(platform="cuda", require_fullgraph=True)
+
+    result = impl.resolve_execution_path(context, query, query, query, None)
+
+    assert result.path == "flashinfer_fa2_dense"
+    assert result.kernel_variant == "fa2"
+    assert result.support.status is SupportStatus.SUPPORTED
+    assert result.compilation_mode is CompilationMode.CUSTOM_OP
+    assert result.requested_support(context).status is SupportStatus.SUPPORTED
+
+
 @pytest.mark.parametrize(
     ("attribute", "value", "dtype", "causal"),
     [
@@ -266,3 +281,22 @@ def test_hopper_explicit_flashinfer_is_mask_capable(monkeypatch):
     spec = AttentionSpec(backend="FLASHINFER_ATTN")
 
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
+
+@pytest.mark.gpu
+@pytest.mark.cuda
+def test_flashinfer_real_init_selects_fa2_on_sm80():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for real FlashInfer initialization")
+    if not flashinfer_attn.HAS_FLASHINFER:
+        pytest.skip("FlashInfer is not installed")
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("This regression test targets A100/SM80")
+
+    impl = FlashInferAttentionImpl(
+        num_heads=2,
+        head_size=128,
+        softmax_scale=128**-0.5,
+        backend_kwargs={"quant": {"flashinfer_backend": "auto"}},
+    )
+
+    assert impl.flashinfer_backend == "fa2"
