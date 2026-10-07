@@ -282,6 +282,7 @@ def test_hopper_explicit_flashinfer_is_mask_capable(monkeypatch):
 
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
 
+
 @pytest.mark.gpu
 @pytest.mark.cuda
 def test_flashinfer_real_init_selects_fa2_on_sm80():
