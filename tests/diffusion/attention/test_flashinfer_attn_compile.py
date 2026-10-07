@@ -391,7 +391,7 @@ def test_flashinfer_real_backend_eager_fullgraph_agreement():
     else:
         pytest.skip("This test covers the original A100 FA2 path and the real cute-dsl path")
 
-    impl = FlashInferAttentionImpl(
+    impl = flashinfer_attn.FlashInferAttentionImpl(
         num_heads=2,
         head_size=128,
         softmax_scale=128**-0.5,
