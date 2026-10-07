@@ -90,6 +90,7 @@ def _candidate_impl():
 
 def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op(monkeypatch):
     monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
+    monkeypatch.setattr(flashinfer_attn, "trtllm_ragged_attention_deepseek", lambda **_kwargs: object())
     impl = _candidate_impl()
     query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
     context = ExecutionContext(platform="cuda", require_fullgraph=True)
@@ -105,6 +106,7 @@ def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op(monkeypatch):
 
 def test_flashinfer_exact_fa2_path_is_supported_custom_op(monkeypatch):
     monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
+    monkeypatch.setattr(flashinfer_attn, "single_prefill_with_kv_cache", lambda *_args, **_kwargs: object())
     impl = _impl()
     query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
     context = ExecutionContext(platform="cuda", require_fullgraph=True)
