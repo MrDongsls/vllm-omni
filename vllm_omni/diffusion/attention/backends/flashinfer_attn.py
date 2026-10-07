@@ -24,6 +24,10 @@ from vllm_omni.diffusion.attention.capabilities import (
     PackingMode,
     ParallelStrategy,
 )
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
@@ -238,11 +242,6 @@ def _runtime_context_allows_custom_op(
     # again at the runtime call boundary so a stale or absent capability
     # result cannot select the opaque path in an SP/HSDP region.
     try:
-        from vllm_omni.diffusion.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
-
         if not is_forward_context_available():
             return True
         forward_context = get_forward_context()
