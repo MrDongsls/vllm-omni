@@ -1,20 +1,30 @@
-# Z-Image-Turbo for image generation and editing
+# Z-Image Turbo
+
+> Few-step text-to-image with `Tongyi-MAI/Z-Image-Turbo`
 
 ## Summary
 
 - Vendor: Tongyi-MAI
 - Model: `Tongyi-MAI/Z-Image-Turbo`
-- Task: Image generation / editing with text input
-- Mode: Online serving with the OpenAI-compatible API
+- Task: Text-to-image and image editing
+- Mode: Offline inference / Online serving
 - Maintainer: Community
 
 ## When to use this recipe
 
-Use this recipe to serve `Tongyi-MAI/Z-Image-Turbo` on a validated CUDA GPU configuration.
+Use this recipe to generate 1024x1024 images with the distilled Z-Image Turbo
+checkpoint through the shared offline text-to-image example, or to serve the
+model online through the OpenAI-compatible API for image generation and
+editing.
 
 ## References
 
-- Upstream or canonical docs:
+- Model card: <https://huggingface.co/Tongyi-MAI/Z-Image-Turbo>
+- Shared runnable example:
+  [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
+- CPU offload guide:
+  [`docs/user_guide/diffusion/cpu_offload.md`](../../docs/user_guide/diffusion/cpu_offload.md)
+- Online serving docs:
   [`docs/user_guide/examples/online_serving/text_to_image.md`](../../docs/user_guide/examples/online_serving/text_to_image.md)
 - Related example under `examples/`:
   [`examples/online_serving/text_to_image/`](../../examples/online_serving/text_to_image/)
@@ -23,11 +33,55 @@ Use this recipe to serve `Tongyi-MAI/Z-Image-Turbo` on a validated CUDA GPU conf
 
 ## Hardware Support
 
-The following CUDA GPU configuration has been validated for this recipe.
+This recipe documents a validated Intel XPU offline configuration and a
+validated CUDA online-serving configuration. Extend it with more hardware
+sections as community validation lands.
+
+## XPU
+
+### 1x Intel Arc Pro B70 (32 GB)
+
+BF16 weights with model-level CPU offload and VAE tiling/slicing, 25 steps.
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- torch: 2.13.0+xpu
+- vLLM: 0.29.0 (`98dff2a8`)
+- vLLM-Omni: `main` at `4c7a98c2`
+
+#### Command
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
+  --prompt "a cup of coffee on the table" \
+  --num-inference-steps 25 \
+  --enable-cpu-offload \
+  --vae-use-tiling \
+  --vae-use-slicing \
+  --enforce-eager \
+  --output z_image_turbo_output.png
+```
+
+#### Verification
+
+Confirm `z_image_turbo_output.png` is written as a 1024x1024 PNG matching the
+prompt.
+
+#### Notes
+
+- Memory usage: peak 15.6 GiB, about 58 s per image.
+- Known limitations: only offline generation was qualified. Online serving is
+  out of scope for this profile.
 
 ## GPU
 
 ### 1x RTX 5880 48GB
+
+Online serving with the OpenAI-compatible API for image generation and
+editing, with optional FP8 quantization and cache backends.
 
 #### Environment
 
@@ -64,6 +118,7 @@ If the server is healthy, the serving terminal should show a log entry similar t
 ```bash
 (APIServer pid=XXX) INFO:     127.0.0.1:XXX - "GET /health HTTP/1.1" 200 OK
 ```
+
 You are ready to run.
 
 You can validate the image generation function with following command:
@@ -106,6 +161,7 @@ Unless otherwise noted, image generation used `size=1024x1024`, `num_inference_s
 **Example commands:**
 
 Enable FP8 quantization:
+
 ```bash
 vllm serve Tongyi-MAI/Z-Image-Turbo \
   --omni \
@@ -127,7 +183,8 @@ vllm serve Tongyi-MAI/Z-Image-Turbo \
 
 #### Performance results
 
-**Image generation**
+##### Image generation
+
 | CLI flag | Latency | Peak GPU Memory (`nvidia-smi`) |
 | -------- | ------- | ------ |
 | baseline | ~9500.00ms | 24987 MB |
@@ -137,8 +194,8 @@ vllm serve Tongyi-MAI/Z-Image-Turbo \
 | `--quantization fp8 --cache-backend tea_cache` | ~5600.00ms | 19835 MB |
 | `--quantization fp8 --cache-backend cache_dit` | ~5600.00ms | 19827 MB |
 
+##### Image editing
 
-**Image editing**
 | CLI flag | Latency | Peak GPU Memory (`nvidia-smi`) |
 | -------- | ------- | ------ |
 | baseline | ~34500.00ms | 24987 MB |
@@ -147,7 +204,6 @@ vllm serve Tongyi-MAI/Z-Image-Turbo \
 | `--cache-backend cache_dit` | ~11000.00ms | 24525 MB |
 | `--quantization fp8 --cache-backend tea_cache` | ~7100.00ms | 17890 MB |
 | `--quantization fp8 --cache-backend cache_dit` | ~7100.00ms | 19410 MB |
-
 
 #### Notes
 
