@@ -43,6 +43,9 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 logger = init_logger(__name__)
 
 _MIMI_DECODE_BATCH_FRAMES = 5
+# Report aggregate Mimi graph replay counters every N decoded requests, so a
+# serving run can state its decode graph hit rate (RFC #7389 evidence).
+_MIMI_GRAPH_STATS_LOG_INTERVAL = 1000
 
 
 def _codec_ids_from_payload_or_input(
@@ -104,6 +107,7 @@ class PersonaPlexCode2Wav(nn.Module):
         self._mimi_device: torch.device | None = None
         self._request_codec_slots: dict[str, int] = {}
         self._consumed_full_payload_requests: set[str] = set()
+        self._decoded_request_calls = 0
 
     # ------------------------------------------------------------------
     # Runner-facing no-op / placeholder hooks (mirror Qwen3TTSCode2Wav).
@@ -228,8 +232,12 @@ class PersonaPlexCode2Wav(nn.Module):
                     continue
                 self._consumed_full_payload_requests.add(state_id)
             wav = self._decode_streaming_frames(state_id, codes_kf.to(device=device))
+            self._decoded_request_calls += 1
             if wav.numel() > 0:
                 audios[i] = wav.to(dtype=torch.float32).reshape(-1)
+
+        if self._decoded_request_calls and self._decoded_request_calls % _MIMI_GRAPH_STATS_LOG_INTERVAL == 0:
+            self._log_mimi_graph_stats()
 
         return OmniOutput(
             text_hidden_states=None,
@@ -284,6 +292,30 @@ class PersonaPlexCode2Wav(nn.Module):
         if ephemeral:
             codec.reset_streaming()
         return wav
+
+    def _log_mimi_graph_stats(self) -> None:
+        totals = {"encode_graph": 0, "encode_eager": 0, "decode_graph": 0, "decode_eager": 0}
+        reporting = 0
+        for codec in self._mimi_codecs():
+            stats = getattr(codec, "graph_replay_stats", None)
+            if callable(stats):
+                reporting += 1
+                for key, value in stats().items():
+                    if key in totals:
+                        totals[key] += int(value)
+        if not reporting:
+            return
+        graph, eager = totals["decode_graph"], totals["decode_eager"]
+        hit_rate = 100.0 * graph / (graph + eager) if graph + eager else 0.0
+        logger.info(
+            "PersonaPlex Code2Wav Mimi decode graphs: graph_replays=%d eager_decodes=%d "
+            "hit_rate=%.1f%% streams=%d decoded_requests=%d",
+            graph,
+            eager,
+            hit_rate,
+            reporting,
+            self._decoded_request_calls,
+        )
 
     def _set_mimi_codecs(self, codecs: list[nn.Module]) -> None:
         if not codecs:

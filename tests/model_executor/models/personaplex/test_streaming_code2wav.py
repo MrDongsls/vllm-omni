@@ -379,3 +379,75 @@ def test_decoder_slot_lifecycle_isolated_capacity_and_reuse() -> None:
     assert second.reset_calls == 0
     replacement = model(input_ids=_codes(1), request_ids=["replacement"])
     assert _audio(replacement).tolist() == [13.0] * 4
+
+
+class _GraphStatsMimi(_FakeStreamingMimi):
+    """A leased decoder that reports invented graph/eager decode counters."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pretend_graph = False
+        self.decode_graph = 0
+        self.decode_eager = 0
+
+    def decode_frame(self, codes: torch.Tensor) -> torch.Tensor:
+        if self.pretend_graph:
+            self.decode_graph += 1
+        else:
+            self.decode_eager += 1
+        return super().decode_frame(codes)
+
+    def graph_replay_stats(self) -> dict[str, int]:
+        return {
+            "encode_graph": 0,
+            "encode_eager": 0,
+            "decode_graph": self.decode_graph,
+            "decode_eager": self.decode_eager,
+        }
+
+
+def test_graph_stats_logged_periodically_with_hit_rate(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.model_executor.models.personaplex import personaplex_code2wav
+
+    monkeypatch.setattr(personaplex_code2wav, "_MIMI_GRAPH_STATS_LOG_INTERVAL", 3)
+    infos: list[tuple] = []
+    monkeypatch.setattr(personaplex_code2wav.logger, "info", lambda *args, **kwargs: infos.append(args))
+    model, _ = _model()
+    mimi = _GraphStatsMimi()
+    model.mimi = mimi
+    model._mimi_device = torch.device("cpu")
+    try:
+        for start in range(2):
+            model(input_ids=_codes(1, start=start), request_ids=["req"])
+        assert not infos  # below the interval: nothing is logged yet
+
+        for start in range(2, 6):
+            model(input_ids=_codes(1, start=start), request_ids=["req"])
+        mimi.pretend_graph = True
+        for start in range(6, 9):
+            model(input_ids=_codes(1, start=start), request_ids=["req"])
+    finally:
+        model.on_requests_finished({"req"})
+
+    assert len(infos) == 3  # at 3, 6 and 9 decoded requests
+    rendered = [args[0] % args[1:] for args in infos]
+    assert "graph_replays=0" in rendered[0] and "eager_decodes=3" in rendered[0]
+    assert "hit_rate=0.0%" in rendered[0]
+    assert "graph_replays=0" in rendered[1] and "eager_decodes=6" in rendered[1]
+    assert "graph_replays=3" in rendered[2] and "eager_decodes=6" in rendered[2]
+    assert "hit_rate=33.3%" in rendered[2]
+
+
+def test_graph_stats_log_skips_codecs_without_counters(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.model_executor.models.personaplex import personaplex_code2wav
+
+    monkeypatch.setattr(personaplex_code2wav, "_MIMI_GRAPH_STATS_LOG_INTERVAL", 1)
+    infos: list[tuple] = []
+    monkeypatch.setattr(personaplex_code2wav.logger, "info", lambda *args, **kwargs: infos.append(args))
+    model, mimi = _model()  # _FakeStreamingMimi has no graph_replay_stats
+
+    model(input_ids=_codes(1), request_ids=["req"])
+    model.on_requests_finished({"req"})
+
+    assert mimi.decode_frame_calls == 1
+    assert not infos
