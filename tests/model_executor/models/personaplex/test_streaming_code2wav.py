@@ -438,6 +438,36 @@ def test_graph_stats_logged_periodically_with_hit_rate(monkeypatch: pytest.Monke
     assert "hit_rate=33.3%" in rendered[2]
 
 
+def test_graph_stats_log_fires_when_multi_request_steps_cross_the_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A duplex step decodes several requests at once, so the request counter
+    jumps past interval boundaries instead of landing on them exactly."""
+    from vllm_omni.model_executor.models.personaplex import personaplex_code2wav
+
+    monkeypatch.setattr(personaplex_code2wav, "_MIMI_GRAPH_STATS_LOG_INTERVAL", 3)
+    infos: list[tuple] = []
+    monkeypatch.setattr(personaplex_code2wav.logger, "info", lambda *args, **kwargs: infos.append(args))
+    model, _ = _model(max_sessions=2)
+    first, second = _GraphStatsMimi(), _GraphStatsMimi()
+    model._set_mimi_codecs([first, second])
+    model._mimi_device = torch.device("cpu")
+    try:
+        # Three two-request steps: the counter goes 2 -> 4 -> 6, crossing the
+        # interval multiples 3 and 6 without ever equaling 3.
+        for start in range(3):
+            model(
+                input_ids=torch.cat([_codes(1, start=start), _codes(1, start=10 + start)]),
+                request_ids=["first", "second"],
+                seq_token_counts=[2, 2],
+            )
+    finally:
+        model.on_requests_finished({"first", "second"})
+
+    assert len(infos) == 2
+    rendered = [args[0] % args[1:] for args in infos]
+    assert "decoded_requests=4" in rendered[0]  # first crossing of 3
+    assert "decoded_requests=6" in rendered[1]  # crossing of 6
+
+
 def test_graph_stats_log_skips_codecs_without_counters(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.model_executor.models.personaplex import personaplex_code2wav
 
