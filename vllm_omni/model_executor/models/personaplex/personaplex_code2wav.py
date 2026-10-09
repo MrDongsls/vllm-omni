@@ -108,6 +108,7 @@ class PersonaPlexCode2Wav(nn.Module):
         self._request_codec_slots: dict[str, int] = {}
         self._consumed_full_payload_requests: set[str] = set()
         self._decoded_request_calls = 0
+        self._graph_stats_log_epoch = 0
 
     # ------------------------------------------------------------------
     # Runner-facing no-op / placeholder hooks (mirror Qwen3TTSCode2Wav).
@@ -236,7 +237,11 @@ class PersonaPlexCode2Wav(nn.Module):
             if wav.numel() > 0:
                 audios[i] = wav.to(dtype=torch.float32).reshape(-1)
 
-        if self._decoded_request_calls and self._decoded_request_calls % _MIMI_GRAPH_STATS_LOG_INTERVAL == 0:
+        # A duplex step decodes every scheduled request at once, so the counter
+        # jumps past interval boundaries; fire on crossing, not on landing.
+        epoch = self._decoded_request_calls // _MIMI_GRAPH_STATS_LOG_INTERVAL
+        if epoch > self._graph_stats_log_epoch:
+            self._graph_stats_log_epoch = epoch
             self._log_mimi_graph_stats()
 
         return OmniOutput(
