@@ -980,6 +980,44 @@ def test_dreamzero_build_observations_shape(tmp_path) -> None:
     assert observations[1]["robot_obs"][camera_key].shape == (4, height, width, 3)
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_dreamzero_repeat_chunk_observations_pads_to_num_chunks(tmp_path) -> None:
+    height, width = 10, 12
+    camera_files = {
+        "observation/exterior_image_0_left": "exterior_image_1_left.mp4",
+        "observation/exterior_image_1_left": "exterior_image_2_left.mp4",
+        "observation/wrist_image_left": "wrist_image_left.mp4",
+    }
+
+    for file_name in camera_files.values():
+        writer = cv2.VideoWriter(
+            str(tmp_path / file_name),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            15.0,
+            (width, height),
+        )
+        for _ in range(24):
+            writer.write(np.zeros((height, width, 3), dtype=np.uint8))
+        writer.release()
+
+    num_chunks = 15
+    observations, _ = build_robot_observations(
+        "DreamZeroPipeline",
+        "model/dir",
+        "pick up the cup",
+        tmp_path,
+        num_chunks=num_chunks,
+        repeat_chunk_observations=True,
+    )
+
+    # 24 frames schedule only the initial frame plus one 4-frame chunk; the
+    # padding path must still reach 1 initial + num_chunks AR steps.
+    assert len(observations) == num_chunks + 1
+    assert all(obs["session_id"] == observations[0]["session_id"] for obs in observations)
+    assert [obs["reset"] for obs in observations] == [True] + [False] * num_chunks
+
+
 @pytest.fixture
 def make_dreamzero_output(mocker: MockerFixture):
     def _make_output(actions, latent):

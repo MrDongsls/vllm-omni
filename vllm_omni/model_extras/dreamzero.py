@@ -126,9 +126,11 @@ def build_observations(model_dir, task, data_dir, **extra_params) -> tuple[list[
     total = min(f.shape[0] for f in camera_frames.values())
     schedule = [[0]] + _build_frame_schedule(total, num_chunks)
 
-    if repeat_chunk_observations and len(schedule) <= num_chunks:
-        # <= num_chunks because schedule already contains the initial frame at index 0
-        while len(schedule) < num_chunks:
+    if repeat_chunk_observations and len(schedule) > 1:
+        # Pad with the last valid chunk so short assets still run num_chunks AR
+        # steps; schedule[0] is the initial frame, so the target length is
+        # num_chunks + 1 (matching the deleted export_prediction_video.py).
+        while len(schedule) < num_chunks + 1:
             schedule.append(schedule[-1])
 
     observations = []
