@@ -28,7 +28,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, resolve_model_class_name
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.engine.stage_init_utils import _resolve_model_to_local_path
 from vllm_omni.entrypoints.omni import Omni
@@ -258,6 +258,11 @@ def main() -> None:
     model_class_name = args.model_class_name
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     model_dir = _resolve_model_to_local_path(args.model)
+    # Resolve before engine init so registry-declared hooks (e.g. the
+    # DreamZero video-export worker extension) apply without requiring
+    # --model-class-name on the command line.
+    if model_class_name is None:
+        model_class_name = resolve_model_class_name(str(model_dir))
 
     # Configure cache based on backend type
     cache_config = None
@@ -306,6 +311,8 @@ def main() -> None:
     )
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
+    if args.deploy_config is not None:
+        omni_kwargs["deploy_config"] = args.deploy_config
     omni_kwargs["worker_extension_cls"] = get_worker_extension_class(model_class_name)
     print(f"\n{'=' * 60}")
     print(f"[Robot policy] model_class_name {model_class_name}")
