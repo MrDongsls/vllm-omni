@@ -10,9 +10,9 @@ wrist), it autoregressively predicts joint-position action chunks and the
 corresponding video rollout of the scene.
 
 DreamZero runs through the shared robot-policy task example
-[`examples/offline_inference/robot_policy/robot_policy.py`](../../../../examples/offline_inference/robot_policy/robot_policy.py).
+`examples/offline_inference/robot_policy/robot_policy.py`.
 Model-specific behavior is declared in
-[`vllm_omni/model_extras/dreamzero.py`](../../../../vllm_omni/model_extras/dreamzero.py)
+`vllm_omni/model_extras/dreamzero.py`
 and registered in the model-extras registry — there is no per-model example
 script.
 
@@ -73,11 +73,11 @@ VRAM is about 71 GiB — use one 80 GiB GPU. `--enable-cpu-offload` and
 ## Measures and validation
 
 - The standard path is covered by
-  [`tests/e2e/offline_inference/test_dreamzero.py`](../../../../tests/e2e/offline_inference/test_dreamzero.py)
+  `tests/e2e/offline_inference/test_dreamzero.py`
   (AR rollout + actions + video export) and the CPU unit tests in
-  [`tests/model_extras/test_model_extras.py`](../../../../tests/model_extras/test_model_extras.py).
+  `tests/model_extras/test_model_extras.py`.
 - For online serving over the OpenPI robot protocol see
-  [`examples/online_serving/dreamzero/`](../../../../examples/online_serving/dreamzero/).
+  `examples/online_serving/dreamzero/`.
 
 ## FAQ
 
