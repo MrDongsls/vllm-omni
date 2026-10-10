@@ -103,7 +103,9 @@ def _make_obs(
     return obs
 
 
-def build_observations(model_dir, task, data_dir, **extra_params) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def build_observations(
+    model_dir: Path | str, task: str, data_dir: Path | str, **extra_params: Any
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Read 3 camera MP4s and yield DreamZero AR extra_args dicts.
 
     Yields a sequence (autoregressive mode). The first item carries
@@ -150,7 +152,7 @@ def build_observations(model_dir, task, data_dir, **extra_params) -> tuple[list[
 
 def process_robot_actions(
     output: OmniRequestOutput,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """Extract actions from DreamZero's DiffusionOutput.
 
@@ -177,7 +179,7 @@ def process_robot_actions(
     return {"actions": action_array, "metadata": {"video_latents": latents}}
 
 
-def finalize(omni: Omni, results: list[dict], output_path) -> None:
+def finalize(omni: Omni, results: list[dict], output_path: Path) -> None:
     """Decode accumulated video latents into an mp4. Calling `decode_video_latents_to_uint8`
     provided by `vllm_omni/diffusion/models/dreamzero/video_export_worker.py`.
     """
@@ -204,4 +206,4 @@ def finalize(omni: Omni, results: list[dict], output_path) -> None:
     if not isinstance(decoded, np.ndarray):
         raise TypeError(f"Unexpected decoded output type: {type(decoded)!r}")
 
-    _write_mp4(output_path.with_suffix(".mp4"), decoded, fps=DEFAULT_EXPORT_FPS)
+    _write_mp4(str(output_path.with_suffix(".mp4")), decoded, fps=DEFAULT_EXPORT_FPS)

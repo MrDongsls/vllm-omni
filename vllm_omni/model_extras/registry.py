@@ -585,15 +585,10 @@ def process_robot_actions(
     spec = _get_spec(model_class_name)
     processor: ActionOutputProcessor | None = spec.get("action_output_processor") if spec is not None else None
     if processor is None:
-        output_arr = getattr(output, "output", output)
-        if isinstance(output_arr, dict) and "actions" in output_arr:
-            import numpy as np
-
-            return {"actions": np.asarray(output_arr["actions"]), "metadata": {}}
-        # Fallback: treat the whole output as actions
-        import numpy as np
-
-        return {"actions": np.asarray(output_arr), "metadata": {}}
+        raise NotImplementedError(
+            f"Model '{model_class_name}' has no action_output_processor registered; "
+            "it cannot run through the shared robot_policy example."
+        )
     return processor(output, **metadata)
 
 

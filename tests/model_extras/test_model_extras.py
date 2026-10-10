@@ -461,6 +461,13 @@ def test_unknown_pipeline_has_empty_extra_registry() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_process_robot_actions_unknown_pipeline_raises() -> None:
+    with pytest.raises(NotImplementedError, match="action_output_processor"):
+        process_robot_actions("UnknownPipeline", object())
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_bagel_text_to_image_prompt_builder() -> None:
     assert build_text_to_image_prompt(
         "BagelPipeline",
