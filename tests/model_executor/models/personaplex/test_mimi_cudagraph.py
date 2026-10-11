@@ -727,3 +727,61 @@ def test_capture_fallback_requires_successful_reset(capture_faults, point):
         capture_faults.capture()
     assert raised.value is error
     assert not capture_faults.warnings
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_shared_width_codec_rows_match_dedicated_codecs_and_graphs_stay_bitwise() -> None:
+    """One codec at N rows is the primitive of the shared Stage 1 decoder.
+
+    Row r of the width-N codec must track a dedicated B=1 codec over a mixed
+    frame-count schedule. Batched kernels reduce in different orders across
+    batch widths, so cross-width parity is a tolerance comparison (as the RFC
+    states for the encoder); graphed-versus-eager on the SAME width stays
+    bitwise, exactly like the per-codec B=1 graphs.
+    """
+    device = torch.device("cuda")
+    rows = 3
+    frame_counts = [1, 5, 5, 2, 1]  # first frame, full chunks, an uncaptured count
+    generator = torch.Generator(device="cpu").manual_seed(99)
+    codes = [
+        [torch.randint(0, 2048, (CODEBOOKS, frames), generator=generator).to(device) for frames in frame_counts]
+        for _ in range(rows)
+    ]
+    active = torch.ones(rows, dtype=torch.bool, device=device)
+    batches = [torch.stack([codes[row][step] for row in range(rows)]) for step in range(len(frame_counts))]
+
+    shared = _random_codec(device, rows)
+    per_request = [_random_codec(device, 1) for _ in range(rows)]  # same seed: same weights
+
+    # Cross-width: row r vs codec r, tolerance-bounded (fp32 reduction-order noise).
+    peak = rms = scale = 0.0
+    for step in range(len(frame_counts)):
+        expected = torch.cat(
+            [per_request[row].decode_frames(codes[row][step].unsqueeze(0)) for row in range(rows)],
+            dim=0,
+        )
+        actual = shared.decode_frames(batches[step], active)
+        error = (actual - expected).abs()
+        peak = max(peak, error.max().item())
+        rms = max(rms, error.square().mean().sqrt().item())
+        scale = max(scale, expected.abs().max().item())
+    # Measured on the random-weight codec: rel_peak ~1e-3, rel_rms ~2e-4,
+    # the expected fp32 batched-reduction noise amplified by the deep stack and
+    # the streaming state. Bounds keep a 2x margin over the measurement.
+    assert peak <= 2e-3 * scale, f"cross-width peak error {peak:.3e} on scale {scale:.3e}"
+    assert rms <= 5e-4 * scale, f"cross-width rms error {rms:.3e} on scale {scale:.3e}"
+
+    # Within-width: graphed vs eager on the same width-N codec is bitwise.
+    shared.streaming_init(rows)  # in-place reset; fresh stream
+    eager_audio = [shared.decode_frames(batch, active) for batch in batches]
+    shared.streaming_init(rows)
+    assert shared.capture_cuda_graphs(encode=False, decode_frame_counts=(1, 5)) == ["decode_f1", "decode_f5"]
+    before = shared.graph_replay_stats()
+    graph_audio = [shared.decode_frames(batch, active) for batch in batches]
+    for step, (eager, graphed) in enumerate(zip(eager_audio, graph_audio)):
+        assert torch.equal(eager, graphed), f"graphed step {step} diverged from eager at width {rows}"
+
+    after = shared.graph_replay_stats()
+    assert after["decode_graph"] - before["decode_graph"] == 4  # F in {1, 5}
+    assert after["decode_eager"] - before["decode_eager"] == 1  # F == 2 has no graph
