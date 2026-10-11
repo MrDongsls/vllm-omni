@@ -186,9 +186,10 @@ def _model(
     *,
     max_sessions: int = 1,
     async_chunk: bool = True,
+    shared_decoder: bool = False,
 ) -> tuple[PersonaPlexCode2Wav, _FakeStreamingMimi]:
     mimi_config = SimpleNamespace(num_codebooks=2, sample_rate=24000, samples_per_frame=4, mimi_name=None)
-    config = SimpleNamespace(mimi_config=mimi_config, mimi_name=None)
+    config = SimpleNamespace(mimi_config=mimi_config, mimi_name=None, mimi_shared_decoder=shared_decoder)
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             model="/unused",
@@ -481,3 +482,117 @@ def test_graph_stats_log_skips_codecs_without_counters(monkeypatch: pytest.Monke
 
     assert mimi.decode_frame_calls == 1
     assert not infos
+
+
+class _FakeSharedMimi(nn.Module):
+    """A width-N shared decoder: per-row state, one decode call per frame-count group."""
+
+    def __init__(self, samples_per_frame: int = 4) -> None:
+        super().__init__()
+        self.samples_per_frame = samples_per_frame
+        self.batch_size: int | None = None
+        self.calls: list[tuple[tuple[int, ...], list[bool]]] = []
+        self.reset_rows: list[int] = []
+        self.row_state: list[float] = []
+
+    def streaming_init(self, batch_size: int) -> None:
+        self.batch_size = batch_size
+        if len(self.row_state) < batch_size:
+            self.row_state = [0.0] * batch_size
+
+    def reset_slot(self, row: int) -> None:
+        self.reset_rows.append(row)
+        self.row_state[row] = 0.0
+
+    def decode_frames(self, codes: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        n_frames = codes.shape[-1]
+        self.calls.append((tuple(codes.shape), active.tolist()))
+        out = torch.zeros(codes.shape[0], n_frames * self.samples_per_frame)
+        for row in range(codes.shape[0]):
+            if not active[row]:
+                continue
+            value = float(codes[row, :, 0].sum()) + self.row_state[row]
+            self.row_state[row] += 1.0
+            out[row, :] = value
+        return out
+
+
+def _shared_model(max_sessions: int) -> tuple[PersonaPlexCode2Wav, _FakeSharedMimi]:
+    model, _ = _model(max_sessions=max_sessions, shared_decoder=True)
+    codec = _FakeSharedMimi()
+    codec.streaming_init(max_sessions)  # load_weights initializes the shared codec at full width
+    model._set_mimi_codecs([codec])
+    model._mimi_device = torch.device("cpu")
+    return model, codec
+
+
+def test_shared_decoder_groups_requests_by_frame_count_and_slices_rows() -> None:
+    model, codec = _shared_model(max_sessions=3)
+
+    out = model(
+        input_ids=torch.cat([_codes(1, start=0), _codes(2, start=10)]),
+        request_ids=["a", "b"],
+        seq_token_counts=[2, 4],
+    )
+
+    # One full-width call per distinct frame count; only leased rows are active.
+    assert [shape for shape, _ in codec.calls] == [(3, 2, 1), (3, 2, 2)]
+    assert [active for _, active in codec.calls] == [
+        [True, False, False],
+        [False, True, False],
+    ]
+    # Each request receives its own row's samples, and inactive row state is untouched.
+    audios = out.multimodal_outputs["model_outputs"]
+    assert audios[0].tolist() == [100.0] * 4
+    assert audios[1].tolist() == [120.0] * 8
+    assert codec.row_state == [1.0, 1.0, 0.0]
+    assert model._request_codec_slots == {"a": 0, "b": 1}
+
+
+def test_shared_decoder_leases_rows_recycles_and_enforces_capacity() -> None:
+    model, codec = _shared_model(max_sessions=2)
+    model(
+        input_ids=torch.cat([_codes(1, start=0), _codes(1, start=10)]),
+        request_ids=["a", "b"],
+        seq_token_counts=[2, 2],
+    )
+    assert model._request_codec_slots == {"a": 0, "b": 1}
+
+    with pytest.raises(RuntimeError, match=r"decoder capacity 2 is exhausted"):
+        model(input_ids=_codes(1, start=20), request_ids=["c"])
+
+    model.on_requests_finished(["a"])
+    # [0, 1] are the initial leases of a and b; the release re-primes row 0.
+    assert codec.reset_rows == [0, 1, 0]
+    model(input_ids=_codes(1, start=20), request_ids=["c"])
+    assert model._request_codec_slots == {"b": 1, "c": 0}
+    assert codec.reset_rows == [0, 1, 0, 0]  # release reset + lease reset
+
+    # An anonymous request borrows a free row without claiming a slot.
+    model.on_requests_finished(["b"])
+    model(input_ids=_codes(1, start=30))
+    # ... then the release of b resets row 1, and the anonymous lease borrows it.
+    assert codec.reset_rows == [0, 1, 0, 0, 1, 1]
+    assert model._request_codec_slots == {"c": 0}
+
+
+def test_shared_decoder_chunks_long_payloads_in_order() -> None:
+    model, codec = _shared_model(max_sessions=2)
+
+    out = model(input_ids=_codes(7, start=0), request_ids=["long"])
+
+    # F=7 splits into segments of 5 then 2, decoded in order on one row. The
+    # fake's per-call value is the segment's first frame (100, then 110) plus
+    # the row state it has accumulated (0, then 1).
+    assert [shape for shape, _ in codec.calls] == [(2, 2, 5), (2, 2, 2)]
+    assert [active for _, active in codec.calls] == [[True, False], [True, False]]
+    audio = out.multimodal_outputs["model_outputs"][0]
+    assert audio.numel() == 7 * 4
+    assert audio.tolist() == [100.0] * (5 * 4) + [111.0] * (2 * 4)
+    assert codec.row_state == [2.0, 0.0]
+
+
+def test_mimi_shared_decoder_config_flag_defaults_off() -> None:
+    from vllm_omni.model_executor.models.personaplex.configuration_personaplex import PersonaPlexConfig
+
+    assert PersonaPlexConfig().mimi_shared_decoder is False
