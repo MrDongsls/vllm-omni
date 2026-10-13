@@ -35,6 +35,7 @@ def _impl(*, causal: bool = False, backend_explicit: bool = False):
     obj.dtype_vo = None
     obj.backend_explicit = backend_explicit
     obj._sdpa_fallback = None
+    obj.device_capability = (10, 0)
     return obj
 
 
@@ -102,6 +103,24 @@ def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op(monkeypatch):
     assert result.support.status is SupportStatus.SUPPORTED
     assert result.compilation_mode is CompilationMode.CUSTOM_OP
     assert result.requested_support(context).status is SupportStatus.SUPPORTED
+
+
+def test_flashinfer_cute_dsl_dense_path_stays_unmigrated_without_artifacts(monkeypatch):
+    # compute capability (12, 0) has no published cute-dsl FMHA artifacts, so
+    # the dense path must not be declared supported there.
+    monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
+    monkeypatch.setattr(flashinfer_attn, "trtllm_ragged_attention_deepseek", lambda **_kwargs: object())
+    impl = _candidate_impl()
+    impl.device_capability = (12, 0)
+    query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
+    context = ExecutionContext(platform="cuda", require_fullgraph=True)
+
+    result = impl.resolve_execution_path(context, query, query, query, None)
+
+    assert result.path == "flashinfer_cute-dsl_dense"
+    assert result.support.status is SupportStatus.UNMIGRATED
+    assert result.compilation_mode is CompilationMode.EAGER_ONLY
+    assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
 
 
 def test_flashinfer_exact_fa2_path_is_supported_custom_op(monkeypatch):

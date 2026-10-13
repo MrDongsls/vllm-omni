@@ -226,6 +226,7 @@ def _candidate_impl():
     impl._kv_indptr = None
     impl._plan_key = None
     impl._sdpa_fallback = None
+    impl.device_capability = (10, 0)
     return impl
 
 
@@ -418,6 +419,51 @@ def test_flashinfer_real_backend_eager_fullgraph_agreement():
     assert path.support.status is SupportStatus.SUPPORTED
     assert path.compilation_mode.value == "custom_op"
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.cuda
+def test_flashinfer_cute_dsl_custom_op_matches_wrapper_and_sdpa():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for real FlashInfer execution")
+    if not flashinfer_attn.HAS_FLASHINFER:
+        pytest.skip("FlashInfer is not installed")
+    capability = torch.cuda.get_device_capability()
+    if capability[0] < 10 or capability == (12, 0):
+        pytest.skip("The cute-dsl dense artifacts are not published for this architecture")
+    if flashinfer_attn.trtllm_ragged_attention_deepseek is None:
+        pytest.skip("FlashInfer cute-dsl API is unavailable")
+
+    impl = flashinfer_attn.FlashInferAttentionImpl(
+        num_heads=2,
+        head_size=128,
+        softmax_scale=128**-0.5,
+        backend_kwargs={"quant": {"flashinfer_backend": "auto"}},
+    )
+
+    from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
+
+    context = ExecutionContext(platform="cuda", require_fullgraph=True)
+    for batch_size, query_length, kv_length in ((1, 4, 5), (2, 7, 4)):
+        query = torch.randn(batch_size, query_length, 2, 128, device=impl.device, dtype=torch.bfloat16)
+        key = torch.randn(batch_size, kv_length, 2, 128, device=impl.device, dtype=torch.bfloat16)
+        value = torch.randn(batch_size, kv_length, 2, 128, device=impl.device, dtype=torch.bfloat16)
+
+        path = impl.resolve_execution_path(context, query, key, value, None)
+        assert path.support.status is SupportStatus.SUPPORTED
+        assert path.compilation_mode.value == "custom_op"
+
+        direct = impl.forward_cuda(query, key, value)
+        wrapper = impl._run_batch_prefill(query, key, value, None)
+        sdpa = F.scaled_dot_product_attention(
+            query.transpose(1, 2).float(),
+            key.transpose(1, 2).float(),
+            value.transpose(1, 2).float(),
+            scale=impl.softmax_scale,
+        ).transpose(1, 2)
+
+        torch.testing.assert_close(direct, wrapper)
+        torch.testing.assert_close(direct.float(), sdpa, rtol=2e-2, atol=2e-2)
 
 
 def test_neighboring_unverified_path_keeps_stateful_wrapper(monkeypatch):

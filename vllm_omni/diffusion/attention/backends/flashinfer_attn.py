@@ -356,6 +356,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.device = torch.device("cuda", torch.accelerator.current_device_index())
+        self.device_capability = torch.cuda.get_device_capability(self.device)
         backend_kwargs = backend_kwargs or {}
         quant = backend_kwargs.get("quant") or {}
         self.dtype_qk = self._check_dtype(quant.get("dtype_qk"), "dtype_qk", self._QK_DTYPES)
@@ -372,6 +373,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         self._check_flashinfer_version()
 
         self.flashinfer_backend = self._select_backend(requested_backend, device=self.device)
+
         workspace_size = 0 if self.flashinfer_backend == "cute-dsl" else 128 * 1024 * 1024
         self._workspace = torch.empty(
             workspace_size,
@@ -614,8 +616,19 @@ class FlashInferAttentionImpl(AttentionImpl):
             return False
         if any(tensor.ndim != 4 for tensor in (query, key, value)):
             return False
+
+        # Gate on artifact availability, not raw kernel capability: the dense
+        # cute-dsl custom op loads FlashInfer's prebuilt FMHA artifacts, which
+        # are published for sm_100a/103a/107a/110a only. Compute capability
+        # (12, 0) has no artifacts and the trtllm-gen fallback rejects the
+        # architecture, so the route stays disabled there. Once SM120 is
+        # wired up (follow-up fmha_v2 route, or FlashInfer publishing sm_120f
+        # artifacts), replace this capability carve-out with an artifact
+        # availability probe so new architectures need no predicate edits.
+        _cute_dsl_dense_artifacts_published = self.device_capability != (12, 0)
         return (
             self.flashinfer_backend == "cute-dsl"
+            and _cute_dsl_dense_artifacts_published
             and trtllm_ragged_attention_deepseek is not None
             and not self.causal
             and self.dtype_qk in (None, torch.bfloat16)
@@ -626,7 +639,6 @@ class FlashInferAttentionImpl(AttentionImpl):
             and query.shape[0] == key.shape[0] == value.shape[0]
             and key.shape[1] == value.shape[1]
             and query.shape[2] == key.shape[2] == value.shape[2]
-            and query.shape[1] <= key.shape[1]
             and query.shape[0] > 0
             and query.shape[1] > 0
             and key.shape[1] > 0
