@@ -105,13 +105,14 @@ def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op(monkeypatch):
     assert result.requested_support(context).status is SupportStatus.SUPPORTED
 
 
-def test_flashinfer_cute_dsl_dense_path_stays_unmigrated_without_artifacts(monkeypatch):
-    # compute capability (12, 0) has no published cute-dsl FMHA artifacts, so
-    # the dense path must not be declared supported there.
+@pytest.mark.parametrize("capability", [(12, 0), (9, 0)])
+def test_flashinfer_cute_dsl_dense_path_stays_unmigrated_without_artifacts(monkeypatch, capability):
+    # Architectures without published cute-dsl FMHA artifacts must not have
+    # the dense path declared supported, even when the backend is forced.
     monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
     monkeypatch.setattr(flashinfer_attn, "trtllm_ragged_attention_deepseek", lambda **_kwargs: object())
     impl = _candidate_impl()
-    impl.device_capability = (12, 0)
+    impl.device_capability = capability
     query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
     context = ExecutionContext(platform="cuda", require_fullgraph=True)
 

@@ -390,7 +390,7 @@ def test_flashinfer_real_backend_eager_fullgraph_agreement():
         expected_backend = "fa2"
         if flashinfer_attn.single_prefill_with_kv_cache is None:
             pytest.skip("FlashInfer single-prefill API is unavailable")
-    elif capability[0] >= 10 and capability != (12, 0):
+    elif capability[0] >= 10 and flashinfer_attn._cute_dsl_dense_artifacts_published(capability):
         expected_backend = "cute-dsl"
         if flashinfer_attn.trtllm_ragged_attention_deepseek is None:
             pytest.skip("FlashInfer cute-dsl API is unavailable")
@@ -429,7 +429,7 @@ def test_flashinfer_cute_dsl_custom_op_matches_wrapper_and_sdpa():
     if not flashinfer_attn.HAS_FLASHINFER:
         pytest.skip("FlashInfer is not installed")
     capability = torch.cuda.get_device_capability()
-    if capability[0] < 10 or capability == (12, 0):
+    if not flashinfer_attn._cute_dsl_dense_artifacts_published(capability):
         pytest.skip("The cute-dsl dense artifacts are not published for this architecture")
     if flashinfer_attn.trtllm_ragged_attention_deepseek is None:
         pytest.skip("FlashInfer cute-dsl API is unavailable")

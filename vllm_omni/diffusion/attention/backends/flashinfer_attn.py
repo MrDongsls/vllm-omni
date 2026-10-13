@@ -209,6 +209,19 @@ def _is_cuda_execution_path(*tensors: torch.Tensor) -> bool:
     return all(tensor.device.type == "cuda" for tensor in tensors)
 
 
+def _cute_dsl_dense_artifacts_published(capability: tuple[int, int]) -> bool:
+    # The dense cute-dsl custom op loads FlashInfer's prebuilt FMHA artifacts,
+    # published for a fixed architecture set (sm_100a/103a/107a/110a today).
+    # Compute capability (12, 0) has no artifacts and its trtllm-gen fallback
+    # rejects the architecture. Keep this as the single source of truth: the
+    # runtime predicate and the real-kernel test guards both call it, so
+    # support changes land in one place. When SM120 is wired up (follow-up
+    # fmha_v2 route, or FlashInfer publishing sm_120f artifacts), extend the
+    # set here -- ideally by probing artifact availability instead of
+    # hardcoding capabilities.
+    return capability in {(10, 0), (10, 3), (10, 7), (11, 0)}
+
+
 def _metadata_is_plain_dense(attn_metadata: AttentionMetadata | None) -> bool:
     return attn_metadata is None or (
         attn_metadata.attn_mask is None
@@ -617,18 +630,9 @@ class FlashInferAttentionImpl(AttentionImpl):
         if any(tensor.ndim != 4 for tensor in (query, key, value)):
             return False
 
-        # Gate on artifact availability, not raw kernel capability: the dense
-        # cute-dsl custom op loads FlashInfer's prebuilt FMHA artifacts, which
-        # are published for sm_100a/103a/107a/110a only. Compute capability
-        # (12, 0) has no artifacts and the trtllm-gen fallback rejects the
-        # architecture, so the route stays disabled there. Once SM120 is
-        # wired up (follow-up fmha_v2 route, or FlashInfer publishing sm_120f
-        # artifacts), replace this capability carve-out with an artifact
-        # availability probe so new architectures need no predicate edits.
-        _cute_dsl_dense_artifacts_published = self.device_capability != (12, 0)
         return (
             self.flashinfer_backend == "cute-dsl"
-            and _cute_dsl_dense_artifacts_published
+            and _cute_dsl_dense_artifacts_published(self.device_capability)
             and trtllm_ragged_attention_deepseek is not None
             and not self.causal
             and self.dtype_qk in (None, torch.bfloat16)
