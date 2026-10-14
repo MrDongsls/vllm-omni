@@ -14,6 +14,11 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
+# The suite compiles the same forward_cuda frame once per test with a fresh
+# impl object (distinct handle/guards); Dynamo's default per-frame cache of 8
+# entries would fail later tests once it fills.
+torch._dynamo.config.cache_size_limit = 64
+
 
 def _inputs(*, value_head_dim: int = 128):
     query = torch.randn(6, 2, 128, dtype=torch.bfloat16)
@@ -202,9 +207,12 @@ class _RecordingWrapper:
     def __init__(self):
         self.plan_calls = 0
         self.run_calls = 0
+        self.plan_custom_masks = []
 
     def plan(self, *args, **kwargs):
         self.plan_calls += 1
+        custom_mask = kwargs.get("custom_mask")
+        self.plan_custom_masks.append(None if custom_mask is None else tuple(custom_mask.shape))
 
     def run(self, query, key, value, **kwargs):
         self.run_calls += 1
@@ -227,6 +235,8 @@ def _candidate_impl():
     impl._plan_key = None
     impl._sdpa_fallback = None
     impl.device_capability = (10, 0)
+    # __new__ bypasses __init__, so register the boundary-op handle explicitly.
+    impl._op_handle = flashinfer_attn._register_impl_for_boundary_op(impl)
     return impl
 
 
@@ -535,3 +545,181 @@ def test_only_exact_dense_cute_dsl_path_is_custom_op_candidate(
     query = torch.empty(1, 4, 2, head_dim, dtype=tensor_dtype)
 
     assert not impl._is_cute_dsl_custom_op_candidate(query, query, query, metadata)
+
+
+def test_flashinfer_attention_boundary_op_schema_and_fake():
+    impl = _candidate_impl()
+    impl.flashinfer_backend = "fa2"
+    impl._wrapper = _RecordingWrapper()
+    query = torch.randn(2, 3, 2, 128, dtype=torch.bfloat16)
+    key = torch.randn(2, 5, 2, 128, dtype=torch.bfloat16)
+    value = torch.randn(2, 5, 2, 128, dtype=torch.bfloat16)
+    mask = torch.ones(3, 5, dtype=torch.bool)
+    mask[:, -1] = False
+
+    op = torch.ops.vllm_omni.flashinfer_attention.default
+    result = torch.library.opcheck(
+        op,
+        (query, key, value, mask, impl._op_handle, False, False),
+        test_utils=("test_schema", "test_faketensor"),
+    )
+
+    assert result == {
+        "test_schema": "SUCCESS",
+        "test_faketensor": "SUCCESS",
+    }
+
+
+_WRAPPER_ROUTE_CASES = [
+    # Every configuration the review bot's P1 named outside the two dense
+    # special-case envelopes, plus the packed-metadata entry: all must reach
+    # the stateful wrapper through the opaque boundary op under fullgraph.
+    ("fa3_backend", "fa3", False, torch.bfloat16, 128, "none"),
+    ("causal", "fa2", True, torch.bfloat16, 128, "none"),
+    ("fp16", "fa2", False, torch.float16, 128, "none"),
+    ("head_dim_64", "fa2", False, torch.bfloat16, 64, "none"),
+    ("masked", "fa2", False, torch.bfloat16, 128, "partial"),
+    ("packed_metadata", "fa2", False, torch.bfloat16, 128, "packed"),
+]
+
+
+@pytest.mark.parametrize(
+    ("case_id", "backend", "causal", "dtype", "head_dim", "mask_kind"),
+    _WRAPPER_ROUTE_CASES,
+)
+def test_wrapper_route_configs_are_opaque_to_fullgraph(
+    monkeypatch,
+    case_id,
+    backend,
+    causal,
+    dtype,
+    head_dim,
+    mask_kind,
+):
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
+    monkeypatch.setattr(
+        flashinfer_attn,
+        "single_prefill_with_kv_cache",
+        lambda *_args, **_kwargs: pytest.fail("wrapper-route case unexpectedly used the fa2 custom op"),
+    )
+    monkeypatch.setattr(
+        flashinfer_attn,
+        "trtllm_ragged_attention_deepseek",
+        lambda **_kwargs: pytest.fail("wrapper-route case unexpectedly used the cute-dsl custom op"),
+    )
+    impl = _candidate_impl()
+    impl.flashinfer_backend = backend
+    impl.causal = causal
+    impl._wrapper = _RecordingWrapper()
+
+    query = torch.randn(2, 3, 2, head_dim, dtype=dtype)
+    key = torch.randn(2, 5, 2, head_dim, dtype=dtype)
+    value = torch.randn(2, 5, 2, head_dim, dtype=dtype)
+    metadata: AttentionMetadata | None
+    if mask_kind == "partial":
+        mask = torch.ones(3, 5, dtype=torch.bool)
+        mask[:, -1] = False
+        metadata = AttentionMetadata(attn_mask=mask)
+    elif mask_kind == "packed":
+        metadata = AttentionMetadata(
+            extra={
+                "cu_seqlens_q": torch.tensor([0, 3, 6], dtype=torch.int32),
+                "cu_seqlens_k": torch.tensor([0, 5, 10], dtype=torch.int32),
+                "max_seqlen_q": 3,
+                "max_seqlen_k": 5,
+            }
+        )
+    else:
+        metadata = None
+
+    assert not impl._is_fa2_custom_op_candidate(query, key, value, metadata)
+    assert not impl._is_cute_dsl_custom_op_candidate(query, key, value, metadata)
+
+    compiled = torch.compile(impl.forward_cuda, backend="eager", fullgraph=True)
+    expected = impl.forward_cuda(query, key, value, metadata)
+    actual = compiled(query, key, value, metadata)
+
+    torch.testing.assert_close(actual, expected)
+    # One eager plus one compiled invocation, both executing plan/run inside
+    # the boundary op body.
+    assert impl._wrapper.run_calls == 2
+    if mask_kind == "partial":
+        # The boundary op packed and flattened the mask before planning.
+        assert impl._wrapper.plan_custom_masks[-1] == (2 * 3 * 5,)
+
+
+def test_all_keep_mask_with_causal_is_rejected_before_the_boundary_op(monkeypatch):
+    # Locked-in behavior change of the unified boundary op: rejection is
+    # decided on the raw mask's presence (statically traceable), so an
+    # all-keep mask no longer elides past the causal check into the wrapper.
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    query = torch.randn(1, 4, 2, 8)
+    metadata = AttentionMetadata(attn_mask=torch.ones(4, 4, dtype=torch.bool))
+
+    auto_impl = _candidate_impl()
+    auto_impl.flashinfer_backend = "fa2"
+    auto_impl.causal = True
+    auto_impl.backend_explicit = False
+    auto_impl._wrapper = _UnexpectedWrapper()
+
+    expected = auto_impl.forward_cuda(query, query, query, metadata)
+    compiled = torch.compile(auto_impl.forward_cuda, backend="eager", fullgraph=True)
+    torch.testing.assert_close(compiled(query, query, query, metadata), expected)
+
+    explicit_impl = _candidate_impl()
+    explicit_impl.flashinfer_backend = "fa2"
+    explicit_impl.causal = True
+    explicit_impl.backend_explicit = True
+    with pytest.raises(ValueError, match="causal=True"):
+        explicit_impl.forward_cuda(query, query, query, metadata)
+
+
+@pytest.mark.gpu
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("causal", "dtype", "head_dim", "query_gt_kv", "masked"),
+    [
+        (False, torch.bfloat16, 128, False, False),
+        (True, torch.bfloat16, 128, False, False),
+        (False, torch.float16, 128, False, False),
+        (False, torch.bfloat16, 64, False, False),
+        (False, torch.bfloat16, 256, False, False),
+        (False, torch.bfloat16, 128, True, False),
+        (False, torch.bfloat16, 128, False, True),
+    ],
+)
+def test_flashinfer_fa2_configs_fullgraph_eager_agreement(
+    causal,
+    dtype,
+    head_dim,
+    query_gt_kv,
+    masked,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for real FlashInfer execution")
+    if not flashinfer_attn.HAS_FLASHINFER:
+        pytest.skip("FlashInfer is not installed")
+
+    impl = flashinfer_attn.FlashInferAttentionImpl(
+        num_heads=2,
+        head_size=head_dim,
+        softmax_scale=head_dim**-0.5,
+        causal=causal,
+        backend_kwargs={"quant": {"flashinfer_backend": "fa2"}},
+    )
+    batch_size, qo_len, kv_len = (2, 5, 3) if query_gt_kv else (2, 4, 7)
+    query = torch.randn(batch_size, qo_len, 2, head_dim, device=impl.device, dtype=dtype)
+    key = torch.randn(batch_size, kv_len, 2, head_dim, device=impl.device, dtype=dtype)
+    value = torch.randn(batch_size, kv_len, 2, head_dim, device=impl.device, dtype=dtype)
+    metadata: AttentionMetadata | None = None
+    if masked:
+        mask = torch.ones(batch_size, qo_len, kv_len, device=impl.device, dtype=torch.bool)
+        mask[..., -1] = False
+        metadata = AttentionMetadata(attn_mask=mask)
+
+    compiled = torch.compile(impl.forward_cuda, backend="eager", fullgraph=True)
+    expected = impl.forward_cuda(query, key, value, metadata)
+    actual = compiled(query, key, value, metadata)
+
+    torch.testing.assert_close(actual, expected)
