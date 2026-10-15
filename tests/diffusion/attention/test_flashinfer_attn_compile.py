@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import functools
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,6 +9,7 @@ import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends import flashinfer_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -372,11 +372,19 @@ def test_active_parallel_context_keeps_stateful_wrapper(
     wrapper = _RecordingWrapper()
     impl._wrapper = wrapper
     query = torch.randn(1, 4, 2, 128, dtype=torch.bfloat16)
-    runtime_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            sequence_parallel_size=sequence_parallel_size,
-            use_hsdp=use_hsdp,
-        ),
+    parallel_config_kwargs: dict[str, int | bool] = {
+        "sequence_parallel_size": sequence_parallel_size,
+        # The config validator requires sequence_parallel_size to equal
+        # ulysses_degree * ring_degree.
+        "ulysses_degree": sequence_parallel_size,
+        "use_hsdp": use_hsdp,
+    }
+    if use_hsdp:
+        # Standalone HSDP needs an explicit shard size; auto-derivation raises
+        # when every other parallel dimension is 1.
+        parallel_config_kwargs["hsdp_shard_size"] = 1
+    runtime_config = OmniDiffusionConfig(
+        parallel_config=DiffusionParallelConfig(**parallel_config_kwargs),
     )
 
     with set_forward_context(omni_diffusion_config=runtime_config):

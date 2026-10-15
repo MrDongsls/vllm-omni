@@ -348,8 +348,7 @@ def _runtime_context_allows_custom_op(
             return True
         if forward_context.sp_active:
             return False
-        parallel_config = getattr(config, "parallel_config", None)
-        return not bool(getattr(parallel_config, "use_hsdp", False))
+        return not config.parallel_config.use_hsdp
     except (AssertionError, ValueError):
         # Standalone backend calls and capability unit tests may not install a
         # ForwardContext. The tensor/context checks above remain authoritative.
