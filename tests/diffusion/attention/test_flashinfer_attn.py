@@ -36,6 +36,10 @@ def _impl(*, causal: bool = False, backend_explicit: bool = False):
     obj.backend_explicit = backend_explicit
     obj._sdpa_fallback = None
     obj.device_capability = (10, 0)
+    # __new__ bypasses __init__; mask reject/fallback runs inside the boundary
+    # op now, so those paths need the op token __init__ would have built.
+    obj._op_handle = flashinfer_attn._register_impl_for_boundary_op(obj)
+    obj._op_token = torch.tensor(obj._op_handle, dtype=torch.int64)
     return obj
 
 

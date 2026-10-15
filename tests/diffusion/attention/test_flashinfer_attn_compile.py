@@ -5,6 +5,7 @@ import functools
 
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends import flashinfer_attn
@@ -14,10 +15,15 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-# The suite compiles the same forward_cuda frame once per test with a fresh
-# impl object (distinct handle/guards); Dynamo's default per-frame cache of 8
-# entries would fail later tests once it fills.
-torch._dynamo.config.cache_size_limit = 64
+
+@pytest.fixture(autouse=True)
+def _fresh_dynamo_cache():
+    # Each test compiles forward_cuda for freshly built impls; start every
+    # test with an empty Dynamo frame cache so the default per-frame limit
+    # applies and per-instance specialization cannot hide behind it.
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
 
 
 def _inputs(*, value_head_dim: int = 128):
@@ -235,8 +241,10 @@ def _candidate_impl():
     impl._plan_key = None
     impl._sdpa_fallback = None
     impl.device_capability = (10, 0)
-    # __new__ bypasses __init__, so register the boundary-op handle explicitly.
+    # __new__ bypasses __init__, so register the boundary-op handle explicitly
+    # and mirror the CPU token __init__ would have built for it.
     impl._op_handle = flashinfer_attn._register_impl_for_boundary_op(impl)
+    impl._op_token = torch.tensor(impl._op_handle, dtype=torch.int64)
     return impl
 
 
@@ -568,7 +576,7 @@ def test_flashinfer_attention_boundary_op_schema_and_fake():
     op = torch.ops.vllm_omni.flashinfer_attention.default
     result = torch.library.opcheck(
         op,
-        (query, key, value, mask, impl._op_handle, False, False),
+        (query, key, value, mask, impl._op_token, False, False),
         test_utils=("test_schema", "test_faketensor"),
     )
 
@@ -657,30 +665,126 @@ def test_wrapper_route_configs_are_opaque_to_fullgraph(
         assert impl._wrapper.plan_custom_masks[-1] == (2 * 3 * 5,)
 
 
-def test_all_keep_mask_with_causal_is_rejected_before_the_boundary_op(monkeypatch):
-    # Locked-in behavior change of the unified boundary op: rejection is
-    # decided on the raw mask's presence (statically traceable), so an
-    # all-keep mask no longer elides past the causal check into the wrapper.
+@pytest.mark.parametrize(
+    ("backend", "causal", "backend_explicit"),
+    [
+        ("fa2", True, False),
+        ("fa2", True, True),
+        ("cute-dsl", False, False),
+        ("cute-dsl", False, True),
+    ],
+)
+def test_all_keep_mask_elides_before_the_rejections(monkeypatch, backend, causal, backend_explicit):
+    # Pre-PR semantics: an all-keep mask packs to None *before* the causal and
+    # cute-dsl rejections, so those calls run exactly like a call without any
+    # mask — through the stateful wrapper here (CPU tensors keep the dense
+    # custom-op gates closed). The unified boundary op must preserve that.
     monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
-    query = torch.randn(1, 4, 2, 8)
+    monkeypatch.setattr(
+        flashinfer_attn,
+        "single_prefill_with_kv_cache",
+        lambda *_args, **_kwargs: pytest.fail("all-keep mask case unexpectedly used the fa2 custom op"),
+    )
+    monkeypatch.setattr(
+        flashinfer_attn,
+        "trtllm_ragged_attention_deepseek",
+        lambda **_kwargs: pytest.fail("all-keep mask case unexpectedly used the cute-dsl custom op"),
+    )
+    query = torch.randn(1, 4, 2, 128, dtype=torch.bfloat16)
     metadata = AttentionMetadata(attn_mask=torch.ones(4, 4, dtype=torch.bool))
 
-    auto_impl = _candidate_impl()
-    auto_impl.flashinfer_backend = "fa2"
-    auto_impl.causal = True
-    auto_impl.backend_explicit = False
-    auto_impl._wrapper = _UnexpectedWrapper()
+    impl = _candidate_impl()
+    impl.flashinfer_backend = backend
+    impl.causal = causal
+    impl.backend_explicit = backend_explicit
+    wrapper = _RecordingWrapper()
+    impl._wrapper = wrapper
 
-    expected = auto_impl.forward_cuda(query, query, query, metadata)
-    compiled = torch.compile(auto_impl.forward_cuda, backend="eager", fullgraph=True)
+    expected = impl.forward_cuda(query, query, query, metadata)
+    compiled = torch.compile(impl.forward_cuda, backend="eager", fullgraph=True)
     torch.testing.assert_close(compiled(query, query, query, metadata), expected)
 
-    explicit_impl = _candidate_impl()
-    explicit_impl.flashinfer_backend = "fa2"
-    explicit_impl.causal = True
-    explicit_impl.backend_explicit = True
-    with pytest.raises(ValueError, match="causal=True"):
-        explicit_impl.forward_cuda(query, query, query, metadata)
+    # The elided mask skipped the rejections; the wrapper ran like a plain
+    # dense call (plan cached across the eager + compiled invocations).
+    assert wrapper.plan_calls == 1
+    assert wrapper.run_calls == 2
+
+
+@pytest.mark.parametrize(
+    ("backend", "causal"),
+    [("fa2", True), ("cute-dsl", False)],
+)
+def test_partial_mask_rejections_are_preserved(monkeypatch, backend, causal):
+    # A mask with real masked-out positions is NOT elided: explicit backends
+    # keep raising for causal/cute-dsl, exactly like before the PR.
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    query = torch.randn(1, 4, 2, 128, dtype=torch.bfloat16)
+    mask = torch.ones(4, 4, dtype=torch.bool)
+    mask[:, -1] = False
+    metadata = AttentionMetadata(attn_mask=mask)
+
+    impl = _candidate_impl()
+    impl.flashinfer_backend = backend
+    impl.causal = causal
+    impl.backend_explicit = True
+
+    with pytest.raises(ValueError, match="causal=True|cute-dsl backend does not support custom masks"):
+        impl.forward_cuda(query, query, query, metadata)
+
+
+class _AttentionBlock(nn.Module):
+    """A transformer-style block owning one attention impl, mirroring how
+    DreamZero compiles blocks individually."""
+
+    def __init__(self, impl):
+        super().__init__()
+        self.impl = impl
+
+    def forward(self, query, key, value):
+        return self.impl.forward_cuda(query, key, value)
+
+
+def test_equivalent_instances_share_one_compiled_graph(monkeypatch):
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    num_blocks = 10  # Above Dynamo's default per-frame cache of 8 entries.
+    blocks = []
+    for _ in range(num_blocks):
+        impl = _fa2_candidate_impl()
+        impl._wrapper = _RecordingWrapper()
+        blocks.append(_AttentionBlock(impl))
+
+    query = torch.randn(2, 3, 2, 128, dtype=torch.bfloat16)
+    key = torch.randn(2, 5, 2, 128, dtype=torch.bfloat16)
+    value = torch.randn(2, 5, 2, 128, dtype=torch.bfloat16)
+    eager_outputs = [block(query, key, value) for block in blocks]
+
+    compile_count = 0
+
+    def counting_backend(graph_module, _example_inputs):
+        nonlocal compile_count
+        compile_count += 1
+        return graph_module.forward
+
+    torch._dynamo.reset()
+    with torch._dynamo.config.patch(cache_size_limit=8):
+        compiled_outputs = []
+        for block in blocks:
+            compiled = torch.compile(
+                block,
+                backend=counting_backend,
+                fullgraph=True,
+                dynamic=True,
+            )
+            compiled_outputs.append(compiled(query, key, value))
+
+    for actual, expected in zip(compiled_outputs, eager_outputs, strict=True):
+        torch.testing.assert_close(actual, expected)
+    # One graph shared by every equivalent instance, and each instance's
+    # wrapper executed its own plan/run inside the boundary op.
+    assert compile_count == 1
+    for block in blocks:
+        assert block.impl._wrapper.plan_calls == 1
+        assert block.impl._wrapper.run_calls == 2  # eager + compiled calls
 
 
 @pytest.mark.gpu
