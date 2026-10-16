@@ -1563,6 +1563,8 @@ def test_transformer_builds_full_layer_replica_without_pp_init(monkeypatch: pyte
     assert len(model.gen_layers) == 2
     assert all(not isinstance(layer, transformer_cosmos3.PPMissingLayer) for layer in model.gen_layers)
 
+    assert isinstance(model.gen_sp_prepare, transformer_cosmos3.Cosmos3GenSPPrepare)
+
 
 def test_build_pp_intermediate_tensors_sends_und_cache_on_first_step_only() -> None:
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
@@ -1619,7 +1621,7 @@ def test_maybe_load_und_cache_and_prep_sizes_from_pp_intermediate_tensors(
         sound_latents=sound,
     )
     assert torch.equal(prep.hidden_gen, hidden)
-    assert prep.freqs_gen == receiver.cached_freqs_gen
+    assert prep.freqs_gen is None
     assert (prep.t, prep.h, prep.w) == (1, 2, 2)
     # latent_patch_size=1: hp*wp == h*w
     assert prep.s_video == 1 * 2 * 2

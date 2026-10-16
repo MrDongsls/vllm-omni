@@ -1494,7 +1494,7 @@ class Cosmos3VFMTransformer(nn.Module):
             self.mixed_precision_runtime.install(self)
 
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps) if is_pp_last_rank else PPMissingLayer()
-        self.gen_sp_prepare = Cosmos3GenSPPrepare() if is_pp_first_rank else PPMissingLayer()
+        self.gen_sp_prepare = Cosmos3GenSPPrepare()
         self.gen_sp_gather = nn.Identity()
 
         # Cached state (populated on first forward, reused across denoising steps)
@@ -2010,6 +2010,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 control_latents=control_latents,
                 control_weights=control_weights,
             )
+            prep = self._shard_gen_prep(prep)
 
         hidden_gen = self._run_gen_layers_from_prep(prep)
         if not is_pp_last:
@@ -2105,7 +2106,7 @@ class Cosmos3VFMTransformer(nn.Module):
             use_multi_control_attention=use_multi_control_attention,
             multi_control_token_sizes=control_token_sizes if use_multi_control_attention else None,
             multi_control_weights=multi_control_weights,
-            freqs_gen=self.cached_freqs_gen,
+            freqs_gen=None,
         )
 
     def _gen_preprocess(
