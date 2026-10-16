@@ -1626,3 +1626,65 @@ def test_maybe_load_und_cache_and_prep_sizes_from_pp_intermediate_tensors(
     assert prep.s_action == 3
     assert prep.s_sound == 2
     assert prep.has_action and prep.has_sound and not prep.has_control
+
+
+def test_run_gen_layers_rejects_cache_dit_wrapper_under_pp(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    monkeypatch.setattr(transformer_cosmos3, "_pp_parallel_active", lambda: True)
+    model.cached_kv = [(torch.zeros(1), torch.ones(1)) for _ in range(2)]
+    freqs = (torch.zeros(1, 2, 1, 8), torch.ones(1, 2, 1, 8))
+    model.cached_freqs_gen = freqs
+
+    class PassthroughWrapper(nn.Module):
+        def forward(self, hidden, **kwargs):
+            return hidden
+
+    # Cache-dit replaces gen_layers with a single grouped wrapper.
+    model.gen_layers = nn.ModuleList([PassthroughWrapper()])
+
+    model.start_layer, model.end_layer = 0, 1  # a PP rank slice
+    with pytest.raises(NotImplementedError, match="Cache-Dit"):
+        model._run_gen_layers(
+            torch.randn(1, 2, 8),
+            freqs_gen=freqs,
+            gather_output=False,
+            s_video=2,
+            s_control=0,
+            s_action=0,
+            s_sound=0,
+            has_action=False,
+            has_sound=False,
+            has_control=False,
+            ulysses_size=1,
+            use_multi_control_attention=False,
+            multi_control_token_sizes=None,
+            multi_control_weights=None,
+        )
+
+    # A full replica slice keeps the wrapper loop working.
+    model.start_layer, model.end_layer = 0, 2
+    hidden = torch.randn(1, 2, 8)
+    torch.testing.assert_close(
+        model._run_gen_layers(
+            hidden,
+            freqs_gen=freqs,
+            gather_output=False,
+            s_video=2,
+            s_control=0,
+            s_action=0,
+            s_sound=0,
+            has_action=False,
+            has_sound=False,
+            has_control=False,
+            ulysses_size=1,
+            use_multi_control_attention=False,
+            multi_control_token_sizes=None,
+            multi_control_weights=None,
+        ),
+        hidden,
+    )

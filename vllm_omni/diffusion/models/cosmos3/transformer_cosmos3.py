@@ -1929,7 +1929,12 @@ class Cosmos3VFMTransformer(nn.Module):
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
         else:
-            # Cache-dit patches gen_layers to a grouped wrapper.
+            # Cache-dit patches gen_layers to a grouped wrapper holding every
+            # layer, so a PP rank would run foreign stages' layers.
+            if _pp_parallel_active() and (self.start_layer, self.end_layer) != (0, len(self.cached_kv)):
+                raise NotImplementedError(
+                    "Cosmos3 Cache-Dit is not supported together with pipeline parallelism; disable one of them."
+                )
             for layer in self.gen_layers:
                 hidden_gen = layer(
                     hidden_gen,
