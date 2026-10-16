@@ -3057,7 +3057,7 @@ class Cosmos3OmniDiffusersPipeline(
                 )
                 if isinstance(next_latents, AsyncLatents):
                     next_latents = next_latents._resolve()
-                if _has_multimodal and is_pipeline_first_stage():
+                if _has_multimodal and (not pp_active or is_pipeline_first_stage()):
                     unpacked = _unpack_joint(next_latents, _joint_shapes, _joint_numels)
                     latents = unpacked[0]
                     idx = 1
