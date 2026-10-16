@@ -42,6 +42,7 @@ from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
+    get_pipeline_parallel_world_size,
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
@@ -145,6 +146,26 @@ def _is_sp_active() -> bool:
     if not is_forward_context_available():
         return False
     return get_forward_context().sp_active
+
+
+def _pp_parallel_active() -> bool:
+    """Whether pipeline parallelism is initialized with world_size > 1.
+
+    Serving initializes the PP group (possibly with world_size 1) before the
+    transformer is built. CPU tests never initialize it and must keep the
+    plain single-rank behavior instead of tripping ``parallel_state`` asserts.
+    """
+    try:
+        return get_pipeline_parallel_world_size() > 1
+    except Exception:
+        return False
+
+
+def _pp_stage_flags() -> tuple[bool, bool]:
+    """``(is_first_stage, is_last_stage)`` with uninitialized PP as single-stage."""
+    if not _pp_parallel_active():
+        return True, True
+    return is_pipeline_first_stage(), is_pipeline_last_stage()
 
 
 def _tf_config_get(config: Any, key: str, default: Any) -> Any:
@@ -1376,8 +1397,7 @@ class Cosmos3VFMTransformer(nn.Module):
             )
         _validate_mixed_precision_runtime(mixed_precision_config, od_config)
 
-        is_pp_first_rank = is_pipeline_first_stage()
-        is_pp_last_rank = is_pipeline_last_stage()
+        is_pp_first_rank, is_pp_last_rank = _pp_stage_flags()
 
         if is_pp_first_rank:
             self.language_model = self._language_model_cls(
@@ -1436,10 +1456,9 @@ class Cosmos3VFMTransformer(nn.Module):
             self.audio_proj_out = nn.Linear(self.hidden_size, self.sound_dim) if is_pp_last_rank else PPMissingLayer()
             self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
 
-        self.start_layer, self.end_layer, self.gen_layers = make_layers(
-            self.num_hidden_layers,
-            lambda prefix: Cosmos3GenDecoderLayer(
-                layer_idx=int(prefix.split(".")[-1]),
+        def build_gen_layer(layer_idx: int, prefix: str) -> Cosmos3GenDecoderLayer:
+            return Cosmos3GenDecoderLayer(
+                layer_idx=layer_idx,
                 hidden_size=self.hidden_size,
                 intermediate_size=self.intermediate_size,
                 num_attention_heads=self.num_attention_heads,
@@ -1450,9 +1469,21 @@ class Cosmos3VFMTransformer(nn.Module):
                 mlp_cls=self._gen_mlp_cls,
                 qk_norm=self.qk_norm_for_diffusion,
                 prefix=prefix,
-            ),
-            prefix="gen_layers",
-        )
+            )
+
+        try:
+            self.start_layer, self.end_layer, self.gen_layers = make_layers(
+                self.num_hidden_layers,
+                lambda prefix: build_gen_layer(int(prefix.split(".")[-1]), prefix),
+                prefix="gen_layers",
+            )
+        except AssertionError:
+            # Distributed groups are not initialized (CPU tests): build the full
+            # replica, exactly like a world_size=1 pipeline.
+            self.start_layer, self.end_layer = 0, self.num_hidden_layers
+            self.gen_layers = nn.ModuleList(
+                build_gen_layer(i, f"gen_layers.{i}") for i in range(self.num_hidden_layers)
+            )
         if release_completed_blocks_to_meta:
             for layer in self.gen_layers[self.start_layer : self.end_layer]:
                 release_module_parameters_to_meta(layer)
@@ -1836,8 +1867,9 @@ class Cosmos3VFMTransformer(nn.Module):
         """Pack GEN hidden states and UND cache for the next PP stage."""
         tensors: dict[str, torch.Tensor] = {"hidden_gen": hidden_gen}
 
-        # send cache to next stage when first denoising step
-        include_cache = (not is_pipeline_last_stage()) and self._is_first_denoise_step
+        # send cache to next stage when first denoising step; callers only
+        # invoke this on non-last PP stages.
+        include_cache = self._is_first_denoise_step
         if self.cached_kv is not None and include_cache:
             cos, sin = self.cached_freqs_gen
             tensors["freqs_cos"] = cos
@@ -1873,13 +1905,21 @@ class Cosmos3VFMTransformer(nn.Module):
         freqs_cos, freqs_sin = freqs_gen
 
         if len(self.gen_layers) == len(self.cached_kv):
-            # make_layers pads gen_layers with PPMissingLayer so indices stay
-            # global; each PP rank executes only its [start_layer, end_layer) slice.
-            for i in range(self.start_layer, self.end_layer):
-                hidden_gen = self.gen_layers[i](
+            # Under PP, gen_layers carries make_layers' PPMissingLayer padding so
+            # indices stay global and each rank runs only [start_layer, end_layer).
+            # Without PP, zip the full lists (they may even be replaced at runtime,
+            # e.g. by tests or cache wrappers).
+            if _pp_parallel_active():
+                own_layers = self.gen_layers[self.start_layer : self.end_layer]
+                own_kv = self.cached_kv[self.start_layer : self.end_layer]
+            else:
+                own_layers = self.gen_layers
+                own_kv = self.cached_kv
+            for layer, (k_und, v_und) in zip(own_layers, own_kv, strict=True):
+                hidden_gen = layer(
                     hidden_gen,
-                    k_und=self.cached_kv[i][0],
-                    v_und=self.cached_kv[i][1],
+                    k_und=k_und,
+                    v_und=v_und,
                     freqs_cos=freqs_cos,
                     freqs_sin=freqs_sin,
                     control_token_sizes=multi_control_token_sizes,
@@ -1932,7 +1972,8 @@ class Cosmos3VFMTransformer(nn.Module):
         if kwargs:
             raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
 
-        if is_pipeline_first_stage():
+        is_pp_first, is_pp_last = _pp_stage_flags()
+        if is_pp_first:
             prep = self._gen_preprocess(
                 hidden_states,
                 timestep,
@@ -1966,7 +2007,7 @@ class Cosmos3VFMTransformer(nn.Module):
             )
 
         hidden_gen = self._run_gen_layers_from_prep(prep)
-        if not is_pipeline_last_stage():
+        if not is_pp_last:
             # First / middle PP ranks stop before the final norm and head, and
             # forward the hidden states (plus the UND cache on the first
             # denoising step) to the next stage.

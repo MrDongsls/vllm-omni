@@ -54,6 +54,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_pipeline_parallel_world_size,
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
@@ -1513,6 +1514,86 @@ class Cosmos3OmniDiffusersPipeline(
         except Exception:
             return False
 
+    @staticmethod
+    def _pp_parallel_active() -> bool:
+        """Whether pipeline parallelism is initialized with world_size > 1.
+
+        Mirrors ``_cfg_parallel_active()``: serving initializes the PP group
+        (possibly with world_size 1) before running, while CPU tests never
+        initialize it and must keep the plain single-rank code paths.
+        """
+        try:
+            return get_pipeline_parallel_world_size() > 1
+        except Exception:
+            return False
+
+    def _predict_noise_via_pp_driver(
+        self,
+        *,
+        _cache_context: str,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        action_latents: torch.Tensor | None,
+        sound_latents: torch.Tensor | None,
+        shared_kwargs: dict,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
+        """Single-branch noise prediction, routed through the PP driver only under PP.
+
+        With PP active the mixin's ``predict_noise_maybe_with_cfg`` propagates
+        intermediate tensors across stages (returning None off the last rank);
+        otherwise this is the plain direct ``predict_noise`` call.
+        """
+        if self._pp_parallel_active():
+            return self.predict_noise_maybe_with_cfg(
+                do_true_cfg=False,
+                true_cfg_scale=1.0,
+                positive_kwargs=dict(
+                    _cache_context=_cache_context,
+                    hidden_states=hidden_states,
+                    timestep=timestep,
+                    text_ids=text_ids,
+                    text_mask=text_mask,
+                    action_latents=action_latents,
+                    sound_latents=sound_latents,
+                    **shared_kwargs,
+                ),
+                negative_kwargs=None,
+                cfg_normalize=False,
+            )
+        return self.predict_noise(
+            _cache_context=_cache_context,
+            hidden_states=hidden_states,
+            timestep=timestep,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            action_latents=action_latents,
+            sound_latents=sound_latents,
+            **shared_kwargs,
+        )
+
+    def _scheduler_step_via_pp_driver(
+        self,
+        noise_pred: torch.Tensor,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        *,
+        step_scheduler: Any,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor | Any:
+        """Scheduler step, routed through the PP handshake only under PP."""
+        if self._pp_parallel_active():
+            return self.scheduler_step_maybe_with_cfg(
+                noise_pred,
+                t,
+                latents,
+                do_true_cfg=False,
+                per_request_scheduler=step_scheduler,
+                generator=generator,
+            )
+        return step_scheduler.step(noise_pred, t, latents, generator=generator, return_dict=False)[0]
+
     def _cache_requires_paired_cfg(self) -> bool:
         """Whether the sequential-CFG denoising loop must keep paired forwards.
 
@@ -2887,6 +2968,7 @@ class Cosmos3OmniDiffusersPipeline(
         """
         do_cfg = guidance_scale > 1.0
         cfg_parallel = self._cfg_parallel_active() and do_cfg
+        pp_active = self._pp_parallel_active()
         step_scheduler = scheduler if scheduler is not None else self.scheduler
         # Session-keyed UND K/V (RFC #4480); None => bespoke transformer-instance cache.
         kv_state = self._new_cosmos3_state(session_id)
@@ -3019,18 +3101,17 @@ class Cosmos3OmniDiffusersPipeline(
                 if raw_action_dim is not None and 0 < raw_action_dim < action_pred.shape[-1]:
                     action_pred[..., raw_action_dim:] = 0
             if action_latents is None and sound_latents is None:
-                latents = self.scheduler_step_maybe_with_cfg(
-                    video_pred, t, latents, do_true_cfg=False, per_request_scheduler=step_scheduler, generator=generator
+                latents = self._scheduler_step_via_pp_driver(
+                    video_pred, t, latents, step_scheduler=step_scheduler, generator=generator
                 )
             else:
                 packed_noise, shapes, numels = _pack_joint(video_pred, action_pred, sound_pred)
                 packed_latents, _, _ = _pack_joint(latents, action_latents, sound_latents)
-                packed_next = self.scheduler_step_maybe_with_cfg(
+                packed_next = self._scheduler_step_via_pp_driver(
                     packed_noise,
                     t,
                     packed_latents,
-                    do_true_cfg=False,
-                    per_request_scheduler=step_scheduler,
+                    step_scheduler=step_scheduler,
                     generator=generator,
                 )
                 if isinstance(packed_next, AsyncLatents):
@@ -3133,21 +3214,15 @@ class Cosmos3OmniDiffusersPipeline(
 
                     if not self._kv_load_und(kv_state, is_negative=False):
                         self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
-                    noise_cond = self.predict_noise_maybe_with_cfg(
-                        do_true_cfg=False,
-                        true_cfg_scale=1.0,
-                        positive_kwargs=dict(
-                            _cache_context="cond",
-                            hidden_states=latents,
-                            timestep=timestep,
-                            text_ids=cond_ids,
-                            text_mask=cond_mask,
-                            action_latents=action_latents,
-                            sound_latents=sound_latents,
-                            **shared_kwargs,
-                        ),
-                        negative_kwargs=None,
-                        cfg_normalize=False,
+                    noise_cond = self._predict_noise_via_pp_driver(
+                        _cache_context="cond",
+                        hidden_states=latents,
+                        timestep=timestep,
+                        text_ids=cond_ids,
+                        text_mask=cond_mask,
+                        action_latents=action_latents,
+                        sound_latents=sound_latents,
+                        shared_kwargs=shared_kwargs,
                     )
                     if kv_state is not None:
                         self._kv_capture_und(kv_state, is_negative=False)
@@ -3157,25 +3232,19 @@ class Cosmos3OmniDiffusersPipeline(
                     if cfg_active or keep_uncond_for_cache:
                         if not self._kv_load_und(kv_state, is_negative=True):
                             self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
-                        if uncond_cache[0] is None and not is_pipeline_last_stage():
+                        if pp_active and uncond_cache[0] is None and not is_pipeline_last_stage():
                             # Re-arm the cache transfer so the uncond branch's UND K/V
                             # is forwarded to the downstream PP stages again.
                             self.transformer.reset_pp_step()
-                        noise_uncond = self.predict_noise_maybe_with_cfg(
-                            do_true_cfg=False,
-                            true_cfg_scale=1.0,
-                            positive_kwargs=dict(
-                                _cache_context="uncond",
-                                hidden_states=latents,
-                                timestep=timestep,
-                                text_ids=uncond_ids,
-                                text_mask=uncond_mask,
-                                action_latents=action_latents,
-                                sound_latents=sound_latents,
-                                **shared_kwargs,
-                            ),
-                            negative_kwargs=None,
-                            cfg_normalize=False,
+                        noise_uncond = self._predict_noise_via_pp_driver(
+                            _cache_context="uncond",
+                            hidden_states=latents,
+                            timestep=timestep,
+                            text_ids=uncond_ids,
+                            text_mask=uncond_mask,
+                            action_latents=action_latents,
+                            sound_latents=sound_latents,
+                            shared_kwargs=shared_kwargs,
                         )
                         if kv_state is not None:
                             self._kv_capture_und(kv_state, is_negative=True)
@@ -3185,7 +3254,7 @@ class Cosmos3OmniDiffusersPipeline(
                         # equal to noise_cond; the uncond pass is computed only to
                         # preserve cache-dit's cond/uncond parity.
                         step_scale = guidance_scale if cfg_active else 1.0
-                        if is_pipeline_last_stage():
+                        if not pp_active or is_pipeline_last_stage():
                             noise_pred = self.combine_cfg_noise(
                                 noise_cond, noise_uncond, step_scale, cfg_normalize=False
                             )
@@ -3206,21 +3275,15 @@ class Cosmos3OmniDiffusersPipeline(
                     self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     self._kv_load_und(kv_state, is_negative=False)
-                    noise_pred = self.predict_noise_maybe_with_cfg(
-                        do_true_cfg=False,
-                        true_cfg_scale=1.0,
-                        positive_kwargs=dict(
-                            _cache_context="cond",
-                            hidden_states=latents,
-                            timestep=timestep,
-                            text_ids=cond_ids,
-                            text_mask=cond_mask,
-                            action_latents=action_latents,
-                            sound_latents=sound_latents,
-                            **shared_kwargs,
-                        ),
-                        negative_kwargs=None,
-                        cfg_normalize=False,
+                    noise_pred = self._predict_noise_via_pp_driver(
+                        _cache_context="cond",
+                        hidden_states=latents,
+                        timestep=timestep,
+                        text_ids=cond_ids,
+                        text_mask=cond_mask,
+                        action_latents=action_latents,
+                        sound_latents=sound_latents,
+                        shared_kwargs=shared_kwargs,
                     )
                     if kv_state is not None:
                         self._kv_capture_und(kv_state, is_negative=False)
