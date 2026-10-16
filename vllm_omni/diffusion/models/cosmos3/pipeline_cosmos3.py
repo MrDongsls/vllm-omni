@@ -1524,7 +1524,7 @@ class Cosmos3OmniDiffusersPipeline(
         """
         try:
             return get_pipeline_parallel_world_size() > 1
-        except Exception:
+        except AssertionError:
             return False
 
     def _predict_noise_via_pp_driver(

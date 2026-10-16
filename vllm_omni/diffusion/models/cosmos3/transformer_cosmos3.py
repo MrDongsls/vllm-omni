@@ -157,7 +157,7 @@ def _pp_parallel_active() -> bool:
     """
     try:
         return get_pipeline_parallel_world_size() > 1
-    except Exception:
+    except AssertionError:
         return False
 
 
