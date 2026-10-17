@@ -30,6 +30,7 @@ from vllm_omni.clients.duplex import EventCollector, write_pcm16_wav
 from vllm_omni.clients.duplex import (
     wait_for_condition as wait_for,
 )
+from vllm_omni.metrics.definitions import compute_audio_rtf
 
 SAMPLE_RATE_HZ = 24_000
 FRAME_SAMPLES = 1_920
@@ -617,6 +618,16 @@ def _load_metrics(client: RawRealtimeProbe, sends: list[tuple[float, float, floa
     audio_duration = samples / SAMPLE_RATE_HZ
     first_audio_ms = (packet_times[0] - first_send) * 1000 if packet_times and first_send is not None else None
     client_rtf = (packet_times[-1] - first_send) / audio_duration if audio_duration and first_send is not None else None
+    # #6614 audio_rtf measured on the client clock: the output-stream window
+    # (first to last audio packet) over the audio content duration. For paced
+    # duplex input both window ratios sit near 1 in steady state because
+    # generation is anchored to the input cadence; saturation stretches this
+    # output window, so it is the RTF flavor that can cross 1 meaningfully.
+    audio_rtf = (
+        compute_audio_rtf(packet_times[-1] - packet_times[0], audio_duration)
+        if packet_times and audio_duration
+        else None
+    )
     continuity = compute_continuity_stats(packet_times, packet_bytes, SAMPLE_RATE_HZ) if packet_times else None
     lateness = _distribution([max(0.0, sent - planned) * 1000 for planned, sent, _ in sends])
     p99_lateness = lateness["p99"]
@@ -628,6 +639,7 @@ def _load_metrics(client: RawRealtimeProbe, sends: list[tuple[float, float, floa
         "response_ids": sorted(response_ids),
         "client_first_audio_after_stream_start_ms": first_audio_ms,
         "client_stream_rtf": client_rtf,
+        "audio_rtf": audio_rtf,
         "client_audio_packet_interval_ms": _distribution(intervals),
         "client_send_lateness_ms": lateness,
         "client_pacing_warning": isinstance(p99_lateness, float) and p99_lateness > FRAME_PERIOD_S * 1000,

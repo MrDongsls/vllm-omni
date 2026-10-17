@@ -278,6 +278,7 @@ def run_cell(args: argparse.Namespace, cell: str, sessions: int, stamp_dir: Path
         rows = [row for run in runs for row in run["sessions"]]
         ok_rows = [row for row in rows if row.get("ok") is True]
         rtfs = [row["client_stream_rtf"] for row in ok_rows if isinstance(row.get("client_stream_rtf"), float)]
+        audio_rtf_rows = [row["audio_rtf"] for row in ok_rows if isinstance(row.get("audio_rtf"), float)]
         ttfps = [
             row["client_first_audio_after_stream_start_ms"]
             for row in ok_rows
@@ -297,6 +298,7 @@ def run_cell(args: argparse.Namespace, cell: str, sessions: int, stamp_dir: Path
             "requested": sum(run["requested_sessions"] for run in runs),
             "passed": sum(run["passed_sessions"] for run in runs),
             "client_stream_rtf": _stats(rtfs),
+            "audio_rtf": _stats(audio_rtf_rows),
             "client_first_audio_ms": _stats(ttfps),
             "client_packet_interval_p99_ms": _stats(p99s),
             "audio_underrun_events": sum(row.get("audio_underrun_event_count") or 0 for row in ok_rows),
@@ -394,16 +396,16 @@ def main() -> None:
 
     print("\n=== SUMMARY (pass-rate counts sessions across all recorded runs) ===")
     header = (
-        f"{'cell':>4} {'N':>3} {'pass':>9} {'rtf med':>8} {'rtf p95':>8} "
+        f"{'cell':>4} {'N':>3} {'pass':>9} {'rtf med':>8} {'a_rtf med':>9} "
         f"{'ttfp med':>9} {'underrun':>8} {'p99 ms':>7} {'load s':>7} {'gpu MiB':>8}"
     )
     print(header)
     print("-" * len(header))
     for s in summaries:
-        rtf, ttfp = s["client_stream_rtf"], s["client_first_audio_ms"]
+        rtf, artf, ttfp = s["client_stream_rtf"], s["audio_rtf"], s["client_first_audio_ms"]
         print(
             f"{s['cell']:>4} {s['sessions']:>3} {s['passed']:>4}/{s['requested']:<4} "
-            f"{rtf['median']:>8.3f} {rtf['p95']:>8.3f} {ttfp['median']:>9.0f} "
+            f"{rtf['median']:>8.3f} {artf['median']:>9.3f} {ttfp['median']:>9.0f} "
             f"{s['audio_underrun_events']:>8} {s['client_packet_interval_p99_ms']['median']:>7.0f} "
             f"{s['server_load_time_s']:>7.1f} {s['server_gpu_memory_mib_after_load'] or float('nan'):>8.0f}"
         )
