@@ -28,6 +28,8 @@ part of the vLLM weights iterator (the codec owns its own checkpoint; see the
 
 from __future__ import annotations
 
+import time
+from collections import deque
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -110,6 +112,10 @@ class PersonaPlexCode2Wav(nn.Module):
         self._consumed_full_payload_requests: set[str] = set()
         self._decoded_request_calls = 0
         self._graph_stats_log_epoch = 0
+        # Recent Stage-1 decode dispatches as (duration ms, active rows): the
+        # decode kernels plus the host copy back, i.e. the per-step Stage-1
+        # cost the runner pays (RFC #7389 section 8 stage attribution).
+        self._decode_step_samples: deque[tuple[float, int]] = deque(maxlen=2048)
 
     # ------------------------------------------------------------------
     # Runner-facing no-op / placeholder hooks (mirror Qwen3TTSCode2Wav).
@@ -240,7 +246,9 @@ class PersonaPlexCode2Wav(nn.Module):
             self._decode_shared_batch(pending, audios)
         else:
             for i, state_id, codes_kf in pending:
+                started = time.perf_counter()
                 wav = self._decode_streaming_frames(state_id, codes_kf)
+                self._decode_step_samples.append(((time.perf_counter() - started) * 1e3, 1))
                 self._decoded_request_calls += 1
                 if wav.numel() > 0:
                     audios[i] = wav.to(dtype=torch.float32).reshape(-1)
@@ -360,7 +368,9 @@ class PersonaPlexCode2Wav(nn.Module):
                 for out_index, row, segment in members:
                     batch[row] = segment
                     active[row] = True
+                started = time.perf_counter()
                 audio = codec.decode_frames(batch, active).to(device="cpu")
+                self._decode_step_samples.append(((time.perf_counter() - started) * 1e3, len(members)))
                 for out_index, row, _ in members:
                     segment_audio = audio[row, : length * self._samples_per_frame].to(dtype=torch.float32).reshape(-1)
                     if segment_audio.numel() == 0:
@@ -385,14 +395,24 @@ class PersonaPlexCode2Wav(nn.Module):
             return
         graph, eager = totals["decode_graph"], totals["decode_eager"]
         hit_rate = 100.0 * graph / (graph + eager) if graph + eager else 0.0
+        durations = sorted(ms for ms, _ in self._decode_step_samples)
+        extra_format = ""
+        extra_args: list[float] = []
+        if durations:
+            midpoint = len(durations) // 2
+            median = durations[midpoint] if len(durations) % 2 else (durations[midpoint - 1] + durations[midpoint]) / 2
+            rows_mean = sum(rows for _, rows in self._decode_step_samples) / len(self._decode_step_samples)
+            extra_format = " decode_step_ms=%.1f/%.1f/%.1f rows_mean=%.1f"
+            extra_args = [median, durations[int(0.95 * (len(durations) - 1))], durations[-1], rows_mean]
         logger.info(
             "PersonaPlex Code2Wav Mimi decode graphs: graph_replays=%d eager_decodes=%d "
-            "hit_rate=%.1f%% streams=%d decoded_requests=%d",
+            "hit_rate=%.1f%% streams=%d decoded_requests=%d" + extra_format,
             graph,
             eager,
             hit_rate,
             reporting,
             self._decoded_request_calls,
+            *extra_args,
         )
 
     def _set_mimi_codecs(self, codecs: list[nn.Module]) -> None:

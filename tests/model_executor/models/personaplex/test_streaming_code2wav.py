@@ -437,6 +437,7 @@ def test_graph_stats_logged_periodically_with_hit_rate(monkeypatch: pytest.Monke
     assert "graph_replays=0" in rendered[1] and "eager_decodes=6" in rendered[1]
     assert "graph_replays=3" in rendered[2] and "eager_decodes=6" in rendered[2]
     assert "hit_rate=33.3%" in rendered[2]
+    assert "decode_step_ms=" in rendered[2] and "rows_mean=1.0" in rendered[2]
 
 
 def test_graph_stats_log_fires_when_multi_request_steps_cross_the_interval(monkeypatch: pytest.MonkeyPatch) -> None:
