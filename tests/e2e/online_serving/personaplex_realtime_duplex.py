@@ -730,9 +730,11 @@ async def _run_load_session(
                 await _wait_load_event(client, "session.created", args.timeout_s)
                 session_id = _session_id(_events(client, "session.created")[-1]) or session_id
                 capabilities = _capabilities(_events(client, "session.created")[-1])
-                if (
-                    capabilities.get("chunk_period_ms") != 80
-                    or capabilities.get("supports_multi_session_same_replica") is not True
+                # The multi-session capability only matters when more than one
+                # session is being opened: a max_sessions=1 server legitimately
+                # does not advertise it, and a single session runs fine there.
+                if capabilities.get("chunk_period_ms") != 80 or (
+                    args.sessions > 1 and capabilities.get("supports_multi_session_same_replica") is not True
                 ):
                     raise AssertionError("server did not advertise PersonaPlex multi-session capabilities")
                 ready.set_result(None)
