@@ -155,16 +155,32 @@ def probe_gpu_memory_mib(pgid: int) -> float | None:
         ).stdout
     except Exception:
         return None
-    total = 0.0
+    rows: list[tuple[int, float]] = []
     for line in smi.splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) != 2 or "[N/A]" in parts[1]:
             continue
         try:
-            if int(parts[0]) in group:
-                total += float(parts[1])
+            rows.append((int(parts[0]), float(parts[1])))
         except ValueError:
             continue
+    total = sum(mib for pid, mib in rows if pid in group)
+    if not total and rows:
+        # In a container, nvidia-smi lists host-side pids that never match the
+        # container's ps output; on this single-GPU box the server is the only
+        # tenant, so attribute every compute app to it.
+        total = sum(mib for _, mib in rows)
+    if not total:
+        try:
+            used = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
+            total = float(used.strip().splitlines()[0])
+        except Exception:
+            return None
     return total or None
 
 
@@ -178,7 +194,7 @@ def run_driver(args: argparse.Namespace, url: str, sessions: int, load_frames: i
         "--model",
         args.model,
         "--input-wav",
-        str(args.input_wav.resolve()),
+        str(args.input_wav),
         "--sessions",
         str(sessions),
         "--load-frames",
@@ -359,7 +375,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    input_sha = hashlib.sha256(Path(args.input_wav).read_bytes()).hexdigest()
+    args.input_wav = Path(args.input_wav).resolve()
+    input_sha = hashlib.sha256(args.input_wav.read_bytes()).hexdigest()
     out = Path(args.output_dir).resolve()
     stamp_dir = out / time.strftime("%Y%m%d-%H%M%S")
     stamp_dir.mkdir(parents=True, exist_ok=True)
@@ -381,7 +398,7 @@ def main() -> None:
         json.dumps(
             {
                 "model": args.model,
-                "input_wav": str(args.input_wav.resolve()),
+                "input_wav": str(args.input_wav),
                 "input_sha256": input_sha,
                 "load_frames": args.load_frames,
                 "runs_per_cell": args.runs,
