@@ -150,6 +150,24 @@ def wait_ready(url: str, proc: subprocess.Popen, log: Path, timeout: float) -> f
     raise TimeoutError(f"server not ready within {timeout}s (log: {log})")
 
 
+def wait_port_free(port: int, timeout: float = 180.0) -> bool:
+    """Block until nothing accepts on the port.
+
+    Stage-engine children can outlive the launcher process group by minutes
+    after SIGTERM; the next server launch must not race them for the bind.
+    """
+    import socket
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with socket.socket() as sock:
+            sock.settimeout(0.5)
+            if sock.connect_ex(("127.0.0.1", port)) != 0:
+                return True
+        time.sleep(2.0)
+    return False
+
+
 def probe_gpu_memory_mib(pgid: int) -> float | None:
     """Sum GPU memory of the server's process group after weight load, before load."""
     try:
@@ -353,6 +371,7 @@ def run_cell(args: argparse.Namespace, cell: str, sessions: int, stamp_dir: Path
             except Exception:
                 proc.kill()
             proc.wait(timeout=20)
+        wait_port_free(args.port)
         deploy.unlink(missing_ok=True)
 
 

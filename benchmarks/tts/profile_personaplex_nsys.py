@@ -131,6 +131,7 @@ def profile_cell(args: argparse.Namespace, cell: str, sessions: int, out_dir: Pa
             except Exception:
                 proc.kill()
             proc.wait(timeout=20)
+        bm.wait_port_free(args.port)
         deploy.unlink(missing_ok=True)
 
 

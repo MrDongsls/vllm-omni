@@ -135,6 +135,7 @@ def main() -> None:
             except Exception:
                 proc.kill()
             proc.wait(timeout=20)
+        bm.wait_port_free(args.port)
         deploy.unlink(missing_ok=True)
 
     with open(out / "gpu_memory.csv", "w", newline="") as stream:
