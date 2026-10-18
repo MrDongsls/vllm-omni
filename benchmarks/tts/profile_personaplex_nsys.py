@@ -5,13 +5,16 @@
 """nsys profile runs for the PersonaPlex shared-Mimi evidence (RFC #7389 §6).
 
 Profiles one server per (cell, sessions) using the documented Omni capture
-flow (docs/contributing/profiling.md §6): the server is wrapped in
+flow (docs/contributing/profiling.md §4/§6): the server is wrapped in
 ``nsys profile --capture-range=cudaProfilerApi`` with per-stage
 ``profiler: cuda`` configs, and the serving API's /start_profile and
 /stop_profile bracket exactly one paced load run — model init and idle time
-stay outside the trace. ``--cuda-graph-trace=node`` keeps kernels inside
-CUDA-graph replays attributed (required for the graphed cells B/D).
-Companion to ``bench_personaplex_shared_mimi_matrix.py``.
+stay outside the trace. ``--capture-range-end=repeat`` keeps the app alive
+across the stop call (the stop-shutdown variant terminates the stage
+engines before the stop RPC can complete on this deploy).
+``--cuda-graph-trace=node`` keeps kernels inside CUDA-graph replays
+attributed (required for the graphed cells B/D). Companion to
+``bench_personaplex_shared_mimi_matrix.py``.
 
 Typical: python profile_personaplex_nsys.py --cells A D --sessions 1 8
 """
@@ -73,7 +76,7 @@ def profile_cell(args: argparse.Namespace, cell: str, sessions: int, out_dir: Pa
         "--cpuctxsw=process-tree",
         "--trace-fork-before-exec=true",
         "--capture-range=cudaProfilerApi",
-        "--capture-range-end=stop-shutdown",
+        "--capture-range-end=repeat",
         "--cuda-graph-trace=node",
         "-o",
         str(report),
@@ -108,6 +111,9 @@ def profile_cell(args: argparse.Namespace, cell: str, sessions: int, out_dir: Pa
                 sessions,
                 args.load_frames,
                 cell_dir / "run01",
+                # Profiler overhead slows the tail drain; this run captures GPU
+                # behavior, session acceptance lives in the matrix benchmark.
+                ["--max-frame-deficit", "8"],
             )
             driver_ok = True
         except Exception as exc:

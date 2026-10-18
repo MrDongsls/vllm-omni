@@ -216,7 +216,14 @@ def probe_gpu_memory_mib(pgid: int) -> float | None:
     return total or None
 
 
-def run_driver(args: argparse.Namespace, url: str, sessions: int, load_frames: int, out_dir: Path) -> dict:
+def run_driver(
+    args: argparse.Namespace,
+    url: str,
+    sessions: int,
+    load_frames: int,
+    out_dir: Path,
+    extra_args: list[str] | None = None,
+) -> dict:
     """One driver invocation; parse its load-result.json (never overwritten)."""
     cmd = [
         sys.executable,
@@ -240,6 +247,8 @@ def run_driver(args: argparse.Namespace, url: str, sessions: int, load_frames: i
         cmd += ["--max-client-rtf", str(args.max_client_rtf)]
     if args.expected_input_sha256:
         cmd += ["--expected-input-sha256", args.expected_input_sha256]
+    if extra_args:
+        cmd += extra_args
     print(f"    driver: {sessions} session(s), {load_frames} frames -> {out_dir.name}", flush=True)
     completed = subprocess.run(cmd, capture_output=True, text=True, timeout=args.driver_timeout_s + 300)
     result_path = out_dir / "load-result.json"
