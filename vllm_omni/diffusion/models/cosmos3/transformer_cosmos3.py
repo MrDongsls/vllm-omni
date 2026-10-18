@@ -1471,15 +1471,15 @@ class Cosmos3VFMTransformer(nn.Module):
                 prefix=prefix,
             )
 
-        try:
+        if _pp_parallel_active():
             self.start_layer, self.end_layer, self.gen_layers = make_layers(
                 self.num_hidden_layers,
                 lambda prefix: build_gen_layer(int(prefix.split(".")[-1]), prefix),
                 prefix="gen_layers",
             )
-        except AssertionError:
-            # Distributed groups are not initialized (CPU tests): build the full
-            # replica, exactly like a world_size=1 pipeline.
+        else:
+            # Distributed groups are not initialized (CPU tests) or PP is a
+            # single stage: build the full replica, exactly like world_size=1.
             self.start_layer, self.end_layer = 0, self.num_hidden_layers
             self.gen_layers = nn.ModuleList(
                 build_gen_layer(i, f"gen_layers.{i}") for i in range(self.num_hidden_layers)
@@ -1640,13 +1640,6 @@ class Cosmos3VFMTransformer(nn.Module):
         p = self.latent_patch_size
         C = self.latent_channel_size
         hp, wp, H_padded, W_padded = self._pad_to_patch_size(h, w)
-        # expected = B * C * t * H_padded * W_padded
-        # if latents.numel() != expected:
-        #     raise ValueError(
-        #         f"Cosmos3 patchify received {latents.numel()} elements but expected "
-        #         f"{expected} for video_shape=({t},{h},{w}). The latents are likely still "
-        #         f"packed with action/sound modalities — unpack before calling forward."
-        #     )
         if H_padded != h or W_padded != w:
             latents = F.pad(latents, (0, W_padded - w, 0, H_padded - h))
 

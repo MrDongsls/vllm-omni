@@ -3423,3 +3423,43 @@ def test_diffuse_pp_sequential_cfg_skips_local_combine_off_last_rank(
     )
     assert combines == []
     assert isinstance(result, torch.Tensor)
+
+
+def test_predict_noise_passes_intermediate_tensors_through(make_cosmos3_pipeline) -> None:
+    """Non-last PP ranks: the transformer returns IntermediateTensors and
+    predict_noise must forward them untouched (no dtype conversion)."""
+    from vllm.sequence import IntermediateTensors
+
+    pipeline = make_cosmos3_pipeline()
+
+    class PPStubTransformer(StubCosmos3Transformer):
+        def forward(self, **kwargs: Any) -> IntermediateTensors:
+            return IntermediateTensors({"hidden_gen": torch.zeros(1, 4, 8)})
+
+    pipeline.transformer = PPStubTransformer(latent_channel_size=2)
+
+    out = pipeline.predict_noise(
+        _cache_context="cond",
+        hidden_states=torch.zeros(1, 2, 1, 1, 1),
+        timestep=torch.tensor([1.0]),
+        text_ids=_ids(2),
+        text_mask=_mask(),
+        intermediate_tensors=None,
+    )
+    assert isinstance(out, IntermediateTensors)
+    assert torch.equal(out["hidden_gen"], torch.zeros(1, 4, 8))
+
+
+def test_forward_transfer_rejects_pipeline_parallel(make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = make_cosmos3_pipeline()
+    monkeypatch.setattr(pipeline, "_pp_parallel_active", lambda: True)
+
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        pipeline._forward_transfer(
+            prompt="transfer",
+            negative_prompt="",
+            sp=make_sampling_params(),
+            transfer_config=SimpleNamespace(),
+            transfer_video_tensor=None,
+            transfer_input_fps=None,
+        )

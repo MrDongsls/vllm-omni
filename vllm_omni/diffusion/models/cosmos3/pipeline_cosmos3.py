@@ -47,6 +47,7 @@ from torch import nn
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, is_pp_missing_parameter
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
@@ -1373,7 +1374,6 @@ class Cosmos3OmniDiffusersPipeline(
         self.transformer.validate_loaded_weights(loaded)
         if getattr(self.transformer, "sound_gen", False):
             sound_markers = ("audio_proj_in.", "audio_proj_out.", "audio_modality_embed")
-            # missing = [marker.rstrip(".") for marker in sound_markers if not any(marker in name for name in loaded)]
             missing = [
                 marker.rstrip(".")
                 for marker in sound_markers
@@ -1388,7 +1388,6 @@ class Cosmos3OmniDiffusersPipeline(
                 )
         if getattr(self.transformer, "action_gen", False):
             action_markers = ("action_proj_in.", "action_proj_out.", "action_modality_embed")
-            # missing = [marker.rstrip(".") for marker in action_markers if not any(marker in name for name in loaded)]
             missing = [
                 marker.rstrip(".")
                 for marker in action_markers
@@ -1403,11 +1402,13 @@ class Cosmos3OmniDiffusersPipeline(
                 )
         return loaded
 
-    def predict_noise(self, **kwargs) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    def predict_noise(self, **kwargs) -> torch.Tensor | tuple[torch.Tensor, ...] | IntermediateTensors:
         """Override CFGParallelMixin.predict_noise for Cosmos3.
 
         The transformer returns the raw prediction: video-only as a tensor,
         or a tuple in video, action, sound order for multimodal generation.
+        Under pipeline parallelism, non-last stages return IntermediateTensors
+        for the next stage, passed through untouched.
         """
 
         def _to_model_dtype(value: Any) -> Any:
@@ -1420,8 +1421,12 @@ class Cosmos3OmniDiffusersPipeline(
             return value
 
         def _to_sampling_dtype(
-            prediction: torch.Tensor | tuple[torch.Tensor, ...],
-        ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+            prediction: torch.Tensor | tuple[torch.Tensor, ...] | IntermediateTensors,
+        ) -> torch.Tensor | tuple[torch.Tensor, ...] | IntermediateTensors:
+            # Non-last pipeline-parallel ranks return IntermediateTensors for the
+            # next stage; forward them untouched instead of converting dtype.
+            if isinstance(prediction, IntermediateTensors):
+                return prediction
             if isinstance(prediction, tuple):
                 return tuple(item.to(self.sampling_dtype) for item in prediction)
             return prediction.to(self.sampling_dtype)
@@ -3143,9 +3148,8 @@ class Cosmos3OmniDiffusersPipeline(
         def _assign_step_out(step_out: torch.Tensor | tuple[torch.Tensor, ...]) -> None:
             nonlocal latents, action_latents, sound_latents
             if action_latents is None and sound_latents is None:
-                # assert isinstance(step_out, torch.Tensor)
-                # latents could be AsyncLatents, which implements __torch_function__
-                # so it will be triggered automatically in self.transformer.forward
+                # Both _step branches resolve AsyncLatents before returning.
+                assert isinstance(step_out, torch.Tensor)
                 latents = step_out
                 return
             if not isinstance(step_out, tuple):
@@ -3654,6 +3658,10 @@ class Cosmos3OmniDiffusersPipeline(
     ) -> DiffusionOutput:
         if self.is_distilled_model:
             raise self._distilled_unsupported_error("transfer requests are unsupported.")
+        if self._pp_parallel_active():
+            raise NotImplementedError(
+                "Cosmos3 transfer inference is not supported together with pipeline parallelism; disable one of them."
+            )
         input_frames = None
         if transfer_video_tensor is not None:
             input_frames = normalized_video_to_uint8_cthw(transfer_video_tensor)
