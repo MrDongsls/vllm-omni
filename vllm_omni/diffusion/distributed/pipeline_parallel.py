@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.cfg_parallel import (
+    CFGParallelMixin,
+    _slice_pred,
+    _unwrap,
+    _wrap,
+)
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -16,21 +21,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_pp_group,
     is_pipeline_first_stage,
 )
-
-
-def _wrap(pred: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-    """Normalize prediction to tuple form."""
-    return pred if isinstance(pred, tuple) else (pred,)
-
-
-def _unwrap(pred: tuple[torch.Tensor, ...]) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """Unwrap single-element tuple to plain tensor; keep multi-element as tuple."""
-    return pred[0] if len(pred) == 1 else pred
-
-
-def _slice_pred(pred: tuple[torch.Tensor, ...], output_slice: int) -> tuple[torch.Tensor, ...]:
-    """Slice each element along dim 1."""
-    return tuple(p[:, :output_slice] for p in pred)
 
 
 class AsyncLatents:
