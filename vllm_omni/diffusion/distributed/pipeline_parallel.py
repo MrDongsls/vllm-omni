@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -221,6 +222,9 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             CFGParallelMixin.predict_noise_maybe_with_cfg exactly.
           - PP only, no CFG: cond branch only.
 
+        Also sets ``self.transformer.do_true_cfg`` (via CFGParallelMixin) before
+        predicting, matching the non-PP CFG helper path for TeaCache.
+
         Returns:
             noise_pred on the last PP rank (all CFG ranks when CFG-parallel is active).
             None on all other ranks.
@@ -229,6 +233,8 @@ class PipelineParallelMixin("CFGParallelMixin" if TYPE_CHECKING else object):  #
             return super().predict_noise_maybe_with_cfg(
                 do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs, cfg_normalize, output_slice
             )
+
+        CFGParallelMixin._set_transformer_do_true_cfg(self, do_true_cfg)
 
         self._sync_pp_send()
 

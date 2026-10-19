@@ -96,7 +96,6 @@ def test_transformer_resolves_global_and_subcomponent_quant_configs(
     expected_gen: str | None,
 ) -> None:
     """Resolve pipeline-level defaults and Cosmos3 subcomponent overrides."""
-    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
     from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
@@ -121,7 +120,7 @@ def test_transformer_resolves_global_and_subcomponent_quant_configs(
             received.append(("gen_layers", quant_config))
 
     monkeypatch.setattr(Cosmos3VFMTransformer, "_language_model_cls", _StubLanguageModel)
-    monkeypatch.setattr(transformer_cosmos3, "Cosmos3GenDecoderLayer", _StubGenDecoderLayer)
+    monkeypatch.setattr(Cosmos3VFMTransformer, "_gen_layer_cls", _StubGenDecoderLayer)
 
     if config_kind == "flat":
         top_level_config = configs["transformer"]
@@ -1655,17 +1654,6 @@ def test_run_gen_layers_rejects_cache_dit_wrapper_under_pp(monkeypatch: pytest.M
             torch.randn(1, 2, 8),
             freqs_gen=freqs,
             gather_output=False,
-            s_video=2,
-            s_control=0,
-            s_action=0,
-            s_sound=0,
-            has_action=False,
-            has_sound=False,
-            has_control=False,
-            ulysses_size=1,
-            use_multi_control_attention=False,
-            multi_control_token_sizes=None,
-            multi_control_weights=None,
         )
 
     # A full replica slice keeps the wrapper loop working.
@@ -1676,17 +1664,59 @@ def test_run_gen_layers_rejects_cache_dit_wrapper_under_pp(monkeypatch: pytest.M
             hidden,
             freqs_gen=freqs,
             gather_output=False,
-            s_video=2,
-            s_control=0,
-            s_action=0,
-            s_sound=0,
-            has_action=False,
-            has_sound=False,
-            has_control=False,
-            ulysses_size=1,
-            use_multi_control_attention=False,
-            multi_control_token_sizes=None,
-            multi_control_weights=None,
         ),
         hidden,
     )
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("already_sharded", [False, True])
+def test_shared_gen_stack_preserves_control_metadata_sharding_and_wrapped_outputs(grouped, already_sharded) -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    model = object.__new__(Cosmos3VFMTransformer)
+    nn.Module.__init__(model)
+    model.cached_kv = [(torch.tensor([i]), torch.tensor([i + 10])) for i in range(2)]
+    model.cached_freqs_gen = (torch.tensor([20]), torch.tensor([30]))
+    prepared = []
+    gathered = []
+
+    def prepare(hidden, cos, sin):
+        prepared.append(hidden)
+        return hidden + 1, cos, sin
+
+    def gather(hidden):
+        gathered.append(hidden)
+        return hidden + 100
+
+    model.gen_sp_prepare = prepare
+    model.gen_sp_gather = gather
+
+    class Layer(nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+
+        def forward(self, hidden, **kwargs):
+            assert kwargs["control_token_sizes"] == (2, 3)
+            assert kwargs["control_weights"] == (0.5, 1.5)
+            if grouped:
+                assert kwargs["cached_kv"] is model.cached_kv
+                assert kwargs["freqs_gen"] == model.cached_freqs_gen
+                return (hidden + 4,)
+            assert kwargs["k_und"] is model.cached_kv[self.index][0]
+            assert kwargs["v_und"] is model.cached_kv[self.index][1]
+            return (hidden + 2,)
+
+    model.gen_layers = nn.ModuleList([Layer(i) for i in range(1 if grouped else 2)])
+    inputs = torch.zeros(1, 3, 4)
+    kwargs = dict(control_token_sizes=(2, 3), control_weights=(0.5, 1.5))
+    if already_sharded:
+        kwargs["freqs_gen"] = model.cached_freqs_gen
+    output = model._run_gen_layers(inputs, **kwargs)
+    torch.testing.assert_close(output, torch.full_like(inputs, 104 if already_sharded else 105))
+    assert len(prepared) == (0 if already_sharded else 1)
+    assert len(gathered) == 1
+    output = model._run_gen_layers(inputs, gather_output=False, **kwargs)
+    torch.testing.assert_close(output, torch.full_like(inputs, 4 if already_sharded else 5))
+    assert len(gathered) == 1
