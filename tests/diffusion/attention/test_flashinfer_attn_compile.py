@@ -449,6 +449,28 @@ def test_flashinfer_real_backend_eager_fullgraph_agreement():
 
 @pytest.mark.gpu
 @pytest.mark.cuda
+def test_impl_token_stays_cpu_when_initialized_in_device_context():
+    # The diffusers loader initializes models inside a target-device context,
+    # so an unspecified device would put the token on CUDA and turn every
+    # in-op handle lookup into a device synchronization.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to exercise target-device-context initialization")
+    if not flashinfer_attn.HAS_FLASHINFER:
+        pytest.skip("FlashInfer is not installed")
+
+    with torch.device("cuda", index=torch.accelerator.current_device_index()):
+        impl = flashinfer_attn.FlashInferAttentionImpl(
+            num_heads=2,
+            head_size=128,
+            softmax_scale=128**-0.5,
+            backend_kwargs={"quant": {"flashinfer_backend": "fa2"}},
+        )
+
+    assert impl._op_token.device.type == "cpu"
+
+
+@pytest.mark.gpu
+@pytest.mark.cuda
 def test_flashinfer_cute_dsl_custom_op_matches_wrapper_and_sdpa():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for real FlashInfer execution")
@@ -730,6 +752,44 @@ def test_partial_mask_rejections_are_preserved(monkeypatch, backend, causal):
 
     with pytest.raises(ValueError, match="causal=True|cute-dsl backend does not support custom masks"):
         impl.forward_cuda(query, query, query, metadata)
+
+
+@pytest.mark.gpu
+@pytest.mark.cuda
+def test_auto_sdpa_fallback_layout_survives_inductor_fullgraph(monkeypatch):
+    # The boundary op's fake promises a contiguous [B, Q, H, Dv] output, but
+    # SDPAImpl returns a permuted (noncontiguous) tensor with the SDPA math
+    # backend. Inductor only asserts the custom op's output layout when one
+    # of its kernels consumes it, so the compiled block carries a downstream
+    # consumer. Without the fallback materializing its return, this fails
+    # with "expected size ... stride ..." against the fake's layout.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for Inductor output-layout verification")
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    query = torch.randn(1, 4, 2, 128, device=device, dtype=torch.bfloat16)
+    key = torch.randn(1, 4, 2, 128, device=device, dtype=torch.bfloat16)
+    value = torch.randn(1, 4, 2, 128, device=device, dtype=torch.bfloat16)
+    mask = torch.ones(4, 4, device=device, dtype=torch.bool)
+    mask[:, -1] = False
+    metadata = AttentionMetadata(attn_mask=mask)
+
+    impl = _candidate_impl()
+    impl.flashinfer_backend = "cute-dsl"
+    impl.causal = False
+    impl.backend_explicit = False  # automatic: rejection routes to the SDPA fallback
+
+    def block(q, k, v, md):
+        return impl.forward_cuda(q, k, v, md) * 2
+
+    with sdpa_kernel([SDPBackend.MATH]):
+        expected = block(query, key, value, metadata)
+        compiled = torch.compile(block, backend="inductor", fullgraph=True)
+        actual = compiled(query, key, value, metadata)
+
+    torch.testing.assert_close(actual, expected)
 
 
 class _AttentionBlock(nn.Module):

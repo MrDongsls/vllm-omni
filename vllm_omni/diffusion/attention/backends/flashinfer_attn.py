@@ -272,7 +272,7 @@ if not hasattr(torch.ops.vllm_omni, "flashinfer_attention"):
                 value,
                 AttentionMetadata(attn_mask=attn_mask),
                 sdpa_reason,
-            )
+            ).contiguous()
         return impl._run_batch_prefill(
             query,
             key,
@@ -524,7 +524,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         # Tensor form of _op_handle for the boundary-op call site: an int would
         # become a per-instance literal guard in compiled graphs. CPU on
         # purpose — the op reads it back with a cheap host-side item().
-        self._op_token = torch.tensor(self._op_handle, dtype=torch.int64)
+        self._op_token = torch.tensor(self._op_handle, dtype=torch.int64, device="cpu")
         self._qo_indptr: torch.Tensor | None = None
         self._kv_indptr: torch.Tensor | None = None
         self._plan_key: FlashInferAttentionImpl._WrapperPlanKey | None = None
