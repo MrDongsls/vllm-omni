@@ -3059,7 +3059,17 @@ class Cosmos3OmniDiffusersPipeline(
                 )
                 if isinstance(next_latents, AsyncLatents):
                     next_latents = next_latents._resolve()
-                if _has_multimodal and (not pp_active or is_pipeline_first_stage()):
+                if pp_active and not is_pipeline_first_stage():
+                    # Middle ranks: the handshake returns their latents unchanged
+                    # and nothing downstream consumes their local state; only
+                    # rank 0 unpacks the packed result from the last stage.
+                    outputs = [latents]
+                    if action_latents is not None:
+                        outputs.append(action_latents)
+                    if sound_latents is not None:
+                        outputs.append(sound_latents)
+                    return outputs[0] if len(outputs) == 1 else tuple(outputs)
+                if _has_multimodal:
                     unpacked = _unpack_joint(next_latents, _joint_shapes, _joint_numels)
                     latents = unpacked[0]
                     idx = 1
@@ -3084,7 +3094,6 @@ class Cosmos3OmniDiffusersPipeline(
                         action_velocity_mask * action_latents + (1.0 - action_velocity_mask) * action_condition_latents
                     )
 
-                # action/sound latents unchanged on non-last ranks
                 outputs = [latents]
                 if action_latents is not None:
                     outputs.append(action_latents)
