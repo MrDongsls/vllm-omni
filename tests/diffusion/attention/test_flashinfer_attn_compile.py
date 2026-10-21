@@ -8,12 +8,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends import flashinfer_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @pytest.fixture(autouse=True)
@@ -72,6 +73,7 @@ def fake_fa2_single_prefill_kernel(monkeypatch):
     return calls
 
 
+@pytest.mark.cpu
 def test_flashinfer_fa2_custom_op_schema_and_fake(fake_fa2_single_prefill_kernel):
     op = torch.ops.vllm_omni.flashinfer_fa2_attention.default
 
@@ -87,6 +89,7 @@ def test_flashinfer_fa2_custom_op_schema_and_fake(fake_fa2_single_prefill_kernel
     }
 
 
+@pytest.mark.cpu
 def test_flashinfer_fa2_custom_op_preserves_inputs(fake_fa2_single_prefill_kernel):
     args = _fa2_inputs()
     snapshots = [tensor.clone() for tensor in args[:3]]
@@ -121,6 +124,7 @@ def fake_cute_dsl_kernel(monkeypatch):
     return calls
 
 
+@pytest.mark.cpu
 def test_flashinfer_cute_dsl_custom_op_schema_and_fake(fake_cute_dsl_kernel):
     op = torch.ops.vllm_omni.flashinfer_cute_dsl_attention.default
 
@@ -137,6 +141,7 @@ def test_flashinfer_cute_dsl_custom_op_schema_and_fake(fake_cute_dsl_kernel):
         }
 
 
+@pytest.mark.cpu
 def test_flashinfer_cute_dsl_custom_op_preserves_inputs(fake_cute_dsl_kernel):
     args = _inputs()
     tensor_snapshots = [tensor.clone() for tensor in args[:7]]
@@ -164,6 +169,7 @@ def test_flashinfer_cute_dsl_custom_op_preserves_inputs(fake_cute_dsl_kernel):
     assert call["return_lse"] is False
 
 
+@pytest.mark.cpu
 def test_flashinfer_cute_dsl_custom_op_reports_missing_kernel(monkeypatch):
     monkeypatch.setattr(
         flashinfer_attn,
@@ -296,6 +302,7 @@ def executable_cute_dsl_kernel(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("noncontiguous", [False, True])
+@pytest.mark.cpu
 def test_dense_cute_dsl_candidate_is_opaque_to_dynamic_fullgraph(
     executable_cute_dsl_kernel,
     noncontiguous,
@@ -340,6 +347,7 @@ def test_dense_cute_dsl_candidate_is_opaque_to_dynamic_fullgraph(
     assert len(executable_cute_dsl_kernel) == 4
 
 
+@pytest.mark.cpu
 def test_dense_fa2_candidate_is_opaque_to_dynamic_fullgraph(
     executable_fa2_single_prefill_kernel,
 ):
@@ -368,6 +376,7 @@ def test_dense_fa2_candidate_is_opaque_to_dynamic_fullgraph(
     ("sequence_parallel_size", "use_hsdp"),
     [(2, False), (1, True)],
 )
+@pytest.mark.cpu
 def test_active_parallel_context_keeps_stateful_wrapper(
     monkeypatch,
     sequence_parallel_size,
@@ -403,8 +412,7 @@ def test_active_parallel_context_keeps_stateful_wrapper(
     assert wrapper.run_calls == 1
 
 
-@pytest.mark.gpu
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_flashinfer_real_backend_eager_fullgraph_agreement():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for real FlashInfer execution")
@@ -447,8 +455,7 @@ def test_flashinfer_real_backend_eager_fullgraph_agreement():
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.gpu
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_impl_token_stays_cpu_when_initialized_in_device_context():
     # The diffusers loader initializes models inside a target-device context,
     # so an unspecified device would put the token on CUDA and turn every
@@ -469,8 +476,7 @@ def test_impl_token_stays_cpu_when_initialized_in_device_context():
     assert impl._op_token.device.type == "cpu"
 
 
-@pytest.mark.gpu
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_flashinfer_cute_dsl_custom_op_matches_wrapper_and_sdpa():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for real FlashInfer execution")
@@ -514,6 +520,7 @@ def test_flashinfer_cute_dsl_custom_op_matches_wrapper_and_sdpa():
         torch.testing.assert_close(direct.float(), sdpa, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.cpu
 def test_neighboring_unverified_path_keeps_stateful_wrapper(monkeypatch):
     monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
     monkeypatch.setattr(
@@ -571,6 +578,7 @@ def test_neighboring_unverified_path_keeps_stateful_wrapper(monkeypatch):
         ),
     ],
 )
+@pytest.mark.cpu
 def test_only_exact_dense_cute_dsl_path_is_custom_op_candidate(
     attribute,
     value,
@@ -585,6 +593,7 @@ def test_only_exact_dense_cute_dsl_path_is_custom_op_candidate(
     assert not impl._is_cute_dsl_custom_op_candidate(query, query, query, metadata)
 
 
+@pytest.mark.cpu
 def test_flashinfer_attention_boundary_op_schema_and_fake():
     impl = _candidate_impl()
     impl.flashinfer_backend = "fa2"
@@ -625,6 +634,7 @@ _WRAPPER_ROUTE_CASES = [
     ("case_id", "backend", "causal", "dtype", "head_dim", "mask_kind"),
     _WRAPPER_ROUTE_CASES,
 )
+@pytest.mark.cpu
 def test_wrapper_route_configs_are_opaque_to_fullgraph(
     monkeypatch,
     case_id,
@@ -696,6 +706,7 @@ def test_wrapper_route_configs_are_opaque_to_fullgraph(
         ("cute-dsl", False, True),
     ],
 )
+@pytest.mark.cpu
 def test_all_keep_mask_elides_before_the_rejections(monkeypatch, backend, causal, backend_explicit):
     # Pre-PR semantics: an all-keep mask packs to None *before* the causal and
     # cute-dsl rejections, so those calls run exactly like a call without any
@@ -736,6 +747,7 @@ def test_all_keep_mask_elides_before_the_rejections(monkeypatch, backend, causal
     ("backend", "causal"),
     [("fa2", True), ("cute-dsl", False)],
 )
+@pytest.mark.cpu
 def test_partial_mask_rejections_are_preserved(monkeypatch, backend, causal):
     # A mask with real masked-out positions is NOT elided: explicit backends
     # keep raising for causal/cute-dsl, exactly like before the PR.
@@ -754,8 +766,7 @@ def test_partial_mask_rejections_are_preserved(monkeypatch, backend, causal):
         impl.forward_cuda(query, query, query, metadata)
 
 
-@pytest.mark.gpu
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_auto_sdpa_fallback_layout_survives_inductor_fullgraph(monkeypatch):
     # The boundary op's fake promises a contiguous [B, Q, H, Dv] output, but
     # SDPAImpl returns a permuted (noncontiguous) tensor with the SDPA math
@@ -804,6 +815,7 @@ class _AttentionBlock(nn.Module):
         return self.impl.forward_cuda(query, key, value)
 
 
+@pytest.mark.cpu
 def test_equivalent_instances_share_one_compiled_graph(monkeypatch):
     monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
     num_blocks = 10  # Above Dynamo's default per-frame cache of 8 entries.
@@ -847,8 +859,7 @@ def test_equivalent_instances_share_one_compiled_graph(monkeypatch):
         assert block.impl._wrapper.run_calls == 2  # eager + compiled calls
 
 
-@pytest.mark.gpu
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
     ("causal", "dtype", "head_dim", "query_gt_kv", "masked"),
     [

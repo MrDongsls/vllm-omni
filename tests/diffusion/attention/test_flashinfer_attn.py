@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends import flashinfer_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flashinfer_attn import (
@@ -22,7 +23,7 @@ from vllm_omni.diffusion.attention.capabilities import (
 )
 from vllm_omni.diffusion.data import AttentionSpec, AttnQuantSpec
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 def _impl(*, causal: bool = False, backend_explicit: bool = False):
@@ -60,6 +61,7 @@ def _resolve(
     )
 
 
+@pytest.mark.cpu
 def test_flashinfer_preconstruction_capability_is_conservative():
     result = FlashInferAttentionBackend.resolve_capabilities(ExecutionContext(platform="cuda", require_fullgraph=True))
 
@@ -73,6 +75,7 @@ def test_flashinfer_preconstruction_capability_is_conservative():
     )
 
 
+@pytest.mark.cpu
 def test_flashinfer_dense_path_uses_initialized_backend_and_stays_unmigrated():
     impl = _impl()
     result = _resolve(
@@ -93,6 +96,7 @@ def _candidate_impl():
     return impl
 
 
+@pytest.mark.cpu
 def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op(monkeypatch):
     monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
     monkeypatch.setattr(flashinfer_attn, "trtllm_ragged_attention_deepseek", lambda **_kwargs: object())
@@ -110,6 +114,7 @@ def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op(monkeypatch):
 
 
 @pytest.mark.parametrize("capability", [(12, 0), (9, 0)])
+@pytest.mark.cpu
 def test_flashinfer_cute_dsl_dense_path_stays_unmigrated_without_artifacts(monkeypatch, capability):
     # Architectures without published cute-dsl FMHA artifacts must not have
     # the dense path declared supported, even when the backend is forced.
@@ -128,6 +133,7 @@ def test_flashinfer_cute_dsl_dense_path_stays_unmigrated_without_artifacts(monke
     assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
 
 
+@pytest.mark.cpu
 def test_flashinfer_exact_fa2_path_is_supported_custom_op(monkeypatch):
     monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
     monkeypatch.setattr(flashinfer_attn, "single_prefill_with_kv_cache", lambda *_args, **_kwargs: object())
@@ -152,6 +158,7 @@ def test_flashinfer_exact_fa2_path_is_supported_custom_op(monkeypatch):
         ("flashinfer_backend", "cute-dsl", torch.bfloat16, True),
     ],
 )
+@pytest.mark.cpu
 def test_flashinfer_unverified_near_miss_stays_unmigrated(attribute, value, dtype, causal):
     impl = _candidate_impl()
     setattr(impl, attribute, value)
@@ -177,6 +184,7 @@ def test_flashinfer_unverified_near_miss_stays_unmigrated(attribute, value, dtyp
         {"outer_boundaries": frozenset({OuterBoundary.HSDP})},
     ],
 )
+@pytest.mark.cpu
 def test_flashinfer_outer_paths_stay_unmigrated(context_change):
     impl = _candidate_impl()
     context = replace(
@@ -192,6 +200,7 @@ def test_flashinfer_outer_paths_stay_unmigrated(context_change):
     assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
 
 
+@pytest.mark.cpu
 def test_flashinfer_unpublished_mask_is_runtime_dependent():
     metadata = AttentionMetadata(attn_mask=torch.ones((2, 2), dtype=torch.bool))
 
@@ -201,6 +210,7 @@ def test_flashinfer_unpublished_mask_is_runtime_dependent():
     assert result.support.status is SupportStatus.UNMIGRATED
 
 
+@pytest.mark.cpu
 def test_flashinfer_published_mask_mode_is_preserved_in_context():
     metadata = AttentionMetadata(
         attn_mask=torch.ones((2, 2), dtype=torch.bool),
@@ -213,6 +223,7 @@ def test_flashinfer_published_mask_mode_is_preserved_in_context():
     assert result.support.status is SupportStatus.UNMIGRATED
 
 
+@pytest.mark.cpu
 def test_flashinfer_mask_mode_rejects_reserved_unknown_value():
     metadata = AttentionMetadata(
         attn_mask=torch.ones((2, 2), dtype=torch.bool),
@@ -223,6 +234,7 @@ def test_flashinfer_mask_mode_rejects_reserved_unknown_value():
         _resolve(_impl(), attn_metadata=metadata)
 
 
+@pytest.mark.cpu
 def test_flashinfer_rejects_float_mask_instead_of_falling_back(monkeypatch):
     monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
     query = torch.randn(1, 2, 2, 8)
@@ -232,6 +244,7 @@ def test_flashinfer_rejects_float_mask_instead_of_falling_back(monkeypatch):
         _impl(backend_explicit=True).forward_cuda(query, query, query, metadata)
 
 
+@pytest.mark.cpu
 def test_flashinfer_rejects_causal_custom_mask_instead_of_falling_back(monkeypatch):
     monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
     query = torch.randn(1, 2, 2, 8)
@@ -241,6 +254,7 @@ def test_flashinfer_rejects_causal_custom_mask_instead_of_falling_back(monkeypat
         _impl(causal=True, backend_explicit=True).forward_cuda(query, query, query, metadata)
 
 
+@pytest.mark.cpu
 def test_explicit_cute_dsl_rejects_custom_mask_instead_of_falling_back(monkeypatch):
     monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
     impl = _impl(backend_explicit=True)
@@ -252,6 +266,7 @@ def test_explicit_cute_dsl_rejects_custom_mask_instead_of_falling_back(monkeypat
         impl.forward_cuda(query, query, query, metadata)
 
 
+@pytest.mark.cpu
 def test_auto_cute_dsl_falls_back_to_sdpa_for_custom_mask(monkeypatch):
     monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
     impl = _impl(backend_explicit=False)
@@ -265,6 +280,7 @@ def test_auto_cute_dsl_falls_back_to_sdpa_for_custom_mask(monkeypatch):
     assert output.shape == query.shape
 
 
+@pytest.mark.cpu
 def test_explicit_cute_dsl_is_not_mask_capable(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
     spec = AttentionSpec(backend="FLASHINFER_ATTN")
@@ -273,6 +289,7 @@ def test_explicit_cute_dsl_is_not_mask_capable(monkeypatch):
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is False
 
 
+@pytest.mark.cpu
 def test_explicit_fa2_flashinfer_is_mask_capable(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
     spec = AttentionSpec(backend="FLASHINFER_ATTN", quant=AttnQuantSpec(flashinfer_backend="fa2"))
@@ -280,6 +297,7 @@ def test_explicit_fa2_flashinfer_is_mask_capable(monkeypatch):
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
 
 
+@pytest.mark.cpu
 def test_explicit_fa2_backend_kwargs_select_fa2_on_blackwell(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
     spec = AttentionSpec(backend="FLASHINFER_ATTN", quant=AttnQuantSpec(flashinfer_backend="fa2"))
@@ -291,6 +309,7 @@ def test_explicit_fa2_backend_kwargs_select_fa2_on_blackwell(monkeypatch):
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
 
 
+@pytest.mark.cpu
 def test_auto_flashinfer_backend_kwargs_select_cute_dsl_on_blackwell(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
     spec = AttentionSpec(backend="FLASHINFER_ATTN")
@@ -302,6 +321,7 @@ def test_auto_flashinfer_backend_kwargs_select_cute_dsl_on_blackwell(monkeypatch
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is False
 
 
+@pytest.mark.cpu
 def test_hopper_explicit_flashinfer_is_mask_capable(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (9, 0))
     spec = AttentionSpec(backend="FLASHINFER_ATTN")
@@ -309,8 +329,7 @@ def test_hopper_explicit_flashinfer_is_mask_capable(monkeypatch):
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
 
 
-@pytest.mark.gpu
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_flashinfer_real_init_selects_fa2_on_sm80():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for real FlashInfer initialization")
