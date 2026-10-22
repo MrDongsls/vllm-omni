@@ -130,13 +130,13 @@ def test_hopper_explicit_flashinfer_is_mask_capable(monkeypatch):
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_flashinfer_real_init_selects_fa2_on_sm80():
+def test_flashinfer_real_init_selects_fa2_on_sm8x():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for real FlashInfer initialization")
     if not flashinfer_attn.HAS_FLASHINFER:
         pytest.skip("FlashInfer is not installed")
-    if torch.cuda.get_device_capability() != (8, 0):
-        pytest.skip("This regression test targets A100/SM80")
+    if torch.cuda.get_device_capability()[0] != 8:
+        pytest.skip("This regression test targets SM8x (A100/L4)")
 
     impl = FlashInferAttentionImpl(
         num_heads=2,

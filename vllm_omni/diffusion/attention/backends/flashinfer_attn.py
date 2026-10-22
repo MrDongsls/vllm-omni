@@ -327,18 +327,20 @@ class FlashInferAttentionImpl(AttentionImpl):
         return tensor.to(to_dtype), 1.0
 
     @staticmethod
-    def _validated_mask_view(
-        attn_mask: torch.Tensor,
-        batch_size: int,
-        qo_len: int,
-        kv_len: int,
-    ) -> torch.Tensor:
-        """Validate a diffusion attn_mask against the target shape and return
-        its broadcastable (collapsed) view without reading its contents.
+    def _pack_mask_for_flashinfer(
+        attn_mask: torch.Tensor, batch_size: int, qo_len: int, kv_len: int
+    ) -> torch.Tensor | None:
+        """Convert a diffusion-style attn_mask into the boolean form
+        FlashInfer's ``custom_mask`` expects (``True`` = keep).
 
-        Called by ``_pack_mask_for_flashinfer`` inside the boundary op (the
-        reject/fallback decisions share the packed result).
+        Returns either ``(qo_len, kv_len)`` (shared across the batch) or
+        ``(batch_size, qo_len, kv_len)`` (per-sample), or ``None`` when the
+        mask is all-keep (elide). Only boolean masks are handled here;
+        additive/float masks and shape mismatches raise ``ValueError`` because
+        an explicitly selected backend must not silently switch to SDPA.
         """
+        # ``mask.all()`` below is content-dependent: this must only run inside
+        # the boundary op or in eager code, never under Dynamo.
         if attn_mask.dtype != torch.bool:
             # Additive masks (0 / -inf / -1e4 / finfo.min) cannot be faithfully
             # reduced to a boolean keep-mask here; SDPA handles them correctly.
@@ -354,30 +356,14 @@ class FlashInferAttentionImpl(AttentionImpl):
             mask = mask[0]  # (qo|1, kv) — shared across the batch
         try:
             if mask.dim() >= 3:
-                return mask.broadcast_to((batch_size, qo_len, kv_len))
-            return mask.broadcast_to((qo_len, kv_len))
+                mask = mask.broadcast_to((batch_size, qo_len, kv_len))
+            else:
+                mask = mask.broadcast_to((qo_len, kv_len))
         except RuntimeError as e:
             raise ValueError(
                 f"attn_mask shape {tuple(attn_mask.shape)} cannot broadcast to "
                 f"(batch={batch_size}, qo_len={qo_len}, kv_len={kv_len})"
             ) from e
-
-    @staticmethod
-    def _pack_mask_for_flashinfer(
-        attn_mask: torch.Tensor, batch_size: int, qo_len: int, kv_len: int
-    ) -> torch.Tensor | None:
-        """Convert a diffusion-style attn_mask into the boolean form
-        FlashInfer's ``custom_mask`` expects (``True`` = keep).
-
-        Returns either ``(qo_len, kv_len)`` (shared across the batch) or
-        ``(batch_size, qo_len, kv_len)`` (per-sample), or ``None`` when the
-        mask is all-keep (elide). Only boolean masks are handled here;
-        additive/float masks and shape mismatches raise ``ValueError`` because
-        an explicitly selected backend must not silently switch to SDPA.
-        """
-        # ``mask.all()`` below is content-dependent: this must only run inside
-        # the boundary op or in eager code, never under Dynamo.
-        mask = FlashInferAttentionImpl._validated_mask_view(attn_mask, batch_size, qo_len, kv_len)
         if mask.all():
             return None
         # ``broadcast_to`` returns a non-contiguous view; materialize for the
@@ -532,10 +518,7 @@ class FlashInferAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
-        # Dynamo cannot trace logging calls; skip them inside compiled code so
-        # the fallback stays fullgraph-transparent.
-        if not torch.compiler.is_compiling():
-            logger.warning_once("FLASHINFER_ATTN falling back to SDPA: %s", reason)
+        logger.warning_once("FLASHINFER_ATTN falling back to SDPA: %s", reason)
         fallback = self._sdpa_fallback
         if fallback is None:
             fallback = SDPAImpl(
@@ -544,11 +527,7 @@ class FlashInferAttentionImpl(AttentionImpl):
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
             )
-            # Cache only outside compilation: under Dynamo the impl is a
-            # closed-over constant and eager-side caching already covers the
-            # repeated-call win.
-            if not torch.compiler.is_compiling():
-                self._sdpa_fallback = fallback
+            self._sdpa_fallback = fallback
         return fallback.forward_cuda(query, key, value, attn_metadata)
 
     def forward_cuda(
