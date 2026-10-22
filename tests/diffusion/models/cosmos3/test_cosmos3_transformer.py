@@ -534,6 +534,53 @@ def test_edge_validates_required_relu2_weights() -> None:
     model.validate_loaded_weights(missing_k_norm)
 
 
+def test_edge_weight_validation_skips_pp_missing_layers() -> None:
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
+        Cosmos3EdgeVFMTransformer,
+    )
+
+    def _make_stage(*, first: bool) -> Cosmos3EdgeVFMTransformer:
+        model = object.__new__(Cosmos3EdgeVFMTransformer)
+        nn.Module.__init__(model)
+        model.num_hidden_layers = 2
+        model.qk_norm_for_diffusion = True
+        model.use_und_k_norm_for_gen = True
+        # PP=2 layout from make_layers: each stage owns one GEN layer and the
+        # UND backbone lives only on the first stage.
+        model.language_model = nn.Linear(1, 1) if first else PPMissingLayer()
+        model.gen_layers = nn.ModuleList(
+            [nn.Linear(1, 1), PPMissingLayer()] if first else [PPMissingLayer(), nn.Linear(1, 1)]
+        )
+        return model
+
+    first_stage = _make_stage(first=True)
+    last_stage = _make_stage(first=False)
+
+    first_loaded = {
+        f"transformer.language_model.layers.{i}.{suffix}.weight"
+        for i in range(2)
+        for suffix in ("mlp.up_proj", "mlp.down_proj", "self_attn.k_norm_und_for_gen")
+    } | {
+        "transformer.gen_layers.0.mlp.up_proj.weight",
+        "transformer.gen_layers.0.mlp.down_proj.weight",
+    }
+    last_loaded = {
+        "transformer.gen_layers.1.mlp.up_proj.weight",
+        "transformer.gen_layers.1.mlp.down_proj.weight",
+    }
+
+    first_stage.validate_loaded_weights(first_loaded)
+    last_stage.validate_loaded_weights(last_loaded)
+
+    # Layers this stage owns are still required.
+    with pytest.raises(ValueError, match=r"gen_layers\.1\.mlp\.up_proj"):
+        last_stage.validate_loaded_weights(last_loaded - {"transformer.gen_layers.1.mlp.up_proj.weight"})
+    with pytest.raises(ValueError, match=r"language_model\.layers\.1\.mlp\.down_proj"):
+        first_stage.validate_loaded_weights(first_loaded - {"transformer.language_model.layers.1.mlp.down_proj.weight"})
+
+
 def test_edge_gen_cached_k_is_normalized_but_reasoner_uses_raw_k() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import RMSNorm
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (

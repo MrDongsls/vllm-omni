@@ -3624,3 +3624,60 @@ def test_diffuse_transfer_interval_bounds_and_cfg_normalization(
         open_guidance_interval=open_interval,
     )
     assert cfg_calls == [True] * (1 if open_interval else 3)
+
+
+@pytest.mark.parametrize(
+    ("pp_size", "cache_backend", "should_raise"),
+    [
+        (2, "sea_cache", True),
+        (2, "tea_cache", True),
+        (2, "cache_dit", True),
+        (2, "none", False),
+        (2, None, False),
+        (1, "sea_cache", False),
+    ],
+)
+def test_pipeline_parallel_rejects_cache_backends(pp_size, cache_backend, should_raise) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _validate_cosmos3_pp_cache_backend
+
+    od_config = SimpleNamespace(
+        cache_backend=cache_backend,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
+    )
+    if should_raise:
+        with pytest.raises(ValueError, match="pipeline parallelism"):
+            _validate_cosmos3_pp_cache_backend(od_config)
+    else:
+        _validate_cosmos3_pp_cache_backend(od_config)
+
+
+def test_pipeline_init_rejects_cache_backend_under_pp_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    monkeypatch.setattr(
+        pipeline_cosmos3.FlowUniPCMultistepScheduler,
+        "load_config",
+        lambda *args, **kwargs: pytest.fail("component loading must not start for PP + cache backend"),
+    )
+    od_config = SimpleNamespace(
+        model="/nonexistent/model/path",
+        cache_backend="sea_cache",
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2, cfg_parallel_size=1, ulysses_degree=1),
+    )
+    with pytest.raises(ValueError, match="cache_backend='sea_cache'"):
+        pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)
+
+
+def test_cosmos3_cache_extractor_rejects_pipeline_parallel_inputs() -> None:
+    from vllm_omni.diffusion.cache.teacache.extractors import extract_cosmos3_context
+
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        extract_cosmos3_context(
+            nn.Module(),
+            hidden_states=torch.zeros(1),
+            timestep=torch.zeros(1),
+            text_ids=torch.zeros(1, dtype=torch.long),
+            text_mask=torch.ones(1, dtype=torch.long),
+            video_shape=(1, 1, 1),
+            intermediate_tensors=None,
+        )

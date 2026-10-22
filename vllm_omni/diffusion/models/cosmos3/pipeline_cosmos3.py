@@ -220,6 +220,29 @@ COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
 
 
+def _validate_cosmos3_pp_cache_backend(od_config: Any) -> None:
+    """Reject diffusion cache backends together with pipeline parallelism.
+
+    None of the Cosmos3 cache backends is PP-aware: Cache-DiT's grouped
+    wrapper holds every GEN layer, and TeaCache/SeaCache run the full
+    ``_gen_preprocess`` through their extractor (which non-first stages
+    cannot do and which rejects ``intermediate_tensors``). Their per-rank
+    skip decisions would also desynchronize the stage-to-stage send/recv.
+    Fail at startup instead of on the first request.
+    """
+    parallel_config = getattr(od_config, "parallel_config", None)
+    pp_size = int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
+    if pp_size <= 1:
+        return
+    cache_backend = getattr(od_config, "cache_backend", None)
+    if cache_backend is None or str(cache_backend).lower() in ("", "none"):
+        return
+    raise ValueError(
+        f"Cosmos3 does not support cache_backend={cache_backend!r} together with pipeline parallelism "
+        f"(pipeline_parallel_size={pp_size}). Remove --cache-backend or set --pipeline-parallel-size 1."
+    )
+
+
 def _ceil_video_num_frames(num_frames: int, temporal_compression_factor: int) -> int:
     """Round a video length up to the causal VAE's ``factor * k + 1`` grid."""
     if temporal_compression_factor <= 0:
@@ -1035,6 +1058,7 @@ class Cosmos3OmniDiffusersPipeline(
     ) -> None:
         super().__init__()
         self.od_config = od_config
+        _validate_cosmos3_pp_cache_backend(od_config)
         resolved_offload = resolve_offload(od_config)
         if resolved_offload.public is not None and resolved_offload.strategy is OffloadStrategy.MODEL_LEVEL:
             raise ValueError(
