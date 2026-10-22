@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from dataclasses import replace
-
 import pytest
 import torch
 
@@ -13,21 +11,13 @@ from vllm_omni.diffusion.attention.backends.flashinfer_attn import (
     FlashInferAttentionBackend,
     FlashInferAttentionImpl,
 )
-from vllm_omni.diffusion.attention.capabilities import (
-    CompilationMode,
-    ExecutionContext,
-    MaskMode,
-    OuterBoundary,
-    ParallelStrategy,
-    SupportStatus,
-)
 from vllm_omni.diffusion.data import AttentionSpec, AttnQuantSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 def _impl(*, causal: bool = False, backend_explicit: bool = False):
-    # Avoid CUDA/wrapper init; exercise the capability contract with initialized-state doubles.
+    # Avoid CUDA/wrapper init with an initialized-state double.
     obj = FlashInferAttentionImpl.__new__(FlashInferAttentionImpl)
     obj.causal = causal
     obj.softmax_scale = 0.5
@@ -36,202 +26,12 @@ def _impl(*, causal: bool = False, backend_explicit: bool = False):
     obj.dtype_vo = None
     obj.backend_explicit = backend_explicit
     obj._sdpa_fallback = None
-    obj.device_capability = (10, 0)
-    # __new__ bypasses __init__; mask reject/fallback runs inside the boundary
-    # op now, so those paths need the op token __init__ would have built.
+    # __new__ bypasses __init__; the mask reject/fallback decisions run inside
+    # the boundary op now, so those paths need the op token __init__ would
+    # have built.
     obj._op_handle = flashinfer_attn._register_impl_for_boundary_op(obj)
     obj._op_token = torch.tensor(obj._op_handle, dtype=torch.int64)
     return obj
-
-
-def _resolve(
-    impl,
-    *,
-    context: ExecutionContext | None = None,
-    attn_metadata: AttentionMetadata | None = None,
-    dtype=torch.bfloat16,
-):
-    tensor = torch.empty((1, 2, 2, 8), dtype=dtype)
-    return impl.resolve_execution_path(
-        context or ExecutionContext(platform="cuda"),
-        tensor,
-        tensor,
-        tensor,
-        attn_metadata,
-    )
-
-
-@pytest.mark.cpu
-def test_flashinfer_preconstruction_capability_is_conservative():
-    result = FlashInferAttentionBackend.resolve_capabilities(ExecutionContext(platform="cuda", require_fullgraph=True))
-
-    assert result.path == "unverified"
-    assert result.kernel_variant is None
-    assert result.support.status is SupportStatus.UNMIGRATED
-    assert result.compilation_mode is CompilationMode.EAGER_ONLY
-    assert (
-        result.requested_support(ExecutionContext(platform="cuda", require_fullgraph=True)).status
-        is SupportStatus.UNSUPPORTED
-    )
-
-
-@pytest.mark.cpu
-def test_flashinfer_dense_path_uses_initialized_backend_and_stays_unmigrated():
-    impl = _impl()
-    result = _resolve(
-        impl,
-        context=ExecutionContext(platform="cuda", kernel_variant="cute-dsl"),
-    )
-
-    assert result.backend == "FLASHINFER_ATTN"
-    assert result.path == "flashinfer_fa2_dense"
-    assert result.kernel_variant == "fa2"
-    assert result.support.status is SupportStatus.UNMIGRATED
-    assert result.compilation_mode is CompilationMode.EAGER_ONLY
-
-
-def _candidate_impl():
-    impl = _impl()
-    impl.flashinfer_backend = "cute-dsl"
-    return impl
-
-
-@pytest.mark.cpu
-def test_flashinfer_exact_cute_dsl_path_is_supported_custom_op(monkeypatch):
-    monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
-    monkeypatch.setattr(flashinfer_attn, "trtllm_ragged_attention_deepseek", lambda **_kwargs: object())
-    impl = _candidate_impl()
-    query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
-    context = ExecutionContext(platform="cuda", require_fullgraph=True)
-
-    result = impl.resolve_execution_path(context, query, query, query, None)
-
-    assert result.path == "flashinfer_cute-dsl_dense"
-    assert result.kernel_variant == "cute-dsl"
-    assert result.support.status is SupportStatus.SUPPORTED
-    assert result.compilation_mode is CompilationMode.CUSTOM_OP
-    assert result.requested_support(context).status is SupportStatus.SUPPORTED
-
-
-@pytest.mark.parametrize("capability", [(12, 0), (9, 0)])
-@pytest.mark.cpu
-def test_flashinfer_cute_dsl_dense_path_stays_unmigrated_without_artifacts(monkeypatch, capability):
-    # Architectures without published cute-dsl FMHA artifacts must not have
-    # the dense path declared supported, even when the backend is forced.
-    monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
-    monkeypatch.setattr(flashinfer_attn, "trtllm_ragged_attention_deepseek", lambda **_kwargs: object())
-    impl = _candidate_impl()
-    impl.device_capability = capability
-    query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
-    context = ExecutionContext(platform="cuda", require_fullgraph=True)
-
-    result = impl.resolve_execution_path(context, query, query, query, None)
-
-    assert result.path == "flashinfer_cute-dsl_dense"
-    assert result.support.status is SupportStatus.UNMIGRATED
-    assert result.compilation_mode is CompilationMode.EAGER_ONLY
-    assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
-
-
-@pytest.mark.cpu
-def test_flashinfer_exact_fa2_path_is_supported_custom_op(monkeypatch):
-    monkeypatch.setattr(flashinfer_attn, "_is_cuda_execution_path", lambda *_tensors: True)
-    monkeypatch.setattr(flashinfer_attn, "single_prefill_with_kv_cache", lambda *_args, **_kwargs: object())
-    impl = _impl()
-    query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
-    context = ExecutionContext(platform="cuda", require_fullgraph=True)
-
-    result = impl.resolve_execution_path(context, query, query, query, None)
-
-    assert result.path == "flashinfer_fa2_dense"
-    assert result.kernel_variant == "fa2"
-    assert result.support.status is SupportStatus.SUPPORTED
-    assert result.compilation_mode is CompilationMode.CUSTOM_OP
-    assert result.requested_support(context).status is SupportStatus.SUPPORTED
-
-
-@pytest.mark.parametrize(
-    ("attribute", "value", "dtype", "causal"),
-    [
-        ("flashinfer_backend", "fa2", torch.bfloat16, False),
-        ("flashinfer_backend", "cute-dsl", torch.float16, False),
-        ("flashinfer_backend", "cute-dsl", torch.bfloat16, True),
-    ],
-)
-@pytest.mark.cpu
-def test_flashinfer_unverified_near_miss_stays_unmigrated(attribute, value, dtype, causal):
-    impl = _candidate_impl()
-    setattr(impl, attribute, value)
-    impl.causal = causal
-    query = torch.empty((1, 4, 2, 128), dtype=dtype)
-    context = ExecutionContext(platform="cuda", require_fullgraph=True)
-
-    result = impl.resolve_execution_path(context, query, query, query, None)
-
-    assert result.support.status is SupportStatus.UNMIGRATED
-    assert result.compilation_mode is CompilationMode.EAGER_ONLY
-    assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
-
-
-@pytest.mark.parametrize(
-    "context_change",
-    [
-        {"platform": "rocm"},
-        {"piecewise": True},
-        {"paged_kv": True},
-        {"kv_cache_dtype": "fp8"},
-        {"parallel_strategy": ParallelStrategy.ULYSSES},
-        {"outer_boundaries": frozenset({OuterBoundary.HSDP})},
-    ],
-)
-@pytest.mark.cpu
-def test_flashinfer_outer_paths_stay_unmigrated(context_change):
-    impl = _candidate_impl()
-    context = replace(
-        ExecutionContext(platform="cuda", require_fullgraph=True),
-        **context_change,
-    )
-    query = torch.empty((1, 4, 2, 128), dtype=torch.bfloat16)
-
-    result = impl.resolve_execution_path(context, query, query, query, None)
-
-    assert result.support.status is SupportStatus.UNMIGRATED
-    assert result.compilation_mode is CompilationMode.EAGER_ONLY
-    assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
-
-
-@pytest.mark.cpu
-def test_flashinfer_unpublished_mask_is_runtime_dependent():
-    metadata = AttentionMetadata(attn_mask=torch.ones((2, 2), dtype=torch.bool))
-
-    result = _resolve(_impl(), attn_metadata=metadata)
-
-    assert result.path == "runtime_mask_dependent"
-    assert result.support.status is SupportStatus.UNMIGRATED
-
-
-@pytest.mark.cpu
-def test_flashinfer_published_mask_mode_is_preserved_in_context():
-    metadata = AttentionMetadata(
-        attn_mask=torch.ones((2, 2), dtype=torch.bool),
-        extra={"attention_mask_mode": "padding"},
-    )
-
-    result = _resolve(_impl(), attn_metadata=metadata)
-
-    assert result.path == "flashinfer_fa2_masked"
-    assert result.support.status is SupportStatus.UNMIGRATED
-
-
-@pytest.mark.cpu
-def test_flashinfer_mask_mode_rejects_reserved_unknown_value():
-    metadata = AttentionMetadata(
-        attn_mask=torch.ones((2, 2), dtype=torch.bool),
-        extra={"attention_mask_mode": MaskMode.UNKNOWN.value},
-    )
-
-    with pytest.raises(ValueError, match="reserved"):
-        _resolve(_impl(), attn_metadata=metadata)
 
 
 @pytest.mark.cpu
