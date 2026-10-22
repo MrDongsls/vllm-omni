@@ -220,6 +220,27 @@ COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
 
 
+def _cosmos3_pp_size(od_config: Any) -> int:
+    parallel_config = getattr(od_config, "parallel_config", None)
+    return int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
+
+
+def _validate_cosmos3_pp_model_offload(od_config: Any, strategy: OffloadStrategy) -> None:
+    """Reject Cosmos3 model-level CPU offload together with pipeline parallelism.
+
+    Model-level offload swaps the whole UND reasoner and GEN stack in and out
+    of the device. Under PP, non-first stages have no reasoner (a
+    PPMissingLayer placeholder) and never enter the generator offload context,
+    so their GEN layers would stay on CPU. Fail at startup instead.
+    """
+    pp_size = _cosmos3_pp_size(od_config)
+    if pp_size > 1 and strategy is OffloadStrategy.MODEL_LEVEL:
+        raise ValueError(
+            "Cosmos3 model-level CPU offload is not supported together with pipeline parallelism "
+            f"(pipeline_parallel_size={pp_size}). Disable --enable-cpu-offload or set --pipeline-parallel-size 1."
+        )
+
+
 def _validate_cosmos3_pp_cache_backend(od_config: Any) -> None:
     """Reject diffusion cache backends together with pipeline parallelism.
 
@@ -230,8 +251,7 @@ def _validate_cosmos3_pp_cache_backend(od_config: Any) -> None:
     skip decisions would also desynchronize the stage-to-stage send/recv.
     Fail at startup instead of on the first request.
     """
-    parallel_config = getattr(od_config, "parallel_config", None)
-    pp_size = int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
+    pp_size = _cosmos3_pp_size(od_config)
     if pp_size <= 1:
         return
     cache_backend = getattr(od_config, "cache_backend", None)
@@ -1065,6 +1085,7 @@ class Cosmos3OmniDiffusersPipeline(
                 "Cosmos3 model offload uses reasoner/generator topology and does "
                 "not support the dit/text_encoder component selector"
             )
+        _validate_cosmos3_pp_model_offload(od_config, resolved_offload.strategy)
         self.device = get_local_device()
         self.dtype = od_config.dtype
 

@@ -1612,6 +1612,18 @@ def test_transformer_builds_full_layer_replica_without_pp_init(monkeypatch: pyte
     assert isinstance(model.gen_sp_prepare, transformer_cosmos3.Cosmos3GenSPPrepare)
 
 
+def test_model_cpu_offload_rejects_pipeline_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    monkeypatch.setattr(transformer_cosmos3, "_pp_parallel_active", lambda: True)
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        model.enable_model_cpu_offload(device=torch.device("cpu"), pin_memory=False)
+    assert not getattr(model, "_model_cpu_offload_enabled", False)
+
+
 def test_build_pp_intermediate_tensors_sends_und_cache_on_first_step_only() -> None:
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 

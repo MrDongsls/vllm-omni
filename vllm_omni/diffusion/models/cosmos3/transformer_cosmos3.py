@@ -1580,6 +1580,13 @@ class Cosmos3VFMTransformer(nn.Module):
         """Enable Cosmos3 reasoner/generator CPU swapping inside ``forward``."""
         if getattr(self, "_model_cpu_offload_enabled", False):
             return
+        if _pp_parallel_active():
+            # Non-first stages have no reasoner and never enter the generator
+            # offload context, so their GEN layers would stay on CPU.
+            raise NotImplementedError(
+                "Cosmos3 model-level CPU offload is not supported together with pipeline parallelism; "
+                "disable one of them."
+            )
 
         from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
 

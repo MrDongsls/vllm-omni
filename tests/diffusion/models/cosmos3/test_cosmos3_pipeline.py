@@ -3681,3 +3681,41 @@ def test_cosmos3_cache_extractor_rejects_pipeline_parallel_inputs() -> None:
             video_shape=(1, 1, 1),
             intermediate_tensors=None,
         )
+
+
+@pytest.mark.parametrize(
+    ("pp_size", "enable_cpu_offload", "should_raise"),
+    [
+        (2, True, True),
+        (2, False, False),
+        (1, True, False),
+    ],
+)
+def test_pipeline_parallel_rejects_model_level_cpu_offload(pp_size, enable_cpu_offload, should_raise) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _validate_cosmos3_pp_model_offload
+    from vllm_omni.diffusion.offloader.config import resolve_offload
+
+    od_config = _make_od_config(sound_gen=False)
+    od_config.enable_cpu_offload = enable_cpu_offload
+    od_config.parallel_config.pipeline_parallel_size = pp_size
+    strategy = resolve_offload(od_config).strategy
+    if should_raise:
+        with pytest.raises(ValueError, match="model-level CPU offload"):
+            _validate_cosmos3_pp_model_offload(od_config, strategy)
+    else:
+        _validate_cosmos3_pp_model_offload(od_config, strategy)
+
+
+def test_pipeline_init_rejects_model_cpu_offload_under_pp_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    monkeypatch.setattr(
+        pipeline_cosmos3.FlowUniPCMultistepScheduler,
+        "load_config",
+        lambda *args, **kwargs: pytest.fail("component loading must not start for PP + model CPU offload"),
+    )
+    od_config = _make_od_config(sound_gen=False)
+    od_config.enable_cpu_offload = True
+    od_config.parallel_config.pipeline_parallel_size = 2
+    with pytest.raises(ValueError, match="model-level CPU offload"):
+        pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)
