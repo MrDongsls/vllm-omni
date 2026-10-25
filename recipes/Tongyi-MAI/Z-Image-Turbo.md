@@ -131,6 +131,7 @@ curl -s http://localhost:8091/v1/images/generations \
         "prompt": "A cat is sitting inside a bowl.",
         "size": "1024x1024",
         "num_inference_steps": 9,
+        "guidance_scale": 0,
         "seed": 42
       }' | \
   python -c 'import sys,json; print(json.load(sys.stdin)["data"][0]["b64_json"])' | \
@@ -145,6 +146,8 @@ curl -s -X POST "http://localhost:8091/v1/images/edits" \
   -F "image=@$PWD/output.png" \
   -F "prompt=The cat got a huge necklace." \
   -F "num_inference_steps=9" \
+  -F "guidance_scale=0" \
+  -F "strength=0.6" \
   -F "seed=42" \
   -F "output_format=png" | \
   python -c 'import sys,json; print(json.load(sys.stdin)["data"][0]["b64_json"])' | \
@@ -181,36 +184,57 @@ vllm serve Tongyi-MAI/Z-Image-Turbo \
   --cache-backend tea_cache
 ```
 
+Enable `cache_dit`:
+
+```bash
+vllm serve Tongyi-MAI/Z-Image-Turbo \
+  --omni \
+  --host 127.0.0.1 \
+  --port 8091 \
+  --cache-backend cache_dit
+```
+
+Enable FP8 quantization with `cache_dit`:
+
+```bash
+vllm serve Tongyi-MAI/Z-Image-Turbo \
+  --omni \
+  --host 127.0.0.1 \
+  --port 8091 \
+  --quantization fp8 \
+  --cache-backend cache_dit
+```
+
 #### Performance results
 
 ##### Image generation
 
 | CLI flag | Latency | Peak GPU Memory (`nvidia-smi`) |
 | -------- | ------- | ------ |
-| baseline | ~9500.00ms | 24987 MB |
-| `--quantization fp8` | ~5600.00ms | 19753 MB |
-| `--cache-backend tea_cache` | ~9300.00ms | 25003 MB |
-| `--cache-backend cache_dit` | ~9300.00ms | 24911 MB |
-| `--quantization fp8 --cache-backend tea_cache` | ~5600.00ms | 19835 MB |
-| `--quantization fp8 --cache-backend cache_dit` | ~5600.00ms | 19827 MB |
+| baseline | ~9500ms | 24987 MB |
+| `--quantization fp8` | ~5600ms | 19753 MB |
+| `--cache-backend tea_cache` | ~9300ms | 25003 MB |
+| `--cache-backend cache_dit` | ~9300ms | 24911 MB |
+| `--quantization fp8 --cache-backend tea_cache` | ~5600ms | 19835 MB |
+| `--quantization fp8 --cache-backend cache_dit` | ~5600ms | 19827 MB |
 
 ##### Image editing
 
 | CLI flag | Latency | Peak GPU Memory (`nvidia-smi`) |
 | -------- | ------- | ------ |
-| baseline | ~34500.00ms | 24987 MB |
-| `--quantization fp8` | ~8200.00ms | 19410 MB |
-| `--cache-backend tea_cache` | ~11000.00ms | 22652 MB |
-| `--cache-backend cache_dit` | ~11000.00ms | 24525 MB |
-| `--quantization fp8 --cache-backend tea_cache` | ~7100.00ms | 17890 MB |
-| `--quantization fp8 --cache-backend cache_dit` | ~7100.00ms | 19410 MB |
+| baseline | ~34500ms | 24987 MB |
+| `--quantization fp8` | ~8200ms | 19410 MB |
+| `--cache-backend tea_cache` | ~11000ms | 22652 MB |
+| `--cache-backend cache_dit` | ~11000ms | 24525 MB |
+| `--quantization fp8 --cache-backend tea_cache` | ~7100ms | 17890 MB |
+| `--quantization fp8 --cache-backend cache_dit` | ~7100ms | 19410 MB |
 
 #### Notes
 
-- Memory usage: In both image generation and image editing parts of the example run, `nvidia-smi` samples showed peak GPU memory usage of `24987 MB`, and the image generation request completed in about `9500.00ms`, while the image editing request completed in about `34500.00ms`.
-- Key flags: `--omni` is required;
+- Memory usage: see the Peak GPU Memory columns in the tables above. The highest peaks across all runs came from the unquantized configurations, while `--quantization fp8` cut the peak to the ~17.9-19.8 GB range in every tested combination.
+- Key flags: `--omni` is required.
 - Known limitations: Image sizes other than `1024x1024` were not tested in this recipe. Memory usage and latency may vary with image size.
-
+- Steps and CFG: `num_inference_steps=9` suffices because `Z-Image-Turbo` is a distilled few-step model that runs without classifier-free guidance (CFG) by default. The example commands pin `guidance_scale=0` explicitly; setting `guidance_scale > 0` enables CFG, roughly doubles the per-step cost, and brings no benefit for this distilled checkpoint (the shared offline example also uses `--guidance-scale 0.0`). The editing command pins `strength=0.6`, the Z-Image default.
 - `--quantization fp8` provided the best overall speed and memory improvements.
-- Cache backends had little impact on *image generation*, likely because `Z-Image-Turbo` uses only a few inference steps. For *image editing*, cache backends reduced latency substantially.
+- Cache backends had little impact on *image generation* but reduced *image editing* latency substantially (see the tables above). Both requests use the same 9 denoising steps, so the step count alone does not explain the asymmetry; this recipe does not characterize the cause further.
 - `seed` was set to 42 in this recipe for reproducibility, setting it to a different value may lead to different results.
