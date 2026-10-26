@@ -232,7 +232,7 @@ def normalize_extra_body_params(
 
 
 def run_inference(
-    omni: Omni, generator: torch.Generator, model_class_name, observations, extra_body, declared_extra_body
+    omni: Omni, generator: torch.Generator, seed: int, model_class_name, observations, extra_body, declared_extra_body
 ) -> list[dict[str, Any]]:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -244,6 +244,7 @@ def run_inference(
         sp = OmniDiffusionSamplingParams(
             extra_args=extra_args,
             generator=generator,
+            seed=seed,
         )
         sp = normalize_extra_body_params(sp, extra_body, declared_extra_body)
         raw = omni.generate(prompt, sampling_params_list=[sp])
@@ -340,7 +341,7 @@ def main() -> None:
         model_dir=model_dir,
         task=args.task,
         data_dir=args.data_dir,
-        **{"seed": args.seed, "device": args.device, "dtype": args.dtype, **extra_body},
+        **{"device": args.device, "dtype": args.dtype, **extra_body},
     )
 
     if extra_body.get("metadata", {}):
@@ -354,7 +355,9 @@ def main() -> None:
     # Return type drives the mode: a single dict → single-shot,
     # any other iterable → autoregressive.
     observations = [observation] if isinstance(observation, dict) else observation
-    results = run_inference(omni, generator, model_class_name, observations, extra_body, declared_extra_body_params)
+    results = run_inference(
+        omni, generator, args.seed, model_class_name, observations, extra_body, declared_extra_body_params
+    )
 
     if not results:
         print("[Robot Policy] No actions produced.")

@@ -17,7 +17,7 @@ import re as re_module
 from collections import OrderedDict
 from collections.abc import Iterable
 from contextlib import contextmanager
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -85,6 +85,23 @@ DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION = 603 * 1024 * 1024
 # The adapter mirrors ``DreamZeroState``'s surface, so every helper that reads or
 # writes session state accepts either.
 DreamZeroSessionState = DreamZeroState | DreamZeroStateAdapter
+
+
+def _resolve_request_seed(
+    extra_args: dict[str, Any],
+    sampling_params: OmniDiffusionSamplingParams,
+    default_seed: int,
+) -> int:
+    """Resolve one request's initial-noise seed.
+
+    Priority: ``extra_args["seed"]`` → ``sampling_params.seed`` → the
+    model-config default. Only ``None`` falls through, so an explicit
+    seed of ``0`` stays meaningful.
+    """
+    seed = extra_args.get("seed", sampling_params.seed)
+    if seed is None:
+        seed = default_seed
+    return int(seed)
 
 
 class VideoActionScheduler:
@@ -1535,7 +1552,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin, SupportsComponentDiscovery)
         _pt_mark("obs_vae_encode")
 
         batch_size = image.shape[0]
-        generator = torch.Generator(device=device).manual_seed(self.seed)
+        seed = _resolve_request_seed(extra_args, req.sampling_params, self.seed)
+        generator = torch.Generator(device=device).manual_seed(seed)
         noise_obs = torch.randn(
             batch_size,
             16,
@@ -1546,7 +1564,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin, SupportsComponentDiscovery)
             dtype=torch.bfloat16,
             generator=generator,
         )
-        generator = torch.Generator(device=device).manual_seed(self.seed)
+        generator = torch.Generator(device=device).manual_seed(seed)
         noise_action = torch.randn(
             batch_size,
             self.action_horizon,
