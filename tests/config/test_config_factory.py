@@ -3128,7 +3128,9 @@ class TestPlatformOverrides:
         The v2 path's self-owned sampler supports temperature/top-k/top-p/seed
         only; a yaml carrying e.g. repetition_penalty=1.1 must fail at deploy
         merge (with the v1 opt-out named), not on every request. Neutral
-        engine defaults (repetition_penalty=1.0) pass.
+        engine defaults (repetition_penalty=1.0) pass, and falsy neutral
+        values (logprobs: null, bad_words: [], logit_bias: {}) pass too,
+        matching the request-path checks in model_state.py add_request.
         """
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
         pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
@@ -3137,8 +3139,25 @@ class TestPlatformOverrides:
         stages = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))
         assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
 
+        # Explicitly neutral None/collection values are no-ops, not failures.
+        deploy = load_deploy_config(deploy_path)
+        deploy.stages[0].default_sampling_params.update(
+            logprobs=None,
+            prompt_logprobs=None,
+            allowed_token_ids=None,
+            bad_words=[],
+            logit_bias={},
+        )
+        merge_pipeline_deploy(pipeline, deploy)
+
         deploy = load_deploy_config(deploy_path)
         deploy.stages[0].default_sampling_params["repetition_penalty"] = 1.1
+        with pytest.raises(ValueError, match="model_runner: v1"):
+            merge_pipeline_deploy(pipeline, deploy)
+
+        # Non-neutral collection values fail the same way as scalars.
+        deploy = load_deploy_config(deploy_path)
+        deploy.stages[0].default_sampling_params["logprobs"] = 5
         with pytest.raises(ValueError, match="model_runner: v1"):
             merge_pipeline_deploy(pipeline, deploy)
 
